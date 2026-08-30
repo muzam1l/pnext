@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      fixture:
+        description: Fixture to bench
+        type: choice
+        default: all
+        options: [all, ssr, dashboard]
+      runs:
+        description: Runs per metric
+        default: '2'
+      record:
+        description: Record passing benchmark values
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install
+      - name: Bench gate
+        run: |
+          gate() {
+            for fixture in ${{ inputs.fixture || (github.event_name == 'push' && 'all' || 'ssr dashboard') }}; do
+              bun bench/run.ts "$fixture" --runs=${{ inputs.runs || (github.event_name == 'push' && '3' || '2') }} || return
+              bun bench/check.ts ${{ inputs.record && '--record' || '' }} || return
+            done
+          }
+          gate || gate
+      - name: Upload recorded baselines
+        if: inputs.record
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-baselines
+          path: bench/baselines.json

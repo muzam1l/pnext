@@ -1,0 +1,74 @@
+#!/bin/sh
+
+# Presence only. The version floor is enforced in src/cli/index.ts, where
+# Bun.version costs nothing — asking `bun --version` here would fork per command.
+if ! command -v bun >/dev/null 2>&1; then
+  echo "pnext requires Bun >=1.3.10. Install it from https://bun.sh/get" >&2
+  exit 1
+fi
+
+script=$0
+
+# `dirname` is an external binary and `$(...)` forks a subshell, so spelling this
+# the obvious way costs two process creations on every command. Parameter
+# expansion plus a `cd` in *this* shell gets the same answer with no forks; the
+# cwd is restored before exec so relative arguments still resolve.
+resolve_dir() {
+  case $1 in
+    */*) dirpart=${1%/*} ;;
+    *) dirpart=. ;;
+  esac
+  opwd=$PWD
+  CDPATH= cd -P "$dirpart" 2>/dev/null || return 1
+  dir=$PWD
+  CDPATH= cd "$opwd" 2>/dev/null || return 1
+}
+
+while [ -L "$script" ]; do
+  resolve_dir "$script" || break
+  target=$(readlink "$script")
+  case "$target" in
+    /*) script=$target ;;
+    *) script=$dir/$target ;;
+  esac
+done
+
+resolve_dir "$script"
+
+# Bun decides its JSX transform (jsx vs. the dev-only jsxDEV, which calls
+# preact/jsx-dev-runtime with a different call signature) once per process,
+# from NODE_ENV at startup — not per file. Setting it later from inside
+# index.ts is too late: by the time that line runs, the entry file and
+# everything reached by its static imports have already been transpiled
+# with whatever NODE_ENV was inherited from the shell. So it must be
+# exported here, before exec, not in TS.
+if [ -z "$NODE_ENV" ]; then
+  case "$1" in
+    dev) export NODE_ENV=development ;;
+    *) export NODE_ENV=production ;;
+  esac
+fi
+
+# Exec through a bun binary literally named for the command ("pnext-dev",
+# "pnext-build", ...) so Activity Monitor and `ps` label every pnext process
+# instead of showing "bun". The kernel takes the process name from the exec'd
+# file's basename; argv0 tricks like `exec -a` never reach it.
+#
+# The cached names are hardlinks of a bun binary (see src/cli/boot/named-bin.ts), so
+# `-ef` — same device and inode — proves a candidate is *this* bun and never
+# execs a stale one left by an earlier version. Resolving it here in sh instead
+# of asking named-bin.ts saves a whole bun process per command; on a miss we run
+# plain bun and the CLI creates the link for the next run.
+case "$1" in
+  dev|build|start|analyze|typegen) named=pnext-$1 ;;
+  *) named=pnext ;;
+esac
+
+bun_bin=$(command -v bun)
+for candidate in "${XDG_CACHE_HOME:-$HOME/.cache}"/pnext/bin/bun-*/"$named"; do
+  if [ -x "$candidate" ] && [ "$candidate" -ef "$bun_bin" ]; then
+    exec "$candidate" --conditions=react-server "$dir/../src/cli/index.ts" "$@"
+  fi
+done
+
+exec bun --conditions=react-server "$dir/../src/cli/index.ts" "$@"

@@ -1,0 +1,5 @@
+/// <reference types="next" />
+import './.next/types/routes.d.ts'
+import './.next/types/root-params.d.ts'
+
+// NOTE: This file should not be edited

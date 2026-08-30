@@ -1,0 +1,128 @@
+{
+  "hello-world": {
+    "todo": "build-warm ratio rebank-pending: use the post-pass CI rebank",
+    "ratios": {
+      "dev-ready": {
+        "ratio": 3.76,
+        "fail": 3.196
+      },
+      "dev-first-page": {
+        "ratio": 12.44,
+        "fail": 10.574
+      },
+      "dev-warm": {
+        "ratio": 4.69,
+        "fail": 3.9865
+      },
+      "build-wall": {
+        "ratio": 8.82,
+        "fail": 7.497
+      },
+      "build-warm": null,
+      "prod-start": {
+        "ratio": 1.83,
+        "fail": 1.5555
+      },
+      "prod-warm": {
+        "ratio": 2.05,
+        "fail": 1.7425
+      },
+      "hmr": {
+        "ratio": 2.04,
+        "fail": 1.734
+      }
+    },
+    "bytes": {
+      "js-raw": 15.14,
+      "js-gzip": 6.6,
+      "js-deferred-gzip": 32.71,
+      "js-files": 3,
+      "install": 6,
+      "zero-island": 15.14
+    }
+  },
+  "ssr": {
+    "todo": "build-warm ratio rebank-pending: use the post-pass CI rebank",
+    "ratios": {
+      "dev-ready": {
+        "ratio": 3.8,
+        "fail": 3.23
+      },
+      "dev-first-page": {
+        "ratio": 11.16,
+        "fail": 9.486
+      },
+      "dev-warm": {
+        "ratio": 1.6,
+        "fail": 1.36
+      },
+      "build-wall": {
+        "ratio": 8.82,
+        "fail": 7.497
+      },
+      "build-warm": null,
+      "prod-start": {
+        "ratio": 1.85,
+        "fail": 1.5725
+      },
+      "prod-warm": {
+        "ratio": 2.5,
+        "fail": 2.125
+      },
+      "hmr": {
+        "ratio": 0.26,
+        "pnext": 264.3,
+        "fail": 303.945,
+        "mode": "pnext-ms"
+      }
+    },
+    "bytes": {
+      "js-raw": 32.1,
+      "js-gzip": 13.1,
+      "js-deferred-gzip": 32.57,
+      "js-files": 4,
+      "install": 6,
+      "zero-island": 15.76
+    }
+  },
+  "dashboard": {
+    "todo": "timing ratios, including build-warm, rebank-pending: use the post-pass CI rebank; local machine was loaded",
+    "ratios": {
+      "dev-ready": null,
+      "dev-first-page": null,
+      "dev-warm": null,
+      "build-wall": null,
+      "build-warm": null,
+      "prod-start": null,
+      "prod-warm": null,
+      "hmr": null
+    },
+    "bytes": {
+      "js-raw": 111.8,
+      "js-gzip": 25.97,
+      "js-deferred-gzip": 35.79,
+      "js-files": 6,
+      "install": 6
+    }
+  },
+  "visible": {
+    "todo": "timing ratios, including build-warm, rebank-pending: use the post-pass CI rebank",
+    "ratios": {
+      "dev-ready": null,
+      "dev-first-page": null,
+      "dev-warm": null,
+      "build-wall": null,
+      "build-warm": null,
+      "prod-start": null,
+      "prod-warm": null,
+      "hmr": null
+    },
+    "bytes": {
+      "js-raw": 6.74,
+      "js-gzip": 2.8,
+      "js-deferred-gzip": 6.41,
+      "js-files": 1,
+      "install": 6
+    }
+  }
+}

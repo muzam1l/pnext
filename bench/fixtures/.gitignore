@@ -1,0 +1,13 @@
+node_modules/
+!dashboard/node_modules/
+dashboard/node_modules/*
+!dashboard/node_modules/fixture-icon-barrel/
+!dashboard/node_modules/fixture-icon-barrel/**
+!dashboard/node_modules/fixture-ui-kit/
+!dashboard/node_modules/fixture-ui-kit/**
+!dashboard/node_modules/@dashboard/
+!dashboard/node_modules/@dashboard/**
+.next/
+.pnext/
+next-env.d.ts
+tsconfig.tsbuildinfo

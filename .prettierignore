@@ -1,0 +1,9 @@
+.tmp/
+.pnext/
+.turbo/
+bench/fixtures/**/.next/
+bench/fixtures/**/.pnext/
+**/next-env.d.ts
+fixtures/**/.pnext/
+reference/data/
+bun.lock

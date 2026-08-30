@@ -1,0 +1,513 @@
+{
+  "run": {
+    "date": "2026-08-20",
+    "machine": "CI — Blacksmith 4 vCPU (Intel Xeon), 16 GB RAM, Ubuntu 22.04 x64",
+    "bun": "1.3.10",
+    "next": "16.2.12",
+    "runs": "5 per metric (first discarded), medians reported"
+  },
+  "fixtures": [
+    {
+      "id": "hello",
+      "label": "hello-world",
+      "blurb": "A single page."
+    },
+    {
+      "id": "ssr",
+      "label": "ssr",
+      "blurb": "A server-rendered site."
+    },
+    {
+      "id": "dashboard",
+      "label": "dashboard",
+      "blurb": "A mid-size admin app — 30 routes, 18 client islands."
+    }
+  ],
+  "metrics": [
+    {
+      "id": "dev-ready",
+      "label": "Dev server ready",
+      "category": "dev",
+      "phase": "cold",
+      "rows": {
+        "hello": [
+          56.4,
+          "56.4 ms",
+          212.3,
+          "212.3 ms",
+          3.76
+        ],
+        "ssr": [
+          56,
+          "56.0 ms",
+          212.8,
+          "212.8 ms",
+          3.8
+        ],
+        "dashboard": [
+          57.1,
+          "57.1 ms",
+          246.4,
+          "246.4 ms",
+          4.31
+        ]
+      }
+    },
+    {
+      "id": "dev-first-page",
+      "label": "Dev first page HTML",
+      "category": "dev",
+      "phase": "cold",
+      "rows": {
+        "hello": [
+          79.9,
+          "79.9 ms",
+          993.5,
+          "993.5 ms",
+          12.44
+        ],
+        "ssr": [
+          93.5,
+          "93.5 ms",
+          1043.3,
+          "1043.3 ms",
+          11.16
+        ],
+        "dashboard": [
+          127,
+          "127.0 ms",
+          1285.8,
+          "1285.8 ms",
+          10.12
+        ]
+      }
+    },
+    {
+      "id": "dev-warm",
+      "label": "Dev warm request (p50 of 7)",
+      "category": "dev",
+      "phase": "warm",
+      "rows": {
+        "hello": [
+          3,
+          "3.0 ms",
+          14,
+          "14.0 ms",
+          4.69
+        ],
+        "ssr": [
+          16.5,
+          "16.5 ms",
+          26.4,
+          "26.4 ms",
+          1.6
+        ],
+        "dashboard": [
+          21.6,
+          "21.6 ms",
+          34.1,
+          "34.1 ms",
+          1.58
+        ]
+      }
+    },
+    {
+      "id": "hmr",
+      "label": "HMR save → visible",
+      "category": "dev",
+      "phase": "warm",
+      "rows": {
+        "hello": [
+          21.9,
+          "21.9 ms",
+          44.8,
+          "44.8 ms",
+          2.04
+        ],
+        "ssr": [
+          264.3,
+          "264.3 ms",
+          68.3,
+          "68.3 ms",
+          0.26
+        ],
+        "dashboard": [
+          300.4,
+          "300.4 ms",
+          97.6,
+          "97.6 ms",
+          0.32
+        ]
+      }
+    },
+    {
+      "id": "build-wall",
+      "label": "Production build (wall)",
+      "category": "build",
+      "phase": "cold",
+      "rows": {
+        "hello": [
+          291.3,
+          "291.3 ms",
+          2569.4,
+          "2569.4 ms",
+          8.82
+        ],
+        "ssr": [
+          310.5,
+          "310.5 ms",
+          2738.8,
+          "2738.8 ms",
+          8.82
+        ],
+        "dashboard": [
+          637.5,
+          "637.5 ms",
+          4566.3,
+          "4566.3 ms",
+          7.16
+        ]
+      }
+    },
+    {
+      "id": "prod-start",
+      "label": "Prod start (ready)",
+      "category": "build",
+      "phase": "cold",
+      "rows": {
+        "hello": [
+          60.7,
+          "60.7 ms",
+          110.9,
+          "110.9 ms",
+          1.83
+        ],
+        "ssr": [
+          57.1,
+          "57.1 ms",
+          105.5,
+          "105.5 ms",
+          1.85
+        ],
+        "dashboard": [
+          55.6,
+          "55.6 ms",
+          128.8,
+          "128.8 ms",
+          2.32
+        ]
+      }
+    },
+    {
+      "id": "prod-warm",
+      "label": "Prod warm request (p50 of 7)",
+      "category": "build",
+      "phase": "warm",
+      "rows": {
+        "hello": [
+          0.6,
+          "0.6 ms",
+          1.2,
+          "1.2 ms",
+          2.05
+        ],
+        "ssr": [
+          0.5,
+          "0.5 ms",
+          1.3,
+          "1.3 ms",
+          2.5
+        ],
+        "dashboard": [
+          0.5,
+          "0.5 ms",
+          1.7,
+          "1.7 ms",
+          3.41
+        ]
+      }
+    },
+    {
+      "id": "dev-rss",
+      "label": "Dev server RSS (ready + 7 warm)",
+      "category": "memory",
+      "phase": "warm",
+      "rows": {
+        "hello": [
+          130.8,
+          "130.8 MB",
+          536.4,
+          "536.4 MB",
+          4.1
+        ],
+        "ssr": [
+          151.3,
+          "151.3 MB",
+          553.6,
+          "553.6 MB",
+          3.66
+        ],
+        "dashboard": [
+          168.6,
+          "168.6 MB",
+          577.1,
+          "577.1 MB",
+          3.42
+        ]
+      }
+    },
+    {
+      "id": "build-rss",
+      "label": "Prod build peak RSS",
+      "category": "memory",
+      "phase": "cold",
+      "rows": {
+        "hello": [
+          124.2,
+          "124.2 MB",
+          455.8,
+          "455.8 MB",
+          3.67
+        ],
+        "ssr": [
+          136.8,
+          "136.8 MB",
+          456.6,
+          "456.6 MB",
+          3.34
+        ],
+        "dashboard": [
+          188,
+          "188.0 MB",
+          569,
+          "569.0 MB",
+          3.03
+        ]
+      }
+    },
+    {
+      "id": "prod-rss",
+      "label": "Prod server RSS (ready + 7 warm)",
+      "category": "memory",
+      "phase": "warm",
+      "rows": {
+        "hello": [
+          85.2,
+          "85.2 MB",
+          85.7,
+          "85.7 MB",
+          1.01
+        ],
+        "ssr": [
+          86,
+          "86.0 MB",
+          85.9,
+          "85.9 MB",
+          1
+        ],
+        "dashboard": [
+          87.3,
+          "87.3 MB",
+          90.6,
+          "90.6 MB",
+          1.04
+        ]
+      }
+    },
+    {
+      "id": "install",
+      "label": "Framework install size",
+      "category": "payload",
+      "phase": "static",
+      "rows": {
+        "hello": [
+          7.1,
+          "7.1 MB",
+          420.7,
+          "420.7 MB",
+          59.14
+        ],
+        "ssr": [
+          7.1,
+          "7.1 MB",
+          420.7,
+          "420.7 MB",
+          59.14
+        ],
+        "dashboard": [
+          7.1,
+          "7.1 MB",
+          420.7,
+          "420.7 MB",
+          59.14
+        ]
+      }
+    },
+    {
+      "id": "js-gzip",
+      "label": "First-page client JS (gzip)",
+      "category": "payload",
+      "phase": "static",
+      "rows": {
+        "hello": [
+          2.19,
+          "2.19 KB",
+          141.78,
+          "141.78 KB",
+          64.67
+        ],
+        "ssr": [
+          11.39,
+          "11.39 KB",
+          142.03,
+          "142.03 KB",
+          12.47
+        ],
+        "dashboard": [
+          15.26,
+          "15.26 KB",
+          144.85,
+          "144.85 KB",
+          9.5
+        ]
+      }
+    },
+    {
+      "id": "js-raw",
+      "label": "First-page client JS (raw)",
+      "category": "payload",
+      "phase": "static",
+      "rows": {
+        "hello": [
+          4.43,
+          "4.43 KB",
+          502.47,
+          "502.47 KB",
+          113.36
+        ],
+        "ssr": [
+          27.36,
+          "27.36 KB",
+          502.78,
+          "502.78 KB",
+          18.37
+        ],
+        "dashboard": [
+          38.51,
+          "38.51 KB",
+          507.42,
+          "507.42 KB",
+          13.18
+        ]
+      }
+    },
+    {
+      "id": "js-files",
+      "label": "First-page JS files",
+      "category": "payload",
+      "phase": "static",
+      "rows": {
+        "hello": [
+          3,
+          "3",
+          5,
+          "5",
+          1.67
+        ],
+        "ssr": [
+          4,
+          "4",
+          6,
+          "6",
+          1.5
+        ],
+        "dashboard": [
+          6,
+          "6",
+          9,
+          "9",
+          1.5
+        ]
+      }
+    },
+    {
+      "id": "zero-island",
+      "label": "Zero-island route client JS",
+      "category": "payload",
+      "phase": "static",
+      "rows": {
+        "hello": [
+          4.43,
+          "4.43 KB",
+          502.47,
+          "502.47 KB",
+          113.36
+        ],
+        "ssr": [
+          4.46,
+          "4.46 KB",
+          502.47,
+          "502.47 KB",
+          112.56
+        ]
+      }
+    }
+  ],
+  "headlines": [
+    {
+      "label": "Dev server ready",
+      "direction": "faster",
+      "value": "3.8–4.3×"
+    },
+    {
+      "label": "First page, cold",
+      "direction": "faster",
+      "value": "10–12×"
+    },
+    {
+      "label": "Warm request (dev)",
+      "direction": "faster",
+      "value": "1.6–4.7×"
+    },
+    {
+      "label": "Production build",
+      "direction": "faster",
+      "value": "7.2–8.8×"
+    },
+    {
+      "label": "Warm request (prod)",
+      "direction": "faster",
+      "value": "2–3.4×"
+    },
+    {
+      "label": "Dev server memory",
+      "direction": "less",
+      "value": "3.4–4.1×"
+    },
+    {
+      "label": "First-page client JS (gzip)",
+      "direction": "less",
+      "value": "9.5–65×"
+    },
+    {
+      "label": "Framework install size",
+      "direction": "smaller",
+      "value": "59×",
+      "detail": "7.1 MB vs 420.7 MB"
+    }
+  ],
+  "clientRuntimes": [
+    {
+      "name": "router-prefetch-only",
+      "raw": "473 B",
+      "gzip": "348 B",
+      "brotli": "283 B"
+    },
+    {
+      "name": "combined-router-hydrator",
+      "raw": "10.47 KB",
+      "gzip": "4.47 KB",
+      "brotli": "4.07 KB"
+    }
+  ]
+}

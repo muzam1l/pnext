@@ -1,0 +1,9 @@
+:root {
+  --hello-color: #123456;
+}
+
+body {
+  margin: 0;
+  color: var(--hello-color);
+  font-family: system-ui, sans-serif;
+}

@@ -1,0 +1,43 @@
+.timeline {
+  border-left: 2px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 1rem;
+}
+
+.entry {
+  display: grid;
+  gap: 0.15rem;
+  position: relative;
+}
+
+.entry::before {
+  background: var(--accent);
+  border-radius: 50%;
+  content: '';
+  height: 8px;
+  left: -1.3rem;
+  position: absolute;
+  top: 0.45rem;
+  width: 8px;
+}
+
+.critical::before {
+  background: var(--bad);
+}
+
+.warn::before {
+  background: #d08700;
+}
+
+.meta {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.action {
+  font-weight: 600;
+}

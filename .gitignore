@@ -1,0 +1,12 @@
+node_modules
+.pnext/
+.next/
+.turbo
+.tmp/
+.cache/
+/dist/
+.DS_Store
+*.log
+.next/
+.pnext/
+.claude/

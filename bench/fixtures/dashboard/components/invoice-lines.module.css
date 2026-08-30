@@ -1,0 +1,21 @@
+.lines {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.lines th,
+.lines td {
+  border-bottom: 1px solid var(--line);
+  padding: 0.5rem 0.4rem;
+  text-align: left;
+}
+
+.right {
+  text-align: right;
+}
+
+.total td {
+  border-bottom: none;
+  font-weight: 700;
+  padding-top: 0.8rem;
+}

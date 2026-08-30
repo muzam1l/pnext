@@ -1,0 +1,95 @@
+{
+  "name": "@wular/pnext",
+  "version": "0.0.24",
+  "description": "A fast little framework for server-first React apps, fully compatible with Next.js",
+  "type": "module",
+  "bin": {
+    "pnext": "bin/pnext"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/muzam1l/pnext.git"
+  },
+  "homepage": "https://github.com/muzam1l/pnext",
+  "bugs": {
+    "url": "https://github.com/muzam1l/pnext/issues"
+  },
+  "keywords": [
+    "react",
+    "preact",
+    "framework",
+    "ssr",
+    "server-components",
+    "bun",
+    "nextjs"
+  ],
+  "files": [
+    "bin",
+    "config",
+    "src",
+    "tsconfig.json",
+    "reference"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "bun": ">=1.3.10"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./internal": "./src/internal.ts",
+    "./cache": "./src/api/cache.ts",
+    "./dynamic": "./src/api/dynamic.tsx",
+    "./link": "./src/api/link.tsx",
+    "./navigation": "./src/api/navigation.ts",
+    "./navigation/client": "./src/api/client-navigation.ts",
+    "./server": "./src/api/server.ts",
+    "./config/*": "./config/*"
+  },
+  "scripts": {
+    "lint": "bun scripts/check-compat-boundary.ts && prettier --check . && eslint . --max-warnings 0 && tsc --noEmit",
+    "format": "prettier --write .",
+    "bench": "bun bench/run.ts",
+    "clean": "rm -rf .turbo .pnext node_modules",
+    "prepublishOnly": "bun run lint",
+    "version-bump:patch": "bun scripts/bump.mjs patch",
+    "version-bump:minor": "bun scripts/bump.mjs minor",
+    "version-bump:major": "bun scripts/bump.mjs major"
+  },
+  "dependencies": {
+    "client-only": "^0.0.1",
+    "dotenv": "^16.0.3",
+    "esbuild": "^0.25.12",
+    "oxc-parser": "0.142.0",
+    "oxc-resolver": "^11.24.2",
+    "oxc-transform": "0.136.0",
+    "preact": "^10.29.2",
+    "preact-render-to-string": "^6.7.0",
+    "react-compiler-runtime": "^1.0.0",
+    "server-only": "^0.0.1",
+    "web-vitals": "^4.2.4"
+  },
+  "devDependencies": {
+    "@eslint/compat": "^1.4.0",
+    "@eslint/js": "^9.38.0",
+    "@types/bun": "^1.3.0",
+    "eslint": "^9.38.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-import": "^2.32.0",
+    "eslint-plugin-turbo": "^2.5.8",
+    "prettier": "^3.9.6",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.2"
+  },
+  "optionalDependencies": {
+    "@mdx-js/mdx": "^3.1.0",
+    "@opentelemetry/api": "^1.7.0",
+    "@resvg/resvg-js": "^2.6.2",
+    "@typescript/native-preview": "^7.0.0-dev.20260707.2",
+    "next-font": "^2.0.2",
+    "sass": "^1.80.0",
+    "satori": "^0.12.0",
+    "sharp": "^0.34.0"
+  }
+}

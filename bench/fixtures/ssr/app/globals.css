@@ -1,0 +1,41 @@
+:root {
+  --fg: #101418;
+  --muted: #5b6672;
+  --line: #e3e7eb;
+  --accent: #2f6feb;
+}
+
+body {
+  margin: 0;
+  color: var(--fg);
+  font-family: system-ui, sans-serif;
+  line-height: 1.5;
+}
+
+main {
+  margin: 0 auto;
+  max-width: 46rem;
+  padding: 2rem 1rem;
+}
+
+nav a {
+  color: var(--accent);
+  margin-right: 1rem;
+}
+
+ul.items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+ul.items li {
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.5rem 0;
+}
+
+ul.items span {
+  color: var(--muted);
+}

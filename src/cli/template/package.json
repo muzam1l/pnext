@@ -1,0 +1,18 @@
+{
+  "name": "pnext-app",
+  "private": true,
+  "scripts": {
+    "dev": "pnext dev",
+    "build": "pnext build",
+    "start": "pnext start",
+    "analyze": "pnext analyze"
+  },
+  "dependencies": {
+    "preact": "^10"
+  },
+  "devDependencies": {
+    "@wular/pnext": "latest",
+    "typescript": "^5",
+    "@types/bun": "^1"
+  }
+}

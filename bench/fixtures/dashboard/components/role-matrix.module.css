@@ -1,0 +1,26 @@
+.matrix {
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  width: 100%;
+}
+
+.matrix th,
+.matrix td {
+  border: 1px solid var(--line);
+  padding: 0.45rem 0.5rem;
+  text-align: center;
+}
+
+.matrix th:first-child,
+.matrix td:first-child {
+  text-align: left;
+}
+
+.yes {
+  color: var(--ok);
+  font-weight: 700;
+}
+
+.no {
+  color: var(--muted);
+}

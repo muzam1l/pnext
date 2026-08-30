@@ -1,0 +1,23 @@
+.grid {
+  border-collapse: separate;
+  border-spacing: 3px;
+  font-size: 0.75rem;
+  width: 100%;
+}
+
+.grid th {
+  color: var(--muted);
+  font-weight: 500;
+  text-align: left;
+}
+
+.cell {
+  border-radius: 4px;
+  color: #fff;
+  padding: 0.4rem 0.35rem;
+  text-align: center;
+}
+
+.empty {
+  background: transparent;
+}
