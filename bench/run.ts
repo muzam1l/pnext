@@ -123,7 +123,7 @@ const bundlesOnly = args.includes('--bundles')
 const runs = bundlesOnly ? 0 : Math.max(1, Number(option('runs') ?? 3))
 const runsLabel = bundlesOnly
   ? 'bundle sizes only, no timed runs'
-  : `runs ${runs} per metric${runs >= 3 ? ' (first discarded)' : ''}, medians reported`
+  : `${runs} per metric${runs >= 3 ? ' (first discarded)' : ''}, medians reported`
 
 const selected =
   selector === 'all' ? FIXTURES : FIXTURES.filter(fixture => fixture.name === selector)

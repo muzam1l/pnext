@@ -64,14 +64,17 @@ async function writeChecks(config: ResolvedConfig, routes: RouteManifestEntry[])
   await rm(checksDir, { recursive: true, force: true })
   await ensureDir(checksDir)
 
+  // Metadata code routes (sitemap.ts, opengraph-image.tsx, ...) keep their
+  // Next-style signatures, which are not PNextRouteHandlerModule shapes.
+  const checked = routes.filter(route => !route.metadataRoute)
   await Promise.all(
-    routes.map(route => {
+    checked.map(route => {
       const file = path.join(checksDir, `${route.id}.check.ts`)
       return writeIfChanged(file, checkSource(checksDir, route))
     }),
   )
 
-  return routes.length
+  return checked.length
 }
 
 async function writeRouteAliases(config: ResolvedConfig, routes: RouteManifestEntry[]) {

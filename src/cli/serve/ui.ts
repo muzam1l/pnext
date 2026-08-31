@@ -40,7 +40,7 @@ export function printServerReady({ mode, hostname, port, elapsedMs }: ReadyBanne
 
   const pad = Math.max(...rows.map(([label]) => label.length))
   console.log('')
-  console.log(`${cyan('▲')} ${bold('pnext')} ${dim(mode)}`)
+  console.log(`⚡ ${bold('pnext')} ${dim(mode)}`)
   for (const [label, value] of rows) {
     console.log(`  ${dim('-')} ${dim(label.padEnd(pad))}  ${value}`)
   }

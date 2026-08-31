@@ -37,7 +37,7 @@ export function emptyResult(): MigrationResult {
 
 export function printHeader(root: string, dryRun: boolean) {
   const suffix = dryRun ? 'dry run, nothing will be written' : root
-  console.log(`\n${cyan('▲')} ${bold('pnext migrate')} ${dim(`— ${suffix}`)}`)
+  console.log(`\n⚡ ${bold('pnext migrate')} ${dim(`— ${suffix}`)}`)
 }
 
 export function printResult(result: MigrationResult, options: { install: string }) {

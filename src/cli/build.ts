@@ -188,9 +188,7 @@ async function runBuild(
   const log = createVerboseLogger(verbose, 'build')
   const startedAt = performance.now()
 
-  console.log(
-    `${cyan('▲')} ${bold('pnext')} ${dim('— Creating an optimized production build ...\n')}`,
-  )
+  console.log(`⚡ ${bold('pnext')} ${dim('— Creating an optimized production build ...\n')}`)
   const config = await loadConfig(root)
   const buildCache = lookupBuildCache(config, options)
   // Compat plugin loader: the single gated seam that populates the core
@@ -1096,6 +1094,7 @@ function printBuildSummary(
   // Route table: ○ static, ● SSG (params), ◐ partial prerender, ƒ dynamic.
   console.log('')
   console.log('Route (app)')
+  const usedMarkers = new Set<string>()
   for (const route of routes) {
     const intercepted = interceptionPrerenders.get(route.id)
     const marker =
@@ -1117,15 +1116,29 @@ function printBuildSummary(
     const label = route.interception ? interceptionDisplayRoute(route) : route.route || '/'
     // Next names a dynamic route by its source pattern (`/[dyn]`), not pnext's
     // `:param` form; compat apps' e2e output is matched against Next's.
+    usedMarkers.add(marker)
     console.log(`  ${marker} ${nextCompatEnabled(config) ? toNextRoutePattern(label) : label}`)
   }
   for (const file of staticMetadataSummaryFiles(staticFiles)) {
+    usedMarkers.add('○')
     console.log(`  ${dim('○')} /${file}`)
   }
   if (hasMiddleware) {
+    usedMarkers.add('ƒ')
     console.log('')
     console.log(`  ${dim('ƒ')} Middleware`)
   }
+  const legend: [string, string][] = [
+    ['○', 'static'],
+    ['●', 'SSG'],
+    ['◐', 'partial prerender'],
+    ['ƒ', 'dynamic'],
+  ]
+  const legendLine = legend
+    .filter(([marker]) => usedMarkers.has(marker))
+    .map(([marker, meaning]) => `${marker} ${meaning}`)
+    .join('   ')
+  if (legendLine) console.log(`\n  ${dim(legendLine)}`)
   console.log('')
   console.log(
     `${green('✓')} ${bold('Build complete')} ${dim(`in ${formatBuildDuration(durationMs)}`)}`,

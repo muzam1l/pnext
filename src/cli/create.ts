@@ -25,7 +25,7 @@ export async function createApp(dir: string | undefined, options: CreateAppOptio
   }
 
   const name = sanitizePackageName(path.basename(target))
-  console.log(`${cyan('▲')} ${bold('pnext create')} ${dim(`— scaffolding ${name}`)}\n`)
+  console.log(`⚡ ${bold('pnext create')} ${dim(`— scaffolding ${name}`)}\n`)
 
   const files = await scaffoldFiles(name, await latestPnextVersionRange('create'))
   await Promise.all(

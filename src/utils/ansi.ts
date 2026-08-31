@@ -1,5 +1,7 @@
+// NO_COLOR (https://no-color.org): any non-empty value disables all styling.
 function color(open: string, close: string) {
-  return (value: string) => (process.stdout.isTTY ? `${open}${value}${close}` : value)
+  return (value: string) =>
+    process.stdout.isTTY && !process.env.NO_COLOR ? `${open}${value}${close}` : value
 }
 
 /** Mid-gray for subordinate text. Readable on both light and dark terminals. */

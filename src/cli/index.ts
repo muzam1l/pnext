@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
+import { bold, cyan, dim } from '../utils/ansi'
 import { markBoot } from './boot/trace'
 import { commandBinaryName, nameEsbuildProcess, namedBunBinary } from './boot/named-bin'
 
@@ -336,27 +337,35 @@ function configPresence(root: string) {
 }
 
 function printHelp() {
-  console.log(`pnext ${VERSION}
+  const commands: [string, string][] = [
+    ['dev', 'Start the development server.'],
+    ['build', 'Create a production build.'],
+    ['start', 'Start the production server.'],
+    ['analyze', 'Analyze production bundle output.'],
+    ['typegen', 'Generate route TypeScript definitions.'],
+    ['create', 'Create a new pnext application.'],
+    ['migrate', 'Migrate a Next.js application to pnext.'],
+    ['info', 'Print environment details for bug reports.'],
+  ]
+  const flags: [string, string][] = [
+    ['--port <port>', 'Port to listen on (default: 3000).'],
+    ['--hostname <hostname>', 'Hostname to listen on (default: 0.0.0.0).'],
+    ['--version, -v', 'Print the pnext version.'],
+    ['--help, -h', 'Show this help message.'],
+  ]
+  const row = ([name, text]: [string, string], width: number) =>
+    `  ${cyan(name.padEnd(width))} ${dim(text)}`
+  console.log(`⚡ ${bold('pnext')} ${dim(VERSION)}
 
-Usage: pnext <command> [options]
+${bold('Usage:')} pnext ${cyan('<command>')} [options]
 
-Commands:
-  dev       Start the development server.
-  build     Create a production build.
-  start     Start the production server.
-  analyze   Analyze production bundle output.
-  typegen   Generate route TypeScript definitions.
-  create    Create a new pnext application.
-  migrate   Migrate a Next.js application to pnext.
-  info      Print environment details for bug reports.
+${bold('Commands:')}
+${commands.map(entry => row(entry, 9)).join('\n')}
 
-Common flags:
-  --port <port>          Port to listen on (default: 3000).
-  --hostname <hostname>  Hostname to listen on (default: 0.0.0.0).
-  --version, -v          Print the pnext version.
-  --help, -h             Show this help message.
+${bold('Common flags:')}
+${flags.map(entry => row(entry, 21)).join('\n')}
 
-Docs: https://pnext.dev`)
+${bold('Docs:')} ${cyan('https://pnext.dev')}`)
 }
 
 function printCommandHelp(command: string) {

@@ -16,6 +16,7 @@ export default [
             '^NEXT_FONT_GOOGLE_MOCKED_RESPONSES$',
             '^PNEXT_FONT_GOOGLE_METADATA$',
             '^PNEXT_CONFIG_FAST$',
+            '^NO_COLOR$',
           ],
         },
       ],
