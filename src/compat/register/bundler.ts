@@ -387,6 +387,8 @@ export function registerBundlerExtensions(config: ResolvedConfig): void {
       // the defaults + resolver from every client bundle.
       __PNEXT_IMAGE_CONFIG_INLINE__: JSON.stringify(getImagesConfig()),
       __PNEXT_IMAGE_CONFIG_INLINED__: 'true',
+      // Next's router policies replace core's scroll and refresh ones, so client bundles drop those.
+      ...(nextCompatEnabled(config) ? { __PNEXT_NEXT_ROUTER__: 'true' } : {}),
       // publicRuntimeConfig inlined the same way; omitted entirely when unset so an app that
       // never configures it adds zero bytes (unlike images, there is no default to drop).
       ...(Object.keys(publicRuntimeConfig()).length > 0

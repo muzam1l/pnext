@@ -14,6 +14,7 @@ import { resolveImport, workspacePackageRoots } from '../../resolve/imports'
 import { findProxyFile, proxyRoutePatterns, type ProxyModule } from '../../routing/proxy'
 import { cacheRoot } from '../boot/named-bin'
 import { startWarmChild, type WarmChild } from './vercel-warm'
+import { escapeRegex } from '../../utils/code'
 import { listFiles, toPosixPath, writeText } from '../../utils/fs'
 import { createVerboseLogger, type VerboseLogger } from '../../utils/verbose'
 import type { BuildManifest, StaticFileMetadata } from '../../types'
@@ -149,7 +150,13 @@ function shipsFile(pack: PackRules, name: string) {
 interface VercelConfig {
   version: 3
   routes?: (
-    | { src: string; dest?: string; headers?: Record<string, string>; continue?: boolean }
+    | {
+        src: string
+        dest?: string
+        methods?: string[]
+        headers?: Record<string, string>
+        continue?: boolean
+      }
     | { handle: 'filesystem' }
   )[]
   overrides?: Record<string, { path?: string; contentType?: string }>
@@ -205,15 +212,12 @@ export async function writeVercelOutput(
     // CDN serves those bytes itself - without it every stylesheet and chunk fell through to the
     // server function: served, but at function cost with no edge cache.
     ...compatStaticRewrite(config, outputPath),
-    // Chunk and font filenames are content-hashed; serve them immutable.
-    {
-      src: '^/assets/(chunks|fonts)/.*',
-      headers: { 'cache-control': 'public, max-age=31536000, immutable' },
-      continue: true,
-    },
+    // Every content-hashed build asset, exactly the set `pnext start` serves immutable.
+    await immutableAssetRoute(),
     // Proxy-matched paths go to the server function before the CDN filesystem
     // check — `pnext start` runs the proxy ahead of static files too.
     ...(await proxyRoutes(config)),
+    ...staticHeaderRoutes(staticFiles),
     { handle: 'filesystem' },
     { src: '^/.*$', dest: `/${SERVER_FUNCTION}` },
   ]
@@ -1375,9 +1379,83 @@ async function staticOverrides(
   return overrides
 }
 
+async function immutableAssetRoute() {
+  const { immutableAssetPrefixes, immutableCacheControl } = await import('../serve/pipeline')
+  const prefixes = [...new Set(immutableAssetPrefixes())].map(escapeRegex)
+  return {
+    src: `^/(?:${prefixes.join('|')})`,
+    headers: { 'cache-control': immutableCacheControl },
+    continue: true,
+  }
+}
+
+// Headers a CDN route cannot replay; a file that sets one stays on the server function.
+const functionOnlyHeaders = new Set([
+  'content-length',
+  'content-encoding',
+  'transfer-encoding',
+  'connection',
+  'set-cookie',
+])
+
 function canServeStaticOnVercel(metadata: StaticFileMetadata) {
+  if (metadata.status !== 200) return false
+  const headers = routeHeaders(metadata)
+  if (headers.length === 0) return true
+  // ISR state needs the function to revalidate.
   return (
-    metadata.status === 200 &&
-    metadata.headers.every(([name]) => name.toLowerCase() === 'content-type')
+    metadata.revalidateSeconds === undefined &&
+    metadata.expireSeconds === undefined &&
+    !metadata.tags?.length &&
+    headers.every(([name]) => !functionOnlyHeaders.has(name.toLowerCase()))
   )
+}
+
+/** Headers beyond content-type, which an override carries instead. */
+function routeHeaders(metadata: StaticFileMetadata) {
+  return metadata.headers.filter(([name]) => name.toLowerCase() !== 'content-type')
+}
+
+// Keeps each route pattern well inside Vercel's route size limits.
+const maxRouteSourceLength = 2000
+
+/**
+ * Route headers for the CDN-served static files whose headers an override cannot carry, so the CDN
+ * answers with what `pnext start` sends. Files sharing a header set share a route.
+ */
+function staticHeaderRoutes(staticFiles: Record<string, StaticFileMetadata>) {
+  const groups = new Map<string, { headers: Record<string, string>; patterns: string[] }>()
+  for (const [relative, metadata] of Object.entries(staticFiles)) {
+    const extra = routeHeaders(metadata)
+    if (extra.length === 0 || !canServeStaticOnVercel(metadata)) continue
+    const headers = Object.fromEntries(new Headers(extra))
+    const key = JSON.stringify(headers)
+    const group = groups.get(key) ?? { headers, patterns: [] }
+    groups.set(key, group)
+    group.patterns.push(servedPathPattern(relative))
+  }
+  return [...groups.values()].flatMap(({ headers, patterns }) => {
+    const sources: string[] = []
+    for (const pattern of patterns) {
+      const last = sources.length - 1
+      if (last >= 0 && sources[last]!.length + pattern.length < maxRouteSourceLength) {
+        sources[last] += `|${pattern}`
+      } else {
+        sources.push(pattern)
+      }
+    }
+    return sources.map(source => ({
+      src: `^/(?:${source})$`,
+      methods: ['GET', 'HEAD'],
+      headers,
+      continue: true,
+    }))
+  })
+}
+
+/** A static file's request paths: `a/index.html` also answers `/a` and `/a/`. */
+function servedPathPattern(relative: string) {
+  if (relative === 'index.html') return '(?:index\\.html)?'
+  if (!relative.endsWith('/index.html')) return escapeRegex(relative)
+  return `${escapeRegex(relative.slice(0, -'/index.html'.length))}(?:/|/index\\.html)?`
 }

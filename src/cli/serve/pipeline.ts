@@ -1352,10 +1352,18 @@ export const immutableCacheControl = 'public, max-age=31536000, immutable'
  * and stay revalidating; the public/ tree the app ships is likewise untouched.
  */
 export function immutableAssetPath(relativePath: string) {
-  if (relativePath.startsWith('assets/') || relativePath.startsWith('_next/static/')) return true
-  return getAssetExtensions()
-    .staticAssetPublicPrefixes()
-    .some(prefix => relativePath.startsWith(prefix.replace(/^\/+/, '')))
+  return immutableAssetPrefixes().some(prefix => relativePath.startsWith(prefix))
+}
+
+/** The public-relative prefixes `immutableAssetPath` covers. */
+export function immutableAssetPrefixes() {
+  return [
+    'assets/',
+    '_next/static/',
+    ...getAssetExtensions()
+      .staticAssetPublicPrefixes()
+      .map(prefix => prefix.replace(/^\/+/, '')),
+  ]
 }
 
 async function firstFile(root: string, files: string[]) {

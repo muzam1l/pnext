@@ -45,11 +45,11 @@ Prefetch warms the target page and its assets. Set the mode per link with the `p
 
 The app-wide default can be set with the `prefetch` field in `pnext.config.ts`, described in [Config](./config.md).
 
-Requests use low network priority. At most four run at once, though the hover-intent lane allows up to twelve. The core fallback expiry is five minutes. Prefetch does nothing in development.
+Requests use low network priority. At most four run at once, though the hover-intent lane allows up to twelve. The core fallback expiry is five minutes. Development prefetches like production, except under `compat.next`, which follows Next and does not prefetch in development.
 
 ## Soft navigation
 
-Link clicks and router pushes swap the page in place instead of reloading the document, so shared chunks and CSS are never re-downloaded. Back and forward stay soft and restore scroll. Cross-origin targets, non-HTML responses, and fetch failures fall back to a full page load.
+Link clicks and router pushes swap the page in place instead of reloading the document, so shared chunks and CSS are never re-downloaded. A new page starts at the top, and back and forward stay soft and restore scroll. When a link shows a dynamic page again from the router cache, the page refreshes in the background and the fresh render replaces it in place. Cross-origin targets, non-HTML responses, and fetch failures fall back to a full page load.
 
 ## Redirects and not found
 

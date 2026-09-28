@@ -20,6 +20,7 @@ import {
 import {
   exportDocumentFetcher,
   loadingShellPredictionPolicy,
+  prefetchStaleTimePolicy,
   prefetchStaleTimeMs,
   revalidationPrefetchDelayMs,
   segmentCachePolicy,
@@ -30,7 +31,9 @@ import {
   emitLocationChange,
   emitNavigationCommit,
   emitNavigationStart,
+  navigationScrollAction,
   scheduleNavigationScroll,
+  setNavigationScrollAction,
   withSilentLocationChange,
 } from './events'
 import type {
@@ -39,6 +42,7 @@ import type {
   EntryModule,
   LinkPrefetchMode,
   LoadingShellPrediction,
+  NavigationScrollAction,
   PrefetchedPage,
   PrefetchOptions,
   SegmentCacheHit,
@@ -57,14 +61,17 @@ export interface BrowserRouteState {
   runtimePrefetch?: boolean
 }
 
+const ROUTE_STATE_PREFIX = 'window.__PNEXT_ROUTE__='
+
 function documentRouteState(doc: Document): BrowserRouteState | undefined {
-  const prefix = 'window.__PNEXT_ROUTE__='
   const source = [...doc.scripts]
     .map(script => script.textContent ?? '')
-    .find(text => text.startsWith(prefix))
+    .find(text => text.startsWith(ROUTE_STATE_PREFIX))
   if (!source) return undefined
   try {
-    return JSON.parse(source.slice(prefix.length).replace(/;\s*$/, '')) as BrowserRouteState
+    return JSON.parse(
+      source.slice(ROUTE_STATE_PREFIX.length).replace(/;\s*$/, ''),
+    ) as BrowserRouteState
   } catch {
     return undefined
   }
@@ -320,6 +327,8 @@ function materializeStreamedSegments(doc: Document) {
   for (const chunk of doc.querySelectorAll<HTMLElement>(
     'div[hidden][data-pnext-stream], template[data-pnext-stream]',
   )) {
+    // Its promotion script has nothing left to do, and re-running it would only trip a script CSP.
+    if (chunk.nextElementSibling?.tagName === 'SCRIPT') chunk.nextElementSibling.remove()
     const id = chunk.getAttribute('data-pnext-stream')
     const suspense = id
       ? doc.querySelector(`pnext-suspense[data-pnext-suspense="${CSS.escape(id)}"]`)
@@ -1053,6 +1062,11 @@ function swapBody(
         continue
       }
       if (node.hasAttribute('data-pnext-dev')) continue
+      // Callers install the route state from the document; re-running it only trips a script CSP.
+      if (node.text.startsWith(ROUTE_STATE_PREFIX)) {
+        fragment.append(document.importNode(node, true))
+        continue
+      }
       // Parser-created scripts are inert; rebuild them so props, route
       // state, and streamed-chunk patches execute in document order when the
       // fragment lands in the live document.
@@ -1092,7 +1106,7 @@ function swapBody(
       cursor = next
     }
   }
-  if (paintHold) document.body.append(paintHold)
+  if (paintHold) placeNavigationPaintHold(paintHold)
   // Track the entry of what is now on screen (dropped when the incoming route
   // has none, so a stale entry is never attributed to it).
   if (entrySrc) document.documentElement.setAttribute(ENTRY_SCRIPT_ATTRIBUTE, entrySrc)
@@ -1102,6 +1116,12 @@ function swapBody(
 /** Keep the last complete screen painted while client roots mount into the committed document. */
 type NavigationPaintHold = HTMLElement & {
   __pnextObserver?: MutationObserver
+  /** The window scroll when the copy was taken. */
+  __pnextScroll?: [number, number]
+  /** The `[data-scroll-root]` scroll the copy shows. */
+  __pnextScrollTop?: number
+  /** The navigation that removes the hold. */
+  __pnextSequence?: number
 }
 
 function removeNavigationPaintHold(hold: NavigationPaintHold) {
@@ -1109,14 +1129,19 @@ function removeNavigationPaintHold(hold: NavigationPaintHold) {
   hold.remove()
 }
 
-function createNavigationPaintHold(): NavigationPaintHold | null {
-  // A newer navigation may start before the prior hold's settling frame. Retire
-  // that transaction synchronously so holds never nest (the older async release
-  // becomes a no-op).
-  const priorHold = document.querySelector<NavigationPaintHold>(
-    '[data-pnext-navigation-paint-hold]',
-  )
-  if (priorHold) removeNavigationPaintHold(priorHold)
+// A released hold until a frame renders without it: until then it is still what the screen shows.
+let releasedHold: NavigationPaintHold | null = null
+
+function createNavigationPaintHold(sequence: number): NavigationPaintHold | null {
+  // A prior hold on screen is taken over, so the older release is a no-op.
+  const priorHold =
+    document.querySelector<NavigationPaintHold>('[data-pnext-navigation-paint-hold]') ??
+    releasedHold
+  releasedHold = null
+  if (priorHold) {
+    priorHold.__pnextSequence = sequence
+    return priorHold
+  }
   const roots = [...document.body.children].filter(
     element =>
       !element.hasAttribute('data-pnext-navigation-paint-hold') &&
@@ -1124,12 +1149,20 @@ function createNavigationPaintHold(): NavigationPaintHold | null {
       element.textContent?.trim(),
   )
   if (roots.length === 0) return null
-  const hold = document.createElement('div')
+  const hold: NavigationPaintHold = document.createElement('div')
   hold.setAttribute('data-pnext-navigation-paint-hold', '')
   hold.setAttribute('aria-hidden', 'true')
   hold.style.cssText =
     'position:fixed;inset:0;z-index:2147483646;overflow:hidden;pointer-events:none;background:Canvas;visibility:visible!important'
-  hold.append(...roots.map(root => root.cloneNode(true)))
+  // compat.next keeps 0.1.0's unscrolled copy, which its server action refresh scroll relies on.
+  if (typeof __PNEXT_NEXT_ROUTER__ === 'undefined')
+    hold.__pnextScroll = [window.scrollX, window.scrollY]
+  hold.__pnextSequence = sequence
+  // A <body> shell over the whole hold: body styles lay out and paint the copy as the page was.
+  const body = document.body.cloneNode() as HTMLElement
+  body.style.minHeight = '100%'
+  body.append(...roots.map(root => root.cloneNode(true)))
+  hold.append(body)
   // The copy is paint-only: route mount scans and id lookups must never treat it as live UI.
   for (const node of hold.querySelectorAll('[data-pnext-client]'))
     node.removeAttribute('data-pnext-client')
@@ -1159,19 +1192,27 @@ function attachNavigationPaintHold(
   // The opaque fixed clone covers the viewport while the committed tree mounts.
   // Keep that live tree visible to focus management and selector observers;
   // hiding <body> also hides every real destination element from browser gates.
-  document.body.append(hold)
+  placeNavigationPaintHold(hold)
+  // A newer navigation leaves the hold up: its commit takes it over, or this release removes it.
   hold.__pnextObserver ??= new MutationObserver(() => {
-    if (sequence !== navigationSequence) {
-      return removeNavigationPaintHold(hold)
-    }
-    if (!hold.isConnected) document.body.append(hold)
+    if (!hold.isConnected) placeNavigationPaintHold(hold)
   })
   hold.__pnextObserver.observe(document.documentElement, { childList: true, subtree: true })
   const scrollRoot = hold.querySelector<HTMLElement>('[data-scroll-root]')
-  if (scrollRoot) scrollRoot.scrollTop = scrollTop
+  if (scrollRoot) scrollRoot.scrollTop = hold.__pnextScrollTop ??= scrollTop
 }
 
-async function releaseNavigationPaintHold(hold: NavigationPaintHold | null) {
+/** Append the hold scrolled as the departing page was; appending resets an element's scroll. */
+function placeNavigationPaintHold(hold: NavigationPaintHold) {
+  document.body.append(hold)
+  if (hold.__pnextScroll) hold.scrollTo?.(...hold.__pnextScroll)
+}
+
+async function releaseNavigationPaintHold(
+  hold: NavigationPaintHold | null,
+  sequence: number,
+  reveal?: () => void,
+) {
   if (!hold) return
   // mountRoute, client effects and the navigation commit have completed before
   // this runs. Keep the departing frame through the next rendering opportunity,
@@ -1179,7 +1220,17 @@ async function releaseNavigationPaintHold(hold: NavigationPaintHold | null) {
   if (window.requestAnimationFrame) {
     await new Promise<void>(resolve => window.requestAnimationFrame(() => resolve()))
   }
+  if (hold.__pnextSequence !== sequence) return
+  reveal?.()
   removeNavigationPaintHold(hold)
+  if (!window.ResizeObserver) return
+  releasedHold = hold
+  // Observing fires at the next rendering update, the first frame that paints without the hold.
+  const rendered = new ResizeObserver(() => {
+    rendered.disconnect()
+    if (releasedHold === hold) releasedHold = null
+  })
+  rendered.observe(document.documentElement)
 }
 
 /**
@@ -1510,6 +1561,11 @@ function isDevDocument() {
   return Boolean(document.querySelector('script[data-pnext-dev]'))
 }
 
+// Next's dev router neither prefetches nor paints loading states; core dev navigates like production.
+function nextDevDocument() {
+  return prefetchStaleTimePolicy !== undefined && isDevDocument()
+}
+
 // `replace` is also set for history TRAVERSALS (options.pop): assign() would
 // push a new entry over the popped one and truncate the forward stack, so a
 // bailout during back/forward must replace the current entry instead.
@@ -1540,6 +1596,27 @@ function saveScrollPosition() {
     // History can throw on rapid updates; losing one scroll position is fine.
   }
 }
+
+// Defined by compat.next builds, whose router policies replace core's scroll and refresh ones.
+declare const __PNEXT_NEXT_ROUTER__: boolean | undefined
+
+// Core's scroll policy when compat installs none: a new page starts at the top, a traversal
+// returns to where its entry was left.
+const coreNavigationScroll: NavigationScrollAction = (url, { pop, scroll }) => {
+  const state = historyState()
+  const saved = pop
+    ? (entryScroll.get(state.__pnextEntry) ?? (state.__pnextScroll as number[] | undefined))
+    : undefined
+  const [x = 0, y = 0] = saved ?? []
+  // A traversal to an entry with no saved position lands on its hash, as a new visit does.
+  const target =
+    !saved && url.hash && document.getElementById(decodeURIComponent(url.hash.slice(1)))
+  if (target) target.scrollIntoView()
+  else if (pop || scroll !== false) window.scrollTo(x, y)
+}
+
+// Where each entry was left, pops included, which cannot write the state of the entry they leave.
+const entryScroll = new Map<unknown, number[]>()
 
 function storeNavState() {
   try {
@@ -2266,6 +2343,8 @@ export function rearmVisiblePrefetches(): void {
   const retry = () => {
     if (generation !== revalidationPrefetchGeneration) return
     revalidationPrefetchBlocked = false
+    // A test host may tear the window down before the timer fires.
+    if (typeof window === 'undefined') return
     for (const element of prefetchedElements) {
       if (!element.isConnected) {
         prefetchedElements.delete(element)
@@ -2516,6 +2595,8 @@ export interface PrefetchEntry {
   stateKey: string
   /** A pending prefetch always dedupes; settled stale data must refetch. */
   settled: boolean
+  /** When the response landed, for entries that started as a pending prefetch. */
+  settledTime?: number
   /** Byte size of the settled document (LRU size accounting). */
   bytes?: number
   /** Settled as a shell-only (partial prefetch) response — see PrefetchedPage. */
@@ -2855,9 +2936,7 @@ export function prefetchRoute(
   href: string,
   options: PrefetchOptions = {},
 ): Promise<PrefetchedPage | null> {
-  // Dev pages render per request and entries build on demand; hover prefetch
-  // would hammer the dev server for little gain. Navigation still fetches.
-  if (isDevDocument()) return Promise.resolve(null)
+  if (nextDevDocument()) return Promise.resolve(null)
   if (isBotUserAgent()) return Promise.resolve(null)
   // `strict` is handled at the facade, the only entry point that can be handed
   // an unparseable href; everything reaching here already resolved once.
@@ -3065,8 +3144,10 @@ export function prefetchRoute(
       // Null = task stopped short with no data; a settled null would dedupe
       // every later reveal into null, so drop the entry and let a viewport
       // re-entry reschedule.
-      if (fetched) entry.settled = true
-      else prefetchCache.delete(cacheKey)
+      if (fetched) {
+        entry.settled = true
+        entry.settledTime = clientClockNow()
+      } else prefetchCache.delete(cacheKey)
     }
     // Size accounting only applies to settled documents — re-trim now that
     // this entry's bytes count against the budget.
@@ -3997,7 +4078,6 @@ export function showLoadingShell(
 ) {
   if (sequence !== navigationSequence) return false
   if (typeof DOMParser === 'undefined') return false
-  const paintHold = document.querySelector<HTMLElement>('[data-pnext-navigation-paint-hold]')
   const doc = new DOMParser().parseFromString(shellHtml, 'text/html')
   materializeClientIslandMarkers(doc)
   // A STATIC STAGE owns whatever chunks streamed with it, so resolve them before picking what
@@ -4035,6 +4115,10 @@ export function showLoadingShell(
   if (!markerRange && slotContainer === document.body && !scopedOwner) return false
   const container = scopedOwner ?? slotContainer
   const fragment = document.createDocumentFragment()
+  // A live page slot is filled from the incoming page slot, never from a container inside it.
+  // compat.next keeps its own fill, which its nested parallel-slot layouts rely on.
+  const incomingSlot =
+    typeof __PNEXT_NEXT_ROUTER__ === 'undefined' && markerRange ? pageSlotRange(doc.body) : null
   // The streamed document can already contain an ancestor layout that resolved before the
   // loading boundary. Keep that prefix when painting the fallback: replacing the target
   // with only the suspense children loses the eagerly prefetched layout.
@@ -4043,17 +4127,19 @@ export function showLoadingShell(
     (container.id ? doc.getElementById(container.id) : null) ??
     doc.querySelector('[data-pnext-root]') ??
     (container === document.body ? doc.body : null)
-  const sourceNodes = incomingTarget
-    ? [...incomingTarget.childNodes]
-    : inline
-      ? // The inline anchor is whatever element holds the markers (often <body>);
-        // only the fallback BETWEEN them is this boundary's content.
-        inline.nodes
-      : suspense
-        ? [...(suspense.closest('pnext-layout[data-pnext-segment]') ?? suspense).childNodes]
-        : // Boundary-free markup with no page container to copy from: there is
-          // nothing this paint could put on screen.
-          null
+  const sourceNodes = incomingSlot
+    ? incomingSlot[2]
+    : incomingTarget
+      ? [...incomingTarget.childNodes]
+      : inline
+        ? // The inline anchor is whatever element holds the markers (often <body>);
+          // only the fallback BETWEEN them is this boundary's content.
+          inline.nodes
+        : suspense
+          ? [...(suspense.closest('pnext-layout[data-pnext-segment]') ?? suspense).childNodes]
+          : // Boundary-free markup with no page container to copy from: there is
+            // nothing this paint could put on screen.
+            null
   if (!sourceNodes) return false
   // A painted loading shell IS a committed navigation (pushOptimisticUrl moves the address
   // bar the instant this returns true), so the window route state must reflect the
@@ -4085,7 +4171,6 @@ export function showLoadingShell(
   // useOffline(), say), and an unmounted island keeps its SSR value forever.
   // mountRoute is idempotent, so mounting on every paint is safe.
   mountPaintedIslands(doc)
-  if (paintHold) document.body.append(paintHold)
   return true
 }
 
@@ -4263,7 +4348,6 @@ function unwrapSuspenseFallbacks(root: ParentNode): void {
  */
 export function paintStaticStageSubtree(html: string): boolean {
   if (typeof DOMParser === 'undefined') return false
-  const paintHold = document.querySelector<HTMLElement>('[data-pnext-navigation-paint-hold]')
   const doc = new DOMParser().parseFromString(html, 'text/html')
   if (!isPNextDocument(doc)) return false
   // Materialize BEFORE comparing structure: the renderer ships the page slot (and
@@ -4297,7 +4381,6 @@ export function paintStaticStageSubtree(html: string): boolean {
   // against the tree painted here. `swapBody`'s own body-child reuse still applies.
   swapBody(doc)
   mountPaintedIslands(doc)
-  if (paintHold) document.body.append(paintHold)
   return true
 }
 
@@ -4425,6 +4508,10 @@ function unsettledPrefetchDeadline(): Promise<null> {
   return new Promise(resolve => setTimeout(() => resolve(null), UNSETTLED_PREFETCH_WAIT_MS))
 }
 
+// Kept copies older than REVALIDATE_AFTER_MS that core commits, then swaps for their fresh render.
+const keptCopies = new WeakMap<PrefetchedPage, Promise<PrefetchedPage | null>>()
+const REVALIDATE_AFTER_MS = 2_000
+
 async function pageForNavigation(
   url: URL,
   options: SoftNavigateOptions = {},
@@ -4491,7 +4578,18 @@ async function pageForNavigation(
       cached.settled || cached.full
         ? await cached.page
         : await Promise.race([cached.page, unsettledPrefetchDeadline()])
-    if (page && !page.shellOnly) return page
+    if (page && !page.shellOnly) {
+      if (
+        typeof __PNEXT_NEXT_ROUTER__ === 'undefined' &&
+        !prefetchStaleTimePolicy &&
+        now - (cached.settledTime ?? cached.time) > REVALIDATE_AFTER_MS &&
+        !documentStaticHintFromHtml(page.html)?.isStatic
+      ) {
+        const fresh = fetchPage(url.href, { fullRender: true }).catch(() => null)
+        keptCopies.set(page, fresh)
+      }
+      return page
+    }
     // Attached to an in-flight (or already settled) SHELL prefetch for this exact target:
     // the navigation issued no duplicate fetch, so paint the static stage it landed and let
     // the dynamic stage stream in below.
@@ -4988,6 +5086,8 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   // into the live body. Capturing later would save the target's fallback as
   // the previous history entry and restore a permanently stuck "Loading...".
   if (!options.pop) saveScrollPosition()
+  if (typeof __PNEXT_NEXT_ROUTER__ === 'undefined')
+    entryScroll.set(routerState.renderedEntryId, [window.scrollX, window.scrollY])
   if (departingBfcacheId) saveFormState(departingBfcacheId)
   // Snapshot the departing page's live island roots NOW, before a loading shell
   // can paint over (and detach) them below — they are stashed for back/forward
@@ -4996,11 +5096,6 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   // Snapshot plain root-layout DOM before a cached/streamed shell can detach it. The final swap
   // reconciles onto these nodes so server layouts keep the same identity Next's root reconciler does.
   const departingReusableBody = reusableBodyChildren()
-  // Capture the complete outgoing screen before any loading/static stage can replace it. The
-  // resolved client-root commit uses this copy only while its first complete paint settles.
-  const paintHoldScrollTop =
-    document.querySelector<HTMLElement>('[data-scroll-root]')?.scrollTop ?? 0
-  const paintHold = createNavigationPaintHold()
   // Painting a prefetched loading shell IS a committed navigation, so push the requested URL
   // here and let usePathname() and the address bar reflect the destination while the fetch is
   // still in flight; the final commit replaces this entry with the resolved one (or, on a
@@ -5056,19 +5151,14 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   // server-side, and re-painting would replace a committed loading state with a second,
   // different one. A segment's loading fallback commits ONCE per navigation.
   let cachedStagePainted = false
-  const devSoftNavigation = isDevDocument()
+  const devSoftNavigation = nextDevDocument()
   const onShell =
     restorePage || options.pop || refreshLike
       ? undefined
       : (shellHtml: string) => {
           if (cachedStagePainted) return
           if (devSoftNavigation) return
-          // In dev, compilation can suspend an application boundary even though the route's real
-          // content is otherwise ready. Keep the departing page until that compile-only hole is
-          // resolved; an explicit loading.js boundary remains paintable through the ordinary
-          // loading-boundary path. Production retains streamed application-Suspense behavior.
-          const devNavigation = shellHtml.includes('data-pnext-dev')
-          if (!showLoadingShell(shellHtml, sequence, url, undefined, false, !devNavigation)) return
+          if (!showLoadingShell(shellHtml, sequence, url, undefined, false, true)) return
           // A loading boundary is a committed navigation state.
           pushOptimisticUrl()
           scheduleNavigationScroll(url, options)
@@ -5396,12 +5486,17 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   // page slot is a marker-range proxy); the entry's unmount compares roots by
   // identity, so it rides the same set.
   if (preservedPage) keptIslands.add(preservedPage.root as unknown as Element)
-  // Wake route-keyed layout children while the departing DOM is still attached. Their layout
-  // cleanups can save shell state before unmount/swap; pop mounts the destination first instead.
-  window.__PNEXT_ACTIVE_ENTRY__?.unmount?.(keptIslands)
+  // Copy the screen as it is now, a loading or static stage included, before anything unmounts.
+  // The resolved client-root commit shows this copy only while its first complete paint settles.
+  const paintHoldScrollTop =
+    document.querySelector<HTMLElement>('[data-scroll-root]')?.scrollTop ?? 0
+  const paintHold = createNavigationPaintHold(sequence)
   let focusedBeforeSwap: Element | null = null
   let navigationFocusTarget: HTMLElement | null = null
   try {
+    // Wake route-keyed layout children while the departing DOM is still attached. Their layout
+    // cleanups can save shell state before unmount/swap; pop mounts the destination first instead.
+    window.__PNEXT_ACTIVE_ENTRY__?.unmount?.(keptIslands)
     if (unmountSlotlessPage && departingRouteKey && departingRouteKey !== targetRouteKey) {
       // Cover the lifecycle-only empty-page pass. This is the same outgoing screen clone used for
       // the final atomic commit, attached early enough that no empty intermediate frame can paint.
@@ -5465,7 +5560,8 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
     // selector waiter can observe the destination immediately after this stack unwinds; pruning in
     // the later post-mount phase let it catch the target node between its correct route sheet and a
     // stale asynchronous prune from the preceding navigation.
-    if (!url.hash) pruneStylesheets(doc)
+    // Core keeps the departing sheets while the paint hold still shows the departing screen.
+    if (!url.hash && (stylesheetReconciler || !paintHold)) pruneStylesheets(doc)
     // The swapped document carries the render's parallel-route state; pin it
     // (plus the document itself) to this history entry so back/forward restores
     // what was actually shown, without a server round trip.
@@ -5514,7 +5610,10 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
       }
     }
   } finally {
-    await releaseNavigationPaintHold(paintHold)
+    await releaseNavigationPaintHold(paintHold, sequence, () => {
+      if (!url.hash && !stylesheetReconciler && sequence === navigationSequence)
+        pruneStylesheets(doc)
+    })
   }
   if (sequence !== navigationSequence) return
   // Mounting/location subscribers run after the initial pre-mount scroll action.
@@ -5547,6 +5646,19 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   if (!options.pop && departingBfcacheId && departingBfcacheId === historyBfcacheId()) {
     restoreFormStateWhenMounted(departingBfcacheId, sequence, true)
   }
+  if (typeof __PNEXT_NEXT_ROUTER__ === 'undefined' && keptCopies.has(page))
+    void revalidateCommittedPage(targetUrl, sequence, page)
+}
+
+async function revalidateCommittedPage(url: URL, sequence: number, page: PrefetchedPage) {
+  const fresh = await keptCopies.get(page)
+  if (!fresh?.ok || fresh.html === page.html || sequence !== navigationSequence) return
+  await softNavigate(url.href, {
+    replace: true,
+    scroll: false,
+    refreshLike: true,
+    cachedPage: fresh,
+  })
 }
 
 function isBotUserAgent() {
@@ -6103,5 +6215,7 @@ export function installRouterFull() {
   )
   window.addEventListener('popstate', onPopState)
   window.addEventListener('pageshow', onPageShow)
+  if (typeof __PNEXT_NEXT_ROUTER__ === 'undefined' && !navigationScrollAction)
+    setNavigationScrollAction(coreNavigationScroll)
   watchEagerPrefetchLinks()
 }

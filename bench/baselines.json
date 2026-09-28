@@ -49,8 +49,8 @@
         "fail": 3.23
       },
       "dev-first-page": {
-        "ratio": 11.16,
-        "fail": 9.486
+        "ratio": 9,
+        "fail": 7.5
       },
       "dev-warm": {
         "ratio": 1.6,

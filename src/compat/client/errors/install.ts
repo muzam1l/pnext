@@ -222,6 +222,8 @@ function installStreamErrorBoundaries(
   const observe = () => {
     scan(document)
     new MutationObserver(mutations => {
+      // A test host may tear the DOM globals down before a queued record is delivered.
+      if (typeof Element === 'undefined') return
       for (const mutation of mutations) {
         for (const node of Array.from(mutation.addedNodes)) {
           if (!(node instanceof Element)) continue

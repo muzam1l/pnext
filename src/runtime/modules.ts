@@ -1440,6 +1440,7 @@ async function writeCompiledFile(file: string, contents: string) {
 function missingCompiledArtifact(entry: string): string | undefined {
   const root = compiledArtifactProfileRoot(entry)
   if (!root) return existsSync(entry) ? undefined : entry
+  const serverRoot = path.dirname(root)
 
   const visiting = new Set<string>()
   const visit = (file: string): string | undefined => {
@@ -1447,7 +1448,7 @@ function missingCompiledArtifact(entry: string): string | undefined {
     if (!existsSync(file)) return file
     // Raw framework/package file URLs are ordinary immutable dependencies, not
     // members of the materialized graph whose publication order we own.
-    if (!isInside(root, file) || !compiledScriptFilePattern.test(file)) return undefined
+    if (!isInside(serverRoot, file) || !compiledScriptFilePattern.test(file)) return undefined
 
     visiting.add(file)
     const cachedTargets = completeArtifactClosures.get(file)
@@ -1480,13 +1481,13 @@ function missingCompiledArtifact(entry: string): string | undefined {
       } catch {
         return sourcePath
       }
-      if (!isInside(root, target)) {
+      const emittedRoot = compiledArtifactProfileRoot(target)
+      if (!emittedRoot) continue
+      // Profiles share one closure: a 'use client' module compiles its imports into the client profile.
+      if (!isInside(serverRoot, target)) {
         if (existsSync(target)) continue
-        const emittedRoot = compiledArtifactProfileRoot(target)
-        // A different profile is produced by a separate build phase. Only a
-        // dead reference to this same profile can be a relocated cache member.
-        if (!emittedRoot || path.basename(emittedRoot) !== path.basename(root)) continue
-        target = path.resolve(root, path.relative(emittedRoot, target))
+        // A dead reference into another cache is a relocated member of this one.
+        target = path.resolve(serverRoot, path.relative(path.dirname(emittedRoot), target))
       }
       const missing = visit(target)
       if (missing) return missing

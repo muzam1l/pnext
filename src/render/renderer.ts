@@ -7001,7 +7001,11 @@ function unwrapUnusedPageSlot(html: string, mode: PageSlotMarkerMode): string {
     return html.replace(/<!--pnext-page:[^>]*-->/, '<!--pnext-page:-->')
   }
   const slot = pageSlotSpan(html)
-  return slot ? html.slice(0, slot.start) + slot.children + html.slice(slot.end) : html
+  if (!slot) return html
+  // `keep` leaves the empty anchors a soft navigation grafts a kept layout's next page between.
+  const children =
+    mode === 'keep' ? `<!--pnext-page:-->${slot.children}<!--/pnext-page-->` : slot.children
+  return html.slice(0, slot.start) + children + html.slice(slot.end)
 }
 
 function serializeNeutralClientIslands(html: string) {
