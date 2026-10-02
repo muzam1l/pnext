@@ -129,8 +129,10 @@ export function isRewriteDocument(html: string, pathname: string): boolean {
   return !routePatternMatchesPathname(state.route, pathname, state.catchAllOptional)
 }
 
-export function routeParamBoundaryChanged(doc: Document): boolean {
-  const current = documentRouteState(document)
+export function routeParamBoundaryChanged(
+  doc: Document,
+  current = documentRouteState(document),
+): boolean {
   const incoming = documentRouteState(doc)
   if (!current?.route || !incoming?.route) return false
   if (current.route !== incoming.route) return true
@@ -2616,6 +2618,8 @@ export interface PrefetchEntry {
   /** Slot-only key of the nav state the entry was rendered against. */
   slotsKey: string
   onInvalidate: (() => void)[]
+  /** A core prefetch's streamed shell, painted by a click that attaches before the body lands. */
+  shell?: { html?: string; listeners: Set<(html: string) => void> }
 }
 
 const prefetchCache = new Map<string, PrefetchEntry>()
@@ -3045,10 +3049,20 @@ export function prefetchRoute(
   options.element?.dispatchEvent(new CustomEvent('pnext:prefetchstart'))
   const startEpoch = routerCacheEpoch()
   const task = createPrefetchTask(cacheKey, options)
+  // A core prefetch is the destination document itself, so its shell can paint an attached click.
+  const shell: PrefetchEntry['shell'] =
+    typeof __PNEXT_NEXT_ROUTER__ === 'undefined' ? { listeners: new Set() } : undefined
   const page = fetchPage(url.href, {
     prefetch: full ? 'full' : 'auto',
     navState: prefetchState,
     task,
+    onShell:
+      typeof __PNEXT_NEXT_ROUTER__ === 'undefined' && !full
+        ? html => {
+            shell!.html = html
+            shell!.listeners.forEach(listener => listener(html))
+          }
+        : undefined,
     // Only when the shell is actually cached: the server strips it from the
     // response, so without a local copy there would be nothing to merge into.
     resumeFromShell: options.hoverResume === true && takeShellForUrl(url) !== null,
@@ -3137,6 +3151,7 @@ export function prefetchRoute(
     slotsKey: slotsStateKey(prefetchState.slots ?? {}),
     settled: false,
     onInvalidate: options.onInvalidate ? [options.onInvalidate] : [],
+    shell,
   })
   void page.then(fetched => {
     const entry = prefetchCache.get(cacheKey)
@@ -3291,6 +3306,7 @@ function streamHasPendingHole(buffer: string) {
 export async function readStreamedBody(
   response: Response,
   onShell: (shellHtml: string) => void,
+  ready?: (shellHtml: string) => boolean,
 ): Promise<string> {
   const reader = response.body?.getReader()
   if (!reader) return response.text()
@@ -3311,7 +3327,7 @@ export async function readStreamedBody(
       // the caller swap the complete, materialized document.
       !/<\/html>\s*$/.test(shellBuffer)
     ) {
-      if (streamHasPendingHole(shellBuffer)) {
+      if (streamHasPendingHole(shellBuffer) && (!ready || ready(shellBuffer))) {
         shellDelivered = true
         // Expose only holes still pending at this commit. Continuations already present in the
         // read are included so showLoadingShell can materialize them before choosing a fallback.
@@ -3438,7 +3454,7 @@ async function fetchPage(
   // Only the streamed-navigation read path (readStreamedBody) can consume a
   // late metadata tail written after `</html>`, so only it asks for one: the
   // server keeps blocking on `generateMetadata` for every other consumer.
-  if (options.onShell) headers[LATE_METADATA_HEADER] = '1'
+  if (options.onShell && !options.prefetch) headers[LATE_METADATA_HEADER] = '1'
   if (options.fullRender) headers['x-pnext-full-render'] = '1'
   if (options.resumeFromShell) headers['x-pnext-resume-shell'] = '1'
 
@@ -3707,7 +3723,16 @@ async function fetchPage(
       segmentPayload && shellOnly && !response.headers.has(SEGMENT_ROUTE_HEADER)
     const responseBody =
       strippedBody ??
-      (options.onShell ? await readStreamedBody(response, options.onShell) : await response.text())
+      (options.onShell
+        ? await readStreamedBody(
+            response,
+            options.onShell,
+            // A prefetch read can end mid-shell; its shell counts once the document's tail scripts land.
+            typeof __PNEXT_NEXT_ROUTER__ === 'undefined' && options.prefetch
+              ? shell => shell.includes('id="__PNEXT_NAV_STATE__"') && /<\/script>\s*$/.test(shell)
+              : undefined,
+          )
+        : await response.text())
     let html = segmentPayload ? segmentDocumentHtml(responseBody, bodySegment) : responseBody
     if (html === null) return null
     // A LAYOUT-only prefetch carries no page: compose this URL's cached page frame
@@ -4508,14 +4533,41 @@ function unsettledPrefetchDeadline(): Promise<null> {
   return new Promise(resolve => setTimeout(() => resolve(null), UNSETTLED_PREFETCH_WAIT_MS))
 }
 
-// Kept copies older than REVALIDATE_AFTER_MS that core commits, then swaps for their fresh render.
-const keptCopies = new WeakMap<PrefetchedPage, Promise<PrefetchedPage | null>>()
-const REVALIDATE_AFTER_MS = 2_000
+/**
+ * The in-flight prefetch's document, or `null` once it has waited long enough. A streamed shell
+ * that paints this navigation first commits it to that prefetch, so it waits for the body.
+ */
+function attachToPrefetch(
+  entry: PrefetchEntry,
+  onShell?: (shellHtml: string) => boolean,
+): Promise<PrefetchedPage | null> {
+  return new Promise(resolve => {
+    const shell = entry.shell
+    const done = (page: PrefetchedPage | Promise<PrefetchedPage | null> | null) => {
+      clearTimeout(timer)
+      shell?.listeners.delete(paint)
+      resolve(page)
+    }
+    const paint = (html: string) => onShell?.(html) && done(entry.page)
+    const timer = setTimeout(done, UNSETTLED_PREFETCH_WAIT_MS, null)
+    void entry.page.then(done)
+    if (shell?.html) paint(shell.html)
+    else shell?.listeners.add(paint)
+  })
+}
+
+// Core reuses a kept copy of a dynamic page this long; past it only the copy's frame paints.
+const KEPT_DATA_MS = 5_000
+
+function keptDataFresh(entry: PrefetchEntry, now: number): boolean {
+  return !entry.settled || now - (entry.settledTime ?? entry.time) < KEPT_DATA_MS
+}
 
 async function pageForNavigation(
   url: URL,
   options: SoftNavigateOptions = {},
-  onShell?: (shellHtml: string) => void,
+  /** Paints a streamed shell; true when it committed the navigation. */
+  onShell?: (shellHtml: string) => boolean,
   /**
    * Paint a cached STATIC STAGE into the live page before the dynamic-stage request goes
    * out. Unlike `onShell` this markup is not a loading fallback but the route's real static
@@ -4552,11 +4604,17 @@ async function pageForNavigation(
       pageFrame.eligible = false
     onStaticStage?.(html, postponedShell)
   }
-  const cached = prefetchEntriesForNavigation(key).find(
+  const usable = prefetchEntriesForNavigation(key).filter(
     entry =>
       entryMatchesNavState(entry, departureNavState) &&
       (!entry.settled || now - entry.time < entry.staleTimeMs),
   )
+  // Core prefers a kept copy whose data is still fresh.
+  const cached =
+    (typeof __PNEXT_NEXT_ROUTER__ === 'undefined' &&
+      !prefetchStaleTimePolicy &&
+      usable.find(entry => keptDataFresh(entry, now))) ||
+    usable[0]
   // Popstate restores a history entry's own parallel-route state; a prefetched response was
   // rendered against the pre-navigation state and may not match, so back/forward always
   // fetches. A refresh bypasses the cache entirely.
@@ -4577,18 +4635,21 @@ async function pageForNavigation(
     const page =
       cached.settled || cached.full
         ? await cached.page
-        : await Promise.race([cached.page, unsettledPrefetchDeadline()])
+        : typeof __PNEXT_NEXT_ROUTER__ === 'undefined'
+          ? await attachToPrefetch(cached, onShell)
+          : await Promise.race([cached.page, unsettledPrefetchDeadline()])
     if (page && !page.shellOnly) {
       if (
         typeof __PNEXT_NEXT_ROUTER__ === 'undefined' &&
         !prefetchStaleTimePolicy &&
-        now - (cached.settledTime ?? cached.time) > REVALIDATE_AFTER_MS &&
+        !keptDataFresh(cached, now) &&
         !documentStaticHintFromHtml(page.html)?.isStatic
       ) {
-        const fresh = fetchPage(url.href, { fullRender: true }).catch(() => null)
-        keptCopies.set(page, fresh)
-      }
-      return page
+        // Next's way past the data window: paint the frame (loading fallbacks included), fetch the data.
+        const frame = sliceShell(page.html)
+        // The response shell is this frame's twin; painting it again would swap the same layout.
+        if (frame !== null && onShell?.(frame)) onShell = () => false
+      } else return page
     }
     // Attached to an in-flight (or already settled) SHELL prefetch for this exact target:
     // the navigation issued no duplicate fetch, so paint the static stage it landed and let
@@ -5151,17 +5212,23 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   // server-side, and re-painting would replace a committed loading state with a second,
   // different one. A segment's loading fallback commits ONCE per navigation.
   let cachedStagePainted = false
+  // The route whose islands a stage paint mounted; the commit keeps them instead of remounting.
+  let paintedRoute: BrowserRouteState | undefined
+  // A painted loading boundary or stage is a committed navigation state.
+  const commitPaint = () => {
+    paintedRoute = window.__PNEXT_ROUTE__
+    pushOptimisticUrl()
+    scheduleNavigationScroll(url, options)
+  }
   const devSoftNavigation = nextDevDocument()
   const onShell =
     restorePage || options.pop || refreshLike
       ? undefined
       : (shellHtml: string) => {
-          if (cachedStagePainted) return
-          if (devSoftNavigation) return
-          if (!showLoadingShell(shellHtml, sequence, url, undefined, false, true)) return
-          // A loading boundary is a committed navigation state.
-          pushOptimisticUrl()
-          scheduleNavigationScroll(url, options)
+          if (cachedStagePainted || devSoftNavigation) return false
+          if (!showLoadingShell(shellHtml, sequence, url, undefined, false, true)) return false
+          commitPaint()
+          return true
         }
   // The per-segment cache's answer for this navigation, looked up ONCE: it decides both
   // whether the generic loading shell should paint (a real cached static segment is strictly
@@ -5181,8 +5248,7 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
         if (devSoftNavigation) return
         if (!commitStaticStage(html, sequence, url, postponedShell)) return
         cachedStagePainted = true
-        pushOptimisticUrl()
-        scheduleNavigationScroll(url, options)
+        commitPaint()
       }
     : undefined
   // Loading-shell reuse: when the navigation must fetch, paint the CACHED shell for the
@@ -5215,8 +5281,7 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
         : false
     if (shellPainted) {
       cachedStagePainted = true
-      pushOptimisticUrl()
-      scheduleNavigationScroll(url, options)
+      commitPaint()
     }
   }
   // Which navigations may fetch the PAGE frame alone. Never on popstate (a history entry
@@ -5389,7 +5454,7 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   // would compare the destination with itself and hide every param transition.
   const parallelSlotsChanged = navSlotsChanged(doc)
   const remountPageIslands =
-    (options.pop && !parallelSlotsChanged) || routeParamBoundaryChanged(doc)
+    (options.pop && !parallelSlotsChanged) || routeParamBoundaryChanged(doc, paintedRoute)
   const committedRoute = documentRouteState(doc)
   if (committedRoute) window.__PNEXT_ROUTE__ = committedRoute
 
@@ -5646,19 +5711,6 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   if (!options.pop && departingBfcacheId && departingBfcacheId === historyBfcacheId()) {
     restoreFormStateWhenMounted(departingBfcacheId, sequence, true)
   }
-  if (typeof __PNEXT_NEXT_ROUTER__ === 'undefined' && keptCopies.has(page))
-    void revalidateCommittedPage(targetUrl, sequence, page)
-}
-
-async function revalidateCommittedPage(url: URL, sequence: number, page: PrefetchedPage) {
-  const fresh = await keptCopies.get(page)
-  if (!fresh?.ok || fresh.html === page.html || sequence !== navigationSequence) return
-  await softNavigate(url.href, {
-    replace: true,
-    scroll: false,
-    refreshLike: true,
-    cachedPage: fresh,
-  })
 }
 
 function isBotUserAgent() {

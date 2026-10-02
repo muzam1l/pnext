@@ -49,7 +49,7 @@ Requests use low network priority. At most four run at once, though the hover-in
 
 ## Soft navigation
 
-Link clicks and router pushes swap the page in place instead of reloading the document, so shared chunks and CSS are never re-downloaded. A new page starts at the top, and back and forward stay soft and restore scroll. When a link shows a dynamic page again from the router cache, the page refreshes in the background and the fresh render replaces it in place. Cross-origin targets, non-HTML responses, and fetch failures fall back to a full page load.
+Link clicks and router pushes swap the page in place instead of reloading the document, so shared chunks and CSS are never re-downloaded. A new page starts at the top, and back and forward stay soft and restore scroll. A dynamic page the router kept from a prefetch or a visit is reused as-is for 5 seconds. After that, the link paints the page's layout and loading fallbacks at once and streams fresh data in, so old data never shows; the frame stays reusable for five minutes. Back and forward restore the page as it was shown. Cross-origin targets, non-HTML responses, and fetch failures fall back to a full page load.
 
 ## Redirects and not found
 
