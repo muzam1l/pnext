@@ -5217,6 +5217,8 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   // A painted loading boundary or stage is a committed navigation state.
   const commitPaint = () => {
     paintedRoute = window.__PNEXT_ROUTE__
+    if (typeof __PNEXT_NEXT_ROUTER__ === 'undefined')
+      routerState.fallbackPaint = [sequence, performance.now()]
     pushOptimisticUrl()
     scheduleNavigationScroll(url, options)
   }
@@ -5415,6 +5417,14 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
       Promise.all(pendingStylesheets),
     ])
     if (sequence !== navigationSequence) return abandonFetchedPage(page)
+  }
+  // React's FALLBACK_THROTTLE_MS: content replacing a committed fallback reveals no sooner than 300 ms after it.
+  if (typeof __PNEXT_NEXT_ROUTER__ === 'undefined' && routerState.fallbackPaint?.[0] === sequence) {
+    const wait = routerState.fallbackPaint[1] + 300 - performance.now()
+    if (wait > 10) {
+      await new Promise(resolve => setTimeout(resolve, wait))
+      if (sequence !== navigationSequence) return abandonFetchedPage(page)
+    }
   }
 
   if (!options.pop) {

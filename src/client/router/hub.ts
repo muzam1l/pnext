@@ -14,7 +14,13 @@ import type { EntryModule } from './types'
 // region (install, soft nav, popstate), so it lives on one record: a module-level `let` can only be
 // reassigned inside the module that declares it. State only the runtime touches stays in ./runtime.
 
-export const routerState = {
+export const routerState: {
+  observedLocationKey: string
+  activeRouteKey: string | undefined
+  renderedEntryId: string | undefined
+  /** The navigation that last painted a fallback, and when. */
+  fallbackPaint?: [sequence: number, at: number]
+} = {
   // pathname+search of the URL the router last observed. A popstate that leaves both unchanged is a
   // same-document FRAGMENT traversal - Chrome fires popstate, not just hashchange, for those - and
   // treating one as a history traversal would refetch and swap the body, remounting the live tree
