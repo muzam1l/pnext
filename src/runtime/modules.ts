@@ -1420,6 +1420,24 @@ export const compiledSpecifiersManifestSuffix = '.pnext-specifiers.json'
 const compiledScriptFilePattern = /\.(?:m?js|cjs|jsx|tsx?)$/
 
 async function writeCompiledFile(file: string, contents: string) {
+  const profileRoot = compiledArtifactProfileRoot(file)
+  if (profileRoot && contents.includes('file://')) {
+    const cacheRoot = path.dirname(profileRoot)
+    const edits: { start: number; end: number; value: string }[] = []
+    for (const found of outputSpecifiers(contents)) {
+      const { sourcePath, hash } = splitHash(found.value)
+      if (!sourcePath.startsWith('file://')) continue
+      const target = fileURLToPath(sourcePath)
+      if (!isInside(cacheRoot, target)) continue
+      const relative = toPosixPath(path.relative(path.dirname(file), target))
+      edits.push({
+        start: found.start,
+        end: found.end,
+        value: JSON.stringify(`${relative.startsWith('.') ? relative : `./${relative}`}${hash}`),
+      })
+    }
+    contents = spliceSource(contents, edits)
+  }
   await writeFileAtomic(file, contents)
   noteDevArtifactWritten(file)
   if (emitCompiledSpecifiersManifest && compiledScriptFilePattern.test(file)) {
@@ -1431,7 +1449,7 @@ async function writeCompiledFile(file: string, contents: string) {
 }
 
 /**
- * Whether every file URL reachable from a compiled artifact is already on
+ * Whether every module reachable from a compiled artifact is already on
  * disk. Individual files publish atomically, but the graph is a set of files:
  * the build's warm child can expose an importer to the parent before it has
  * exposed that importer's slower sibling. A mere existsSync(importer) is
@@ -1474,10 +1492,12 @@ function missingCompiledArtifact(entry: string): string | undefined {
       // profile directory. Static imports must be complete before evaluation.
       if (kind === 'dynamic') continue
       const { sourcePath } = splitHash(specifier)
-      if (!sourcePath.startsWith('file://')) continue
+      if (!sourcePath.startsWith('file://') && !sourcePath.startsWith('.')) continue
       let target: string
       try {
-        target = fileURLToPath(sourcePath)
+        target = sourcePath.startsWith('file://')
+          ? fileURLToPath(sourcePath)
+          : path.resolve(path.dirname(file), sourcePath)
       } catch {
         return sourcePath
       }
@@ -2433,6 +2453,7 @@ async function resolveDevModuleSpecifier(
     config.root,
     importer && !importer.startsWith('<') ? importer : file,
     sourcePath,
+    config.workspaceRoot,
   )
   // A relative specifier that resolved names first-party source next to its importer, so compile it
   // through the normal pipeline even outside workspaceRoot (compat's own runtime files live inside
@@ -2806,7 +2827,7 @@ function shouldBundleExternalPackage(
   if (options.aliases[specifier]) return false
   if (specifier === 'server-only') return false
   if (!isPackageSpecifier(specifier)) return false
-  const resolved = resolveImport(config.root, file, specifier)
+  const resolved = resolveImport(config.root, file, specifier, config.workspaceRoot)
   const inWorkspace = resolved !== undefined && isInside(config.workspaceRoot, resolved)
   // transpilePackages force-bundle; serverExternalPackages force-external (never bundled). A
   // transpiled package that resolves INSIDE the workspace is first-party source, not a registry
@@ -2859,7 +2880,7 @@ function localImportTargets(
     // compiling them as modules would fail the import scan. Css keeps its
     // copy-through so compiled css module paths stay importable.
     if (isServerIgnoredAssetSpecifier(sourcePath) && !isCssFile(sourcePath)) continue
-    const resolved = resolveImport(config.root, file, sourcePath)
+    const resolved = resolveImport(config.root, file, sourcePath, config.workspaceRoot)
     // `resolveExtensions` can land an extensionless specifier on an asset
     // (`import img from './image'` -> image.png), which the specifier check
     // above misses — compiling the image bytes as a module fails the build.
@@ -2894,7 +2915,7 @@ async function writeClientReferenceModules(
   for (const specifier of importSpecifiers(source, file)) {
     const { sourcePath } = splitHash(specifier)
     if (aliases[specifier] || aliases[sourcePath]) continue
-    const resolved = resolveImport(config.root, file, sourcePath)
+    const resolved = resolveImport(config.root, file, sourcePath, config.workspaceRoot)
     if (!resolved || !isInside(config.workspaceRoot, resolved) || isCssFile(resolved)) continue
     if (!(await fileHasUseClientDirective(resolved))) continue
 
@@ -3107,7 +3128,7 @@ function packageNameFromSpecifier(specifier: string) {
 
 function resolveLocalImport(config: ResolvedConfig, fromFile: string, specifier: string) {
   if (path.isAbsolute(specifier)) return existsSync(specifier) ? specifier : undefined
-  return resolveImport(config.root, fromFile, specifier)
+  return resolveImport(config.root, fromFile, specifier, config.workspaceRoot)
 }
 
 async function linkAssetContext(config: ResolvedConfig, file: string, profile: string) {

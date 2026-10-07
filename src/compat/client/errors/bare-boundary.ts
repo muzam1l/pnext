@@ -24,7 +24,7 @@ export class BareErrorBoundary extends Component<{ children?: unknown }, BareBou
     // Everything else re-throws: unmarked, so the window last resort still sees
     // a genuinely uncaught error and drives it.
     if (error === null || typeof error !== 'object') {
-      void import('./global-error').then(module => module.escalateToGlobalError(error))
+      void import('./install').then(module => module.escalateToGlobalError(error))
       return null
     }
     throw error as Error

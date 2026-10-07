@@ -121,22 +121,10 @@ function renderBuiltinFallback(root: HTMLElement, error: unknown): void {
     : 'Reload to try again, or go back.'
 
   ensureThemeStyle()
-  Object.assign(root.style, {
-    fontFamily:
-      'system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji"',
-    height: '100vh',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-  } as Partial<CSSStyleDeclaration>)
+  root.style.cssText =
+    'font-family:system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji";height:100vh;display:flex;align-items:center;justify-content:center'
 
-  const card = document.createElement('div')
-  Object.assign(card.style, {
-    marginTop: '-32px',
-    maxWidth: '325px',
-    padding: '32px 28px',
-    textAlign: 'left',
-  } as Partial<CSSStyleDeclaration>)
+  const card = styled('div', 'margin-top:-32px;max-width:325px;padding:32px 28px;text-align:left')
 
   const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
   icon.setAttribute('width', '32')
@@ -152,46 +140,30 @@ function renderBuiltinFallback(root: HTMLElement, error: unknown): void {
   path.setAttribute('fill', 'var(--next-error-title)')
   icon.append(path)
 
-  const title = document.createElement('h1')
-  title.textContent = 'This page couldn’t load'
-  Object.assign(title.style, {
-    fontSize: '24px',
-    fontWeight: '500',
-    letterSpacing: '-0.02em',
-    lineHeight: '32px',
-    margin: '0 0 12px 0',
-    color: 'var(--next-error-title)',
-  } as Partial<CSSStyleDeclaration>)
+  const title = styled(
+    'h1',
+    'font-size:24px;font-weight:500;letter-spacing:-0.02em;line-height:32px;margin:0 0 12px 0;color:var(--next-error-title)',
+    'This page couldn’t load',
+  )
+  const body = styled(
+    'p',
+    'font-size:14px;font-weight:400;line-height:21px;margin:0 0 20px 0;color:var(--next-error-message)',
+    message,
+  )
 
-  const body = document.createElement('p')
-  body.textContent = message
-  Object.assign(body.style, {
-    fontSize: '14px',
-    fontWeight: '400',
-    lineHeight: '21px',
-    margin: '0 0 20px 0',
-    color: 'var(--next-error-message)',
-  } as Partial<CSSStyleDeclaration>)
-
-  const buttonGroup = document.createElement('div')
-  Object.assign(buttonGroup.style, { display: 'flex', gap: '8px', alignItems: 'center' })
-  const reloadForm = document.createElement('form')
-  reloadForm.style.margin = '0'
+  const buttonGroup = styled('div', 'display:flex;gap:8px;align-items:center')
+  const reloadForm = styled('form', 'margin:0')
   reloadForm.addEventListener('submit', event => {
     event.preventDefault()
     location.reload()
   })
-  const reload = document.createElement('button')
+  const reload = styled('button', buttonStyle(''), 'Reload')
   reload.type = 'submit'
-  reload.textContent = 'Reload'
-  Object.assign(reload.style, buttonStyle(false))
   reloadForm.append(reload)
   buttonGroup.append(reloadForm)
   if (!isServerError) {
-    const back = document.createElement('button')
+    const back = styled('button', buttonStyle('secondary-'), 'Back')
     back.type = 'button'
-    back.textContent = 'Back'
-    Object.assign(back.style, buttonStyle(true))
     back.addEventListener('click', () => {
       if (window.history.length > 1) window.history.back()
       else window.location.href = '/'
@@ -203,42 +175,31 @@ function renderBuiltinFallback(root: HTMLElement, error: unknown): void {
   if (isServerError) {
     // Next's DefaultGlobalError digest footer (`ERROR <digest>`), fixed to the
     // bottom so operators can correlate the redacted UI with server logs.
-    const footer = document.createElement('p')
-    footer.textContent = `ERROR ${digest}`
-    Object.assign(footer.style, {
-      position: 'fixed',
-      bottom: '32px',
-      left: '0',
-      right: '0',
-      textAlign: 'center',
-      fontFamily: 'ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace',
-      fontSize: '12px',
-      lineHeight: '18px',
-      fontWeight: '400',
-      margin: '0',
-      color: 'var(--next-error-digest)',
-    } as Partial<CSSStyleDeclaration>)
-    root.append(footer)
+    root.append(
+      styled(
+        'p',
+        'position:fixed;bottom:32px;left:0;right:0;text-align:center;font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;font-size:12px;line-height:18px;font-weight:400;margin:0;color:var(--next-error-digest)',
+        `ERROR ${digest}`,
+      ),
+    )
   }
   if (typeof document.title !== 'undefined') document.title = '500: This page couldn’t load'
 }
 
-function buttonStyle(secondary: boolean): Partial<CSSStyleDeclaration> {
-  return {
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    height: '32px',
-    padding: '0 12px',
-    fontSize: '14px',
-    fontWeight: '500',
-    lineHeight: '20px',
-    borderRadius: '6px',
-    cursor: 'pointer',
-    color: secondary ? 'var(--next-error-btn-secondary-text)' : 'var(--next-error-btn-text)',
-    background: secondary ? 'var(--next-error-btn-secondary-bg)' : 'var(--next-error-btn-bg)',
-    border: secondary ? 'var(--next-error-btn-secondary-border)' : 'var(--next-error-btn-border)',
-  }
+// Styles go through CSSOM (style.cssText), never style attributes, so a strict style-src CSP allows them.
+function styled<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  css: string,
+  text?: string,
+): HTMLElementTagNameMap[K] {
+  const element = document.createElement(tag)
+  element.style.cssText = css
+  if (text !== undefined) element.textContent = text
+  return element
+}
+
+function buttonStyle(variant: string): string {
+  return `display:inline-flex;align-items:center;justify-content:center;height:32px;padding:0 12px;font-size:14px;font-weight:500;line-height:20px;border-radius:6px;cursor:pointer;color:var(--next-error-btn-${variant}text);background:var(--next-error-btn-${variant}bg);border:var(--next-error-btn-${variant}border)`
 }
 
 const THEME_STYLE_ID = '__pnext_global_error_theme__'

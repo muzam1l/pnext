@@ -14,7 +14,7 @@
 
 import { existsSync, readdirSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { writeFileAtomic } from '../utils/fs'
+import { includeTypes, writeFileAtomic } from '../utils/fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import type { ResolvedConfig } from '../config'
@@ -236,16 +236,13 @@ export async function writeTsconfigDefaults(config: ResolvedConfig): Promise<voi
       hasAppDir && !strictRouteTypes
         ? ['next-env.d.ts', ...nextTypes, '**/*.mts', '**/*.ts', '**/*.tsx']
         : ['next-env.d.ts', '**/*.mts', '**/*.ts', '**/*.tsx']
-    userTsConfig.include = defaultInclude
+    includeTypes(userTsConfig, [], defaultInclude)
     suggestedActions.push(
       `include was set to [${defaultInclude.map(type => `'${type}'`).join(', ')}]`,
     )
   } else if (hasAppDir && !strictRouteTypes && Array.isArray(userTsConfig.include)) {
-    for (const type of nextTypes) {
-      if (!userTsConfig.include.includes(type)) {
-        userTsConfig.include.push(type)
-        suggestedActions.push(`include was updated to add '${type}'`)
-      }
+    for (const type of includeTypes(userTsConfig, nextTypes, [])) {
+      suggestedActions.push(`include was updated to add '${type}'`)
     }
   }
 

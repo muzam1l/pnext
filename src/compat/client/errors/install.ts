@@ -42,7 +42,7 @@ export { ClientErrorBoundary, toClientError } from './error-boundary'
 export { markErrorHandled, wasErrorHandled } from './error-boundary'
 export type { RouteErrorComponent } from './error-boundary'
 export { isControlFlowError, handleControlFlowError } from './control-flow'
-export { mountGlobalError } from './global-error'
+export { escalateToGlobalError, mountGlobalError } from './global-error'
 export { softRefreshRoute } from './soft-refresh'
 
 export interface InstallOptions {

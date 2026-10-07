@@ -1,3 +1,4 @@
+import { resolveManifest } from '../../utils/fs'
 /**
  * Module warm-up for a production build - run in its own process.
  *
@@ -549,7 +550,11 @@ if (import.meta.main) {
   // only thing on stderr.
   const manifestFile = path.join(config.outPath, 'manifest.json')
   if (!request.skip || !existsSync(manifestFile)) process.exit(0)
-  const manifest = JSON.parse(await readFile(manifestFile, 'utf8')) as BuildManifest
+  const manifest = resolveManifest(
+    JSON.parse(await readFile(manifestFile, 'utf8')) as BuildManifest,
+    config.outPath,
+    config.root,
+  )
   await warmRouteModules(config, manifest, new Set(request.skip ?? []), mode)
   // App code reached through a route handler can leave the loop alive (a db
   // pool, a stray interval); the warm pass is done either way.

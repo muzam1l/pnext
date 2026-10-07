@@ -35,6 +35,7 @@ import {
 } from '../../extensions'
 import {
   isEsmModuleFile,
+  findWorkspaceRoot,
   isWorkspacePackage,
   packageNameForFile,
   packageNameOfSpecifier,
@@ -593,5 +594,12 @@ function clientSourceRootPrefixes(config: ResolvedConfig): string[] {
 // First-party workspace source is implicitly transpiled. Hoisting puts the
 // package only in the workspace root's node_modules, so both roots are asked.
 function isLinkedWorkspacePackage(config: ResolvedConfig, name: string) {
-  return isWorkspacePackage(config.root, name) || isWorkspacePackage(config.workspaceRoot, name)
+  const boundary =
+    config.workspaceRoot === (findWorkspaceRoot(config.root) ?? config.root)
+      ? undefined
+      : config.workspaceRoot
+  return (
+    isWorkspacePackage(config.root, name, boundary) ||
+    isWorkspacePackage(config.workspaceRoot, name, boundary)
+  )
 }

@@ -1,3 +1,4 @@
+import { resolveManifest } from '../../utils/fs'
 /**
  * The production request pipeline. Split out of `start.ts` so the prebundled
  * server entry parses only what listening needs: this module (renderer,
@@ -99,9 +100,16 @@ export async function createRequestHandler(
   const manifestPath = path.join(config.outPath, 'manifest.json')
   // `start` reads the manifest before binding the port (a missing build must
   // still fail there, not on the first request) and hands it over.
-  const manifest =
-    options.manifest ?? (JSON.parse(await readFile(manifestPath, 'utf8')) as BuildManifest)
-  const persistManifest = () => writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+  const manifest = resolveManifest(
+    options.manifest ?? (JSON.parse(await readFile(manifestPath, 'utf8')) as BuildManifest),
+    config.outPath,
+    config.root,
+  )
+  const persistManifest = async () => {
+    const stored = JSON.parse(await readFile(manifestPath, 'utf8')) as BuildManifest
+    stored.staticFiles = manifest.staticFiles
+    await writeFile(manifestPath, `${JSON.stringify(stored, null, 2)}\n`)
+  }
   // Compat action-registry arming + serverActions.bodySizeLimit resolution +
   // fetch-cache install now run through the extension registry: the action
   // dispatch interceptor rebuilds the registry from manifest.actions on the

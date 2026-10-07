@@ -16,28 +16,30 @@ import type { EntryModule } from './types'
 
 export const routerState: {
   observedLocationKey: string
-  activeRouteKey: string | undefined
-  renderedEntryId: string | undefined
+  // The route key (pathname+search) of the currently committed navigation, used
+  // as the departing key on popstate (where `location` already points at the
+  // target). Seeded on router init and updated at each committed navigation.
+  activeRouteKey?: string
+  // The entry id whose document is currently on screen. A traversal to that
+  // same id — an app-level shallow pushState now carries the id forward — needs
+  // no fetch and no swap: the DOM already is this entry's.
+  renderedEntryId?: string
   /** The navigation that last painted a fallback, and when. */
   fallbackPaint?: [sequence: number, at: number]
+  /** Ends the clicked link's pending state; set once the runtime installs. */
+  settleLink?: () => void
 } = {
   // pathname+search of the URL the router last observed. A popstate that leaves both unchanged is a
   // same-document FRAGMENT traversal - Chrome fires popstate, not just hashchange, for those - and
   // treating one as a history traversal would refetch and swap the body, remounting the live tree
   // under the user's feet.
   observedLocationKey: locationKey(),
-  // The route key (pathname+search) of the currently committed navigation, used
-  // as the departing key on popstate (where `location` already points at the
-  // target). Seeded on router init and updated at each committed navigation.
-  activeRouteKey: undefined as string | undefined,
-  // The entry id whose document is currently on screen. A traversal to that
-  // same id — an app-level shallow pushState now carries the id forward — needs
-  // no fetch and no swap: the DOM already is this entry's.
-  renderedEntryId: undefined as string | undefined,
 }
 
 export function locationKey() {
-  return typeof location === 'undefined' ? '' : location.pathname + location.search
+  return process.browser || typeof location !== 'undefined'
+    ? location.pathname + location.search
+    : ''
 }
 
 // Installers that only the navigation runtime ever observes — compat's policy

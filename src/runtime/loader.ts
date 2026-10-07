@@ -187,6 +187,7 @@ export function registerServerRuntime(config: ResolvedConfig, sourceFiles: strin
 
   const aliases = aliasesForConfig(config)
   const roots = [
+    ...rootPaths(config.root),
     ...rootPaths(config.appPath),
     ...rootPaths(path.join(config.outPath, 'cache', 'server')),
     // The pnext src root, so the framework's own source transforms too.
@@ -219,7 +220,7 @@ export function registerServerRuntime(config: ResolvedConfig, sourceFiles: strin
   }
   registerResolvePlugin()
   registerNodeModulesLoadPlugin()
-  for (const root of roots) registerLoadPlugin(root)
+  for (const root of roots) registerLoadPlugin(root, rootPaths(config.root).includes(root))
 }
 
 /**
@@ -236,7 +237,12 @@ export function installServerRuntimePlugins(): void {
   pluginsDeferred = false
   registerResolvePlugin()
   registerNodeModulesLoadPlugin()
-  for (const root of deferredPluginRoots) registerLoadPlugin(root)
+  for (const root of deferredPluginRoots) {
+    const projectRoot = [...runtimeConfigs.values()].some(config =>
+      rootPaths(config.root).includes(root),
+    )
+    registerLoadPlugin(root, projectRoot)
+  }
   deferredPluginRoots.clear()
 }
 
@@ -302,7 +308,7 @@ function registerResolvePlugin() {
   })
 }
 
-function registerLoadPlugin(root: string) {
+function registerLoadPlugin(root: string, projectRoot = false) {
   if (registeredLoadRoots.has(root)) return
   registeredLoadRoots.add(root)
   if (traceEnabled('server')) {
@@ -312,7 +318,7 @@ function registerLoadPlugin(root: string) {
   Bun.plugin({
     name: `pnext-server-runtime-load-${hashRoot(root)}`,
     setup(plugin) {
-      plugin.onLoad({ filter: rootFilter(root) }, async ({ path: file }) => ({
+      plugin.onLoad({ filter: rootFilter(root, projectRoot) }, async ({ path: file }) => ({
         contents: await transformSource(file),
         loader: 'js',
       }))
@@ -594,12 +600,17 @@ async function inlineModuleScopeRequires(
 function requireCallTarget(root: string, file: string, specifier: string): string | undefined {
   if (specifier.startsWith('file://')) {
     try {
-      return resolveImport(root, file, fileURLToPath(specifier))
+      return resolveImport(
+        root,
+        file,
+        fileURLToPath(specifier),
+        runtimeConfigForFile(file)?.resolved.workspaceRoot,
+      )
     } catch {
       return undefined
     }
   }
-  return resolveImport(root, file, specifier)
+  return resolveImport(root, file, specifier, runtimeConfigForFile(file)?.resolved.workspaceRoot)
 }
 
 // Compile an app module to a sibling `.pnext-require.cjs` (CommonJS), reusing a
@@ -751,7 +762,8 @@ export function rewriteServerSource(
   const rewritten = sourceHasDynamicImport(source)
     ? rewriteDynamicCallTargets(
         rewriteLiteralDynamicCalls(source, file),
-        specifier => resolveImport(root, file, specifier),
+        specifier =>
+          resolveImport(root, file, specifier, runtimeConfigForFile(file)?.resolved.workspaceRoot),
         file,
       )
     : source
@@ -867,12 +879,13 @@ function rootPaths(root: string) {
   return resolved
 }
 
-function rootFilter(root: string) {
+function rootFilter(root: string, projectRoot = false) {
   // Base source extensions plus any extra loadable extensions registered by
   // compat (e.g. mdx/md via pageExtensions). Without these, `.mdx` modules skip
   // the transform load hook and resolve as raw assets (default export = path).
   const extras = currentLoadExtras().map(escapeRegex)
-  const exts = ['[jt]sx?', ...extras].join('|')
+  // Project-wide coverage handles JSX/TS; plain JS tools and build output keep their own loaders.
+  const exts = [projectRoot ? 'tsx?|jsx' : '[jt]sx?', ...extras].join('|')
   // Exclude `next.config.{js,cjs,mjs,ts}`: it is loaded for its exported value (often CommonJS
   // `module.exports = ...`), not as part of the app's server module graph. Routing it through the
   // ES-module source transform drops the CJS exports, silently disabling next.config
@@ -884,8 +897,14 @@ function rootFilter(root: string) {
   const vendorGuard = vendorLoadsNatively()
     ? `${root.endsWith(`${path.sep}cache${path.sep}server`) ? '(?!\\/vendor\\/)' : ''}(?!.*\\/cache\\/server\\/vendor\\/)`
     : ''
+  // Project-wide roots include precompiled server output. Keep its chunks native: transforming
+  // them loads compiler libraries and starts an esbuild service on the first production request.
+  const serverGuard = [...runtimeConfigs.values()]
+    .flatMap(runtime => rootPaths(path.join(runtime.resolved.outPath, 'server')))
+    .map(serverRoot => `(?!${escapeRegex(serverRoot)}(?:/|$))`)
+    .join('')
   return new RegExp(
-    `^${escapeRegex(root)}${vendorGuard}(?!.*\\/node_modules\\/)(?!\\/next\\.config\\.(?:js|cjs|mjs|ts)$)(?:/.*)?\\.(?:${exts})$`,
+    `^${serverGuard}${escapeRegex(root)}${vendorGuard}(?!.*\\/node_modules\\/)(?!\\/next\\.config\\.(?:js|cjs|mjs|ts)$)(?:/.*)?\\.(?:${exts})$`,
   )
 }
 

@@ -104,7 +104,7 @@ export function serverSymlinkImportPlugin(config: ResolvedConfig): Plugin {
           return undefined
         }
         if (await isRealPath(args.importer)) return undefined
-        const target = resolveImport(config.root, args.importer, args.path)
+        const target = resolveImport(config.root, args.importer, args.path, config.workspaceRoot)
         if (!target) return undefined
         return build.resolve(target, {
           kind: args.kind,

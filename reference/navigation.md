@@ -92,7 +92,9 @@ Exported from `@wular/pnext/navigation/client`, for use in components marked `"u
 | `useSearchParams()`  | Read-only URL search params.                                  |
 | `useParams<Route>()` | Current route params from the initial route state.            |
 | `useRoute<Route>()`  | Pathname, route template, params, and search params together. |
-| `useLinkStatus()`    | Currently always `{ pending: false }`.                        |
+| `useLinkStatus()`    | `{ pending }` for the enclosing `<Link>`.                     |
+
+`useLinkStatus()` tracks the pending state of a `<Link>`, so call it in a component rendered inside one. `pending` turns true when the link is clicked and false once its navigation paints a loading state or the page, fails, or another navigation replaces it.
 
 Router pushes and replaces are typed like links. They soft-navigate when the path or query changes, and fall back to the History API for same-URL hash updates. Cross-origin targets become a full page load. Refreshing re-fetches the current route in place.
 

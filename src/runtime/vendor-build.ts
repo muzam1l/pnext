@@ -1754,8 +1754,8 @@ function nearestManifestDir(from: string) {
     const manifest = path.join(dir, 'package.json')
     if (existsSync(manifest)) {
       try {
-        const parsed = JSON.parse(readFileSync(manifest, 'utf8')) as { name?: unknown }
-        if (typeof parsed.name === 'string') {
+        const parsed: unknown = JSON.parse(readFileSync(manifest, 'utf8'))
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
           nearestManifestDirs.set(from, dir)
           return dir
         }

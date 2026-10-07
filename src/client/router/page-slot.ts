@@ -27,6 +27,64 @@ export function elementInPageSlot(element: Element): boolean {
   )
 }
 
+const SEGMENT = 'pnext-layout[data-pnext-segment]'
+
+/** A server layout's identity and the URL prefix it rendered for. */
+export function segmentKey(segment: Element): string {
+  return `${segment.getAttribute('data-pnext-segment')}\u0001${segment.getAttribute('data-pnext-scope')}`
+}
+
+/** The server layout directly below `segment`, outside parallel-route slots. */
+export function childSegment(segment: Element): Element | null {
+  for (const child of segment.querySelectorAll(SEGMENT))
+    if (!segment.contains(child.closest('[data-pnext-slot]'))) return child
+  return null
+}
+
+/**
+ * The live layout below the deepest layout `boundary` shares with `slot` (null when that layout
+ * holds `slot`), and the incoming node that replaces it: the boundary, or the new layout holding
+ * it. Null when either sits in an island.
+ */
+export function divergingLayout(slot: Node, boundary: Element): [Element | null, Element] | null {
+  let paint = boundary
+  let owner = boundary.closest(SEGMENT)
+  let below: Element | null
+  for (;;) {
+    const key = owner && segmentKey(owner)
+    below = null
+    let layout = slot.parentElement?.closest(SEGMENT)
+    for (; layout && segmentKey(layout) !== key; layout = layout.parentElement?.closest(SEGMENT))
+      below = layout
+    if (layout || !owner) break
+    paint = owner
+    owner = owner.parentElement!.closest(SEGMENT)
+  }
+  return !boundary.closest('pnext-client') &&
+    !(below ?? slot).parentElement?.closest('pnext-client')
+    ? [below, paint]
+    : null
+}
+
+function childNodes(segment: Element): ChildNode[] | null {
+  const child = childSegment(segment)
+  if (child) return [child]
+  const range = pageSlotRange(segment)
+  return range && (range[1] ? [range[0], ...range[2], range[1]] : [range[0]])
+}
+
+/** Replace a kept layout's children (its child layout or page slot) with the incoming ones. */
+export function graftSegmentChildren(liveSegment: Element, incomingSegment: Element): boolean {
+  if (!childSegment(liveSegment) && !childSegment(incomingSegment))
+    return graftPageSlot(liveSegment, incomingSegment)
+  const live = childNodes(liveSegment)
+  const incoming = childNodes(incomingSegment)
+  if (!live || !incoming) return false
+  live[0]!.before(...incoming)
+  for (const stale of live) stale.remove()
+  return true
+}
+
 /**
  * Graft a destination page into a preserved layout without changing the destination's mount shape.
  * Client pages need the real `#pnext-page` element; server/island-only pages need the marker range.

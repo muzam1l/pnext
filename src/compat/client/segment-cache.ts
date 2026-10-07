@@ -300,11 +300,7 @@ function recordOneSegment(rawInput: SegmentRecordInput): void {
     // really did answer this pathname with that route, and the sibling guard
     // in `candidateKeys` reads it to keep other routes off this URL.
     resolvedRoutes.set(rawInput.pathname, rawInput.route)
-    while (resolvedRoutes.size > SEGMENT_ENTRY_LIMIT) {
-      const oldest = resolvedRoutes.keys().next().value
-      if (oldest === undefined) break
-      resolvedRoutes.delete(oldest)
-    }
+    trimOldest(resolvedRoutes)
   }
   const key = entryKey(input.segmentPath, input.route, input.params, input.search, input.vary, {
     pathname: input.pathname,
@@ -332,7 +328,7 @@ function recordOneSegment(rawInput: SegmentRecordInput): void {
     // LRU-bound like `entries`/`resolvedRoutes`: a route publishing a new vary
     // set per prefetch (dynamic params in the vary set) would otherwise grow this
     // map without limit (memory-pressure leak-slope test).
-    trimLearnedRoutes(byRoute)
+    trimOldest(byRoute)
   }
   const sharedAppShell = input.sharedAppShell === true || isRouteWideAppShell(input)
   const existing = entries.get(key)
@@ -363,7 +359,7 @@ function recordOneSegment(rawInput: SegmentRecordInput): void {
     sharedAppShell,
   })
   touch(key)
-  trim()
+  trimOldest(entries)
 }
 
 /**
@@ -620,11 +616,7 @@ export function recordDocumentLayoutFrame(input: {
     time: now(),
     staleTimeMs: input.staleTimeMs,
   })
-  while (documentLayoutFrames.size > DOCUMENT_LAYOUT_LIMIT) {
-    const oldest = documentLayoutFrames.keys().next().value
-    if (oldest === undefined) break
-    documentLayoutFrames.delete(oldest)
-  }
+  trimOldest(documentLayoutFrames, DOCUMENT_LAYOUT_LIMIT)
 }
 
 /**
@@ -968,12 +960,9 @@ function touch(key: string): void {
   entries.set(key, entry)
 }
 
-function trim(): void {
-  while (entries.size > SEGMENT_ENTRY_LIMIT) {
-    const oldest = entries.keys().next().value
-    if (oldest === undefined) return
-    entries.delete(oldest)
-  }
+// Drop insertion-order-oldest entries beyond `limit` (keys are never undefined).
+function trimOldest(map: Map<string, unknown>, limit = SEGMENT_ENTRY_LIMIT): void {
+  while (map.size > limit) map.delete(map.keys().next().value!)
 }
 
 function touchLearnedRoute(segmentPath: string, learnedKey: string): void {
@@ -982,14 +971,6 @@ function touchLearnedRoute(segmentPath: string, learnedKey: string): void {
   if (!byRoute || !learned) return
   byRoute.delete(learnedKey)
   byRoute.set(learnedKey, learned)
-}
-
-function trimLearnedRoutes(byRoute: Map<string, LearnedRoute>): void {
-  while (byRoute.size > SEGMENT_ENTRY_LIMIT) {
-    const oldest = byRoute.keys().next().value
-    if (oldest === undefined) return
-    byRoute.delete(oldest)
-  }
 }
 
 /**

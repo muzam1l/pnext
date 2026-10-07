@@ -3,7 +3,7 @@ import { wrapComponentForPrimitiveThrows } from '../client/errors/primitive-thro
 
 const reactForwardRefSymbol = Symbol.for('react.forward_ref')
 const react19RefCompatInstalled = Symbol.for('pnext.react19-ref-compat-installed')
-const reactTextSeparatorSymbol = Symbol.for('pnext.react-text-separator')
+const reactTextSeparatorSymbol = /* @__PURE__ */ Symbol.for('pnext.react-text-separator')
 
 type PNextPreactOptions = typeof options & {
   [react19RefCompatInstalled]?: true

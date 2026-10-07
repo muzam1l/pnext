@@ -22,6 +22,7 @@ import path from 'node:path'
 import { resolveImport } from '../../resolve/imports'
 import { nextCssSource } from './modules'
 import { escapeRegex } from '../../utils/code'
+import { cssModuleScopePath } from '../../utils/fs'
 
 // Structural typing of the slice of the Dart Sass JS API we use. Avoids a hard
 // type dependency on the optional `sass` package (mirrors how css.ts/runtime.ts
@@ -362,13 +363,6 @@ function keyframeNames(css: string): Set<string> {
     if (match[1]) names.add(match[1])
   }
   return names
-}
-
-function cssModuleScopePath(file: string): string {
-  const normalized = file.split(path.sep).join('/')
-  const appIndex = normalized.lastIndexOf('/app/')
-  if (appIndex !== -1) return normalized.slice(appIndex + 1)
-  return normalized.split('/').slice(-3).join('/')
 }
 
 function rewriteClassSelector(

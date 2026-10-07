@@ -19,6 +19,7 @@
 // compat/aliases.ts reactCompatEnabled/nextCompatEnabled.
 
 import type { ResolvedConfig } from './config'
+import type { RouteManifestEntry } from './types'
 import { onExtensionHostReset } from './extensions'
 import { installFetchHostNormalization } from './runtime/fetch-host'
 
@@ -68,4 +69,18 @@ export function bootstrapCompat(
     .then(() => import('./compat/register/index'))
     .then(module => module.registerCompatExtensions(config, options))
   return registration
+}
+
+/** Generate compat types without running build hooks or a typecheck. */
+export async function generateCompatRouteTypes(
+  config: ResolvedConfig,
+  routes: RouteManifestEntry[],
+): Promise<void> {
+  if (!config.compat?.next) return
+  const [{ writeTsconfigDefaults }, { generateTypedRoutes }] = await Promise.all([
+    import('./compat/tsconfig-defaults'),
+    import('./compat/typed-routes/generate'),
+  ])
+  await writeTsconfigDefaults(config)
+  await generateTypedRoutes(config, routes)
 }

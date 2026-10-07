@@ -1,7 +1,6 @@
 /** @jsxImportSource preact */
 import { h, type ComponentChildren, type JSX } from 'preact'
 import { useEffect, useRef } from 'preact/hooks'
-import type { AnchorHTMLAttributes, MouseEvent, ReactNode } from 'react'
 import { getDefaultPrefetchMode, routeHref, type SearchInput } from '../routing/href'
 import type { PrefetchMode, RouteParams, RoutePath } from '../types'
 
@@ -9,9 +8,9 @@ export interface NavigateEvent {
   preventDefault(): void
 }
 
-type LinkMouseEvent = MouseEvent<HTMLAnchorElement>
+type LinkMouseEvent = JSX.TargetedMouseEvent<HTMLAnchorElement>
 
-type BaseLinkProps = Omit<AnchorHTMLAttributes<HTMLAnchorElement>, 'href' | 'onClick'> & {
+type BaseLinkProps = Omit<JSX.IntrinsicElements['a'], 'href' | 'onClick' | 'ref'> & {
   prefetch?: PrefetchMode
   replace?: boolean
   scroll?: boolean
@@ -21,7 +20,7 @@ type BaseLinkProps = Omit<AnchorHTMLAttributes<HTMLAnchorElement>, 'href' | 'onC
   onNavigate?: (event: NavigateEvent) => void
   onPrefetchStart?: () => void
   onPrefetchFinish?: () => void
-  children?: ReactNode
+  children?: ComponentChildren
 }
 
 type ParamsProp<Route extends RoutePath> =
@@ -48,7 +47,7 @@ export function Link<Route extends RoutePath>({
   onPrefetchFinish,
   children,
   ...anchorProps
-}: LinkProps<Route>): ReactNode {
+}: LinkProps<Route>): ComponentChildren {
   const resolvedHref = routeHref(href, { params: params ?? {}, search, hash })
   // A link's own prefetch prop wins; otherwise the app-wide config default.
   const prefetchMode = prefetch ?? getDefaultPrefetchMode()
@@ -72,8 +71,8 @@ export function Link<Route extends RoutePath>({
         if (navEvent.defaultPrevented) clickEvent.preventDefault()
       },
     } as JSX.HTMLAttributes<HTMLAnchorElement>,
-    children as ComponentChildren,
-  ) as unknown as ReactNode
+    children,
+  )
 }
 
 // The prefetch runtime dispatches lifecycle events on the anchor that

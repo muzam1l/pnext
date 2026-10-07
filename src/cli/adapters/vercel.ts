@@ -1012,7 +1012,7 @@ async function traceNodeModulesClosure(
         // packages - workspace source gets traced further. Bare package specifiers are also recorded
         // so the closure ships (or workspace-links) their node_modules entries; workspace packages
         // need the link even when their source is traced.
-        const resolved = resolveImport(config.root, file, specifier)
+        const resolved = resolveImport(config.root, file, specifier, config.workspaceRoot)
         if (
           resolved &&
           isInsideDir(workspaceRoot, resolved) &&

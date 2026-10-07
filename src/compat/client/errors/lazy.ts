@@ -79,5 +79,12 @@ export function installClientErrors(installOptions: InstallOptions = {}): void {
   window.addEventListener('error', onError)
   window.addEventListener('unhandledrejection', onRejection)
 
+  // A streamed server error has already thrown: Next shows its boundary while hydrating, not on idle.
+  const pullForStreamError = () => {
+    if (document.querySelector('pnext-error')) void load()
+  }
+  pullForStreamError()
+  document.addEventListener('DOMContentLoaded', pullForStreamError)
+
   registerDeferredInstall(load)
 }

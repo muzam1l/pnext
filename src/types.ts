@@ -658,7 +658,9 @@ export interface StaticRouteMetadata {
 
 export interface BuildManifest {
   version: 0
+  /** Source root relative to outDir on disk; resolved at load. */
   root: string
+  /** App directory relative to root on disk; resolved at load. */
   appDir: string
   outDir: string
   routes: RouteManifestEntry[]

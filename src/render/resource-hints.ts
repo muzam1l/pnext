@@ -21,7 +21,10 @@ export const RENDER_BUFFER_SCOPE = Symbol.for('pnext.renderBufferScope')
 const RENDER_BUFFER_STRAYS = Symbol.for('pnext.renderBufferStrays')
 
 export type RenderBufferKind = 'hints' | 'head' | 'deferred'
-export type RenderBufferFrame = Record<RenderBufferKind, unknown[]>
+export type RenderBufferFrame = Record<RenderBufferKind, unknown[]> & {
+  /** Islands rendered per useId seed, so identical islands get distinct seeds. */
+  islandSeeds?: Map<string, number>
+}
 
 export const newRenderBufferFrame = (): RenderBufferFrame => ({ hints: [], head: [], deferred: [] })
 

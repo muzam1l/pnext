@@ -49,7 +49,15 @@ import type {
   SoftNavigateOptions,
 } from './types'
 import type { LinkClickTarget } from './hub'
-import { elementInPageSlot, graftPageSlot, loadingShellTarget, pageSlotRange } from './page-slot'
+import {
+  childSegment,
+  divergingLayout,
+  elementInPageSlot,
+  graftSegmentChildren,
+  loadingShellTarget,
+  pageSlotRange,
+  segmentKey,
+} from './page-slot'
 // ---------------------------------------------------------------------------
 // DOCUMENTS
 // ---------------------------------------------------------------------------
@@ -140,12 +148,7 @@ export function routeParamBoundaryChanged(
 }
 
 function stableParams(params: Record<string, string | string[]> | undefined): string {
-  if (!params) return ''
-  return JSON.stringify(
-    Object.keys(params)
-      .sort()
-      .map(key => [key, params[key]]),
-  )
+  return params ? slotsStateKey(params as Record<string, string>) : ''
 }
 
 // Importing a route's entry module during a navigation — only the navigation
@@ -516,6 +519,9 @@ function installStylesheets(doc: Document): Promise<void>[] {
   return pending
 }
 
+// React holds every commit until its route sheets load, so an early paint hands its loads to `hold`.
+type SheetHold = (sheets: Promise<void>[]) => void
+
 function absoluteStylesheetHref(href: string) {
   try {
     return new URL(href, location.href).href
@@ -569,9 +575,23 @@ function syncHeadMetadata(doc: Document) {
     if (managedHeadNode(node)) node.remove()
   }
   for (const node of [...doc.head.childNodes]) {
-    if (managedHeadNode(node)) document.head.append(document.importNode(node, true))
+    if (managedHeadNode(node) || newResourceHint(node))
+      document.head.append(document.importNode(node, true))
   }
   document.title = titleText ?? ''
+}
+
+// Hints persist like React's resources: installed once per variant, never pruned.
+function newResourceHint(node: ChildNode) {
+  const key = (link: HTMLLinkElement) =>
+    ['rel', 'href', 'as', 'imagesrcset', 'imagesizes', 'media']
+      .map(name => link.getAttribute(name))
+      .join('\n') + link.crossOrigin
+  return (
+    node instanceof HTMLLinkElement &&
+    /^(preload|modulepreload|preconnect|dns-prefetch)$/.test(node.rel) &&
+    ![...document.head.querySelectorAll('link')].some(link => key(link) === key(node))
+  )
 }
 
 function managedHeadNode(node: ChildNode) {
@@ -688,6 +708,8 @@ function islandMarkerRange(start: Comment, endData: string) {
 }
 
 const SEGMENT_PRESERVE_ATTRIBUTE = 'data-pnext-preserve-segment'
+// A layout a loading shell painted: a copy of the incoming one, never a live layout to keep.
+const SHELL_LAYOUT_ATTRIBUTE = 'data-pnext-shell-layout'
 
 function isTopLevelServerSegment(segment: Element) {
   return segment.parentElement?.closest('pnext-layout[data-pnext-segment]') == null
@@ -695,36 +717,65 @@ function isTopLevelServerSegment(segment: Element) {
 
 function serverSegmentSignature(segment: Element) {
   return [segment, ...segment.querySelectorAll('pnext-layout[data-pnext-segment]')]
-    .map(
-      child =>
-        `${child.getAttribute('data-pnext-segment') ?? ''}\u0001${child.getAttribute('data-pnext-scope') ?? ''}`,
-    )
+    .map(segmentKey)
     .join('\u0000')
+}
+
+// Whether a kept layout's routed child (child layout, else page slot) is missing or inside an island.
+function routedUnderIsland(leaf: Element, child: Element | null) {
+  const parent = (child ?? pageSlotRange(leaf)?.[0])?.parentElement
+  return !parent || !!parent.closest('pnext-client')
 }
 
 // Drop any segment-preserve tags left on a document by an earlier pass (the
 // ungraftable dry run tags the same nodes). Every real pass re-tags from
 // scratch, so stale indices never leak into the graft.
-function clearSegmentPreserveTags(doc: Document) {
-  for (const tagged of doc.body.querySelectorAll(`[${SEGMENT_PRESERVE_ATTRIBUTE}]`)) {
+function clearSegmentPreserveTags(root: ParentNode) {
+  for (const tagged of root.querySelectorAll(`[${SEGMENT_PRESERVE_ATTRIBUTE}]`)) {
     tagged.removeAttribute(SEGMENT_PRESERVE_ATTRIBUTE)
   }
 }
 
+// Tags the incoming layouts that keep their live counterpart: the shared prefix of each top-level
+// chain, matched on identity and scope. A routed child in an island's DOM needs the full chain (0.1.4).
+// Returns the live layouts by tag index.
 function matchPreservedServerSegments(doc: Document): Element[] {
   clearSegmentPreserveTags(doc)
-  const liveBySignature = new Map<string, Element>()
+  const liveByKey = new Map<string, Element>()
   for (const segment of document.body.querySelectorAll('pnext-layout[data-pnext-segment]')) {
-    if (!isTopLevelServerSegment(segment)) continue
-    liveBySignature.set(serverSegmentSignature(segment), segment)
+    // The paint hold is an inert copy of layouts that are still live.
+    if (
+      isTopLevelServerSegment(segment) &&
+      !segment.closest('[data-pnext-navigation-paint-hold]') &&
+      !segment.hasAttribute(SHELL_LAYOUT_ATTRIBUTE)
+    )
+      liveByKey.set(segmentKey(segment), segment)
   }
   const preserved: Element[] = []
   for (const segment of doc.body.querySelectorAll('pnext-layout[data-pnext-segment]')) {
-    if (!isTopLevelServerSegment(segment)) continue
-    const live = liveBySignature.get(serverSegmentSignature(segment))
-    if (!live) continue
-    segment.setAttribute(SEGMENT_PRESERVE_ATTRIBUTE, String(preserved.length))
-    preserved.push(live)
+    const top = isTopLevelServerSegment(segment) && liveByKey.get(segmentKey(segment))
+    if (!top) continue
+    const kept: [Element, Element][] = []
+    let [live, incoming]: [Element | null, Element | null] = [top, segment]
+    while (
+      live &&
+      incoming &&
+      segmentKey(live) === segmentKey(incoming) &&
+      !live.hasAttribute(SHELL_LAYOUT_ATTRIBUTE)
+    ) {
+      kept.push([live, incoming])
+      ;[live, incoming] = [childSegment(live), childSegment(incoming)]
+    }
+    const [liveLeaf, incomingLeaf] = kept[kept.length - 1]!
+    if (
+      (routedUnderIsland(liveLeaf, live) || routedUnderIsland(incomingLeaf, incoming)) &&
+      serverSegmentSignature(top) !== serverSegmentSignature(segment)
+    )
+      continue
+    for (const [layout, tagged] of kept) {
+      tagged.setAttribute(SEGMENT_PRESERVE_ATTRIBUTE, String(preserved.length))
+      preserved.push(layout)
+    }
   }
   return preserved
 }
@@ -732,12 +783,18 @@ function matchPreservedServerSegments(doc: Document): Element[] {
 function preservedSegmentIslands(segments: Element[]): LiveIslandRoot[] {
   const roots: LiveIslandRoot[] = []
   for (const segment of segments) {
+    if (!isTopLevelServerSegment(segment)) continue
+    // The child layout the graft swaps out takes its islands with it.
+    let departing = childSegment(segment)
+    while (departing && segments.includes(departing)) departing = childSegment(departing)
     for (const root of segment.querySelectorAll('pnext-client[data-pnext-client]')) {
       const live = root as LiveIslandRoot
       if (!isTopLevelIslandRoot(root)) continue
       if (elementInPageSlot(root)) continue
+      if (departing?.contains(root)) continue
       if (!live.__pnextLive) continue
-      live.__pnextIncoming ??= live.cloneNode(true) as Element
+      // Kept as is: a clone of hydrated DOM has lost its nested island hosts.
+      live.__pnextIncoming ??= live
       roots.push(live)
     }
   }
@@ -745,18 +802,24 @@ function preservedSegmentIslands(segments: Element[]): LiveIslandRoot[] {
 }
 
 function graftPreservedServerSegments(fragment: DocumentFragment, preserved: Element[]) {
+  const liveFor = (placeholder: Element | null) =>
+    preserved[Number(placeholder?.getAttribute(SEGMENT_PRESERVE_ATTRIBUTE) ?? NaN)]
   for (const placeholder of [...fragment.querySelectorAll(`[${SEGMENT_PRESERVE_ATTRIBUTE}]`)]) {
-    const live = preserved[Number(placeholder.getAttribute(SEGMENT_PRESERVE_ATTRIBUTE))]
-    placeholder.removeAttribute(SEGMENT_PRESERVE_ATTRIBUTE)
-    if (!live) continue
-    // MOVE (not clone) the incoming page slot: it already belongs to this
+    const live = liveFor(placeholder)
+    if (!live || !isTopLevelServerSegment(placeholder)) continue
+    // The deepest kept layout takes the incoming children.
+    let [liveLeaf, incomingLeaf] = [live, placeholder]
+    for (let next = childSegment(incomingLeaf); liveFor(next); next = childSegment(incomingLeaf))
+      [liveLeaf, incomingLeaf] = [liveFor(next)!, next!]
+    // MOVE (not clone) the incoming children: they already belong to this
     // document, and cloning would turn an island root the island graft just
     // spliced in back into an inert copy, dropping its live preact tree. Moving
     // the slot itself also preserves whether this destination needs a mount
     // element or Next-flat comment anchors.
-    if (!graftPageSlot(live, placeholder)) continue
+    if (!graftSegmentChildren(liveLeaf, incomingLeaf)) continue
     placeholder.replaceWith(live)
   }
+  clearSegmentPreserveTags(fragment)
 }
 
 const SEGMENT_SKIP_ATTRIBUTE = 'data-pnext-skip'
@@ -772,7 +835,7 @@ function skippedSegmentsUngraftable(doc: Document, refreshLike: boolean): boolea
   // Dry-run the segment match: it tags placeholders deterministically, so the
   // later real pass re-tags them identically.
   matchPreservedServerSegments(doc)
-  return skipped.some(segment => !segment.closest(`pnext-layout[${SEGMENT_PRESERVE_ATTRIBUTE}]`))
+  return skipped.some(segment => !segment.hasAttribute(SEGMENT_PRESERVE_ATTRIBUTE))
 }
 
 // Shared-layout island preservation. An island root whose island renders again in
@@ -804,30 +867,23 @@ function isTopLevelIslandRoot(root: Element) {
 // The rendered source path of a document's children slot (from its embedded
 // nav-state script), used to decide template remounts across a swap.
 function docNavStateChildren(doc: Document, fallback: string): string {
-  const text = doc.getElementById?.('__PNEXT_NAV_STATE__')?.textContent
-  if (text) {
-    try {
-      const parsed = JSON.parse(text) as DocumentNavState
-      if (parsed.children) return parsed.children
-    } catch {
-      // Malformed state — fall back to the navigation target.
-    }
-  }
-  return fallback
+  return docNavState(doc)?.children || fallback
 }
 
 // The per-slot source paths a document's embedded nav state records.
 function docNavStateSlots(doc: Document): Record<string, string> {
+  return docNavState(doc)?.slots || {}
+}
+
+function docNavState(doc: Document): DocumentNavState | null | undefined {
   const text = doc.getElementById?.('__PNEXT_NAV_STATE__')?.textContent
   if (text) {
     try {
-      const parsed = JSON.parse(text) as DocumentNavState
-      if (parsed.slots) return parsed.slots
+      return JSON.parse(text) as DocumentNavState | null
     } catch {
-      // Malformed state — treat as empty slot state.
+      // Malformed state — callers fall back.
     }
   }
-  return {}
 }
 
 export function slotsStateKey(slots: Record<string, string>): string {
@@ -1638,6 +1694,11 @@ function storeNavState() {
 const entryDocCache = new Map<string, PrefetchedPage>()
 const ENTRY_DOC_CACHE_LIMIT = 12
 
+// Drop insertion-order-oldest entries beyond `limit` (keys are never undefined).
+function trimOldest(cache: Map<string, unknown> | Set<string>, limit: number): void {
+  while (cache.size > limit) cache.delete(cache.keys().next().value!)
+}
+
 // Back/forward document cache, keyed by ROUTE (pathname+search). Every shown
 // document lands here, and a `prefetch={true}` full prefetch reads it before issuing
 // any request. Only complete documents are kept (no shell-only/skip-marker
@@ -1671,11 +1732,7 @@ function storeBfDoc(
   const priorTime = options.preserveTime ? bfDocCache.get(key)?.time : undefined
   bfDocCache.delete(key)
   bfDocCache.set(key, { time: priorTime ?? clientClockNow(), page })
-  while (bfDocCache.size > BF_DOC_CACHE_LIMIT) {
-    const oldest = bfDocCache.keys().next().value
-    if (oldest === undefined) break
-    bfDocCache.delete(oldest)
-  }
+  trimOldest(bfDocCache, BF_DOC_CACHE_LIMIT)
 }
 
 function takeBfDoc(key: string): BfDocEntry | null {
@@ -1701,11 +1758,7 @@ function markUrlStaticFresh(key: string, staleTimeMs: number): void {
   if (staleTimeMs <= 0) return
   urlStaticFreshUntil.delete(key)
   urlStaticFreshUntil.set(key, clientClockNow() + staleTimeMs)
-  while (urlStaticFreshUntil.size > URL_STATIC_FRESH_LIMIT) {
-    const oldest = urlStaticFreshUntil.keys().next().value
-    if (oldest === undefined) break
-    urlStaticFreshUntil.delete(oldest)
-  }
+  trimOldest(urlStaticFreshUntil, URL_STATIC_FRESH_LIMIT)
 }
 
 function urlStaticFresh(key: string): boolean {
@@ -1756,10 +1809,7 @@ function cacheEntryDocument(page: PrefetchedPage) {
   }
   activeBfcacheId = bfcacheId
   entryDocCache.set(id as string, page)
-  if (entryDocCache.size > ENTRY_DOC_CACHE_LIMIT) {
-    const oldest = entryDocCache.keys().next().value
-    if (oldest !== undefined) entryDocCache.delete(oldest)
-  }
+  trimOldest(entryDocCache, ENTRY_DOC_CACHE_LIMIT)
 }
 
 // Loading-shell cache: the streamed shell of a route response, carrying its closed
@@ -1887,11 +1937,7 @@ function storeShell(
       ...(staleTimeMs === undefined ? {} : { staleTimeMs }),
     })
   }
-  while (shellCache.size > SHELL_CACHE_LIMIT) {
-    const oldest = shellCache.keys().next().value
-    if (oldest === undefined) break
-    shellCache.delete(oldest)
-  }
+  trimOldest(shellCache, SHELL_CACHE_LIMIT)
 }
 
 /**
@@ -1928,15 +1974,6 @@ function shellHtmlByPath() {
   return shells
 }
 
-// Segment-prefetch tree cache: a `/_tree` request learns a route's staleTime before
-// any HTML is fetched, so the HTML prefetch's reuse window is right on first visit.
-// Keyed by pathname (Next's PPR segment cache excludes search from the tree key).
-export interface SegmentTree {
-  time: number
-  staleTimeSeconds: number
-  isStatic: boolean
-}
-const segmentTreeCache = new Map<string, SegmentTree>()
 // ---------------------------------------------------------------------------
 // SEGMENT CACHE
 // ---------------------------------------------------------------------------
@@ -1951,55 +1988,6 @@ const TREE_SEGMENT_PATH = '/_tree'
 const SEGMENT_ROUTE_HEADER = 'x-pnext-segment-route'
 // Opt-in: this fetch can consume a late metadata tail written after `</html>`.
 const LATE_METADATA_HEADER = 'x-pnext-late-metadata'
-
-/**
- * Fetch the `/_tree` segment-prefetch payload for a route and cache its
- * staleTime. Best-effort: a server that doesn't answer segment prefetches (or a
- * dev server) simply leaves the tree cache empty and the HTML prefetch falls
- * back to the mode-derived window. Returns the parsed staleTime (seconds) or
- * undefined.
- */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-async function segmentTreePrefetch(url: URL): Promise<number | undefined> {
-  const key = segmentCachePathname(url)
-  const cached = segmentTreeCache.get(key)
-  if (cached && clientClockNow() - cached.time < cached.staleTimeSeconds * 1000) {
-    touchCacheEntry(segmentTreeCache, key, cached)
-    return cached.staleTimeSeconds
-  }
-  try {
-    const init: RequestInit & { priority?: 'auto' | 'high' | 'low' } = {
-      headers: {
-        rsc: '1',
-        'next-router-prefetch': '1',
-        [SEGMENT_PREFETCH_HEADER]: TREE_SEGMENT_PATH,
-      },
-      credentials: 'same-origin',
-      priority: 'low',
-    }
-    const response = await fetch(withRscQuery(url.href), init)
-    if (!response.ok) return undefined
-    const type = response.headers.get('content-type') ?? ''
-    if (!type.includes('text/x-component')) return undefined
-    const text = await response.text()
-    // Requests with the `_rsc` CDN key use Flight's `0:<json>` framing. Keep
-    // accepting unframed JSON for direct compat responders.
-    const payload = JSON.parse(text.startsWith('0:') ? text.slice(2) : text) as {
-      staleTime?: number
-      isStatic?: boolean
-    }
-    const staleTimeSeconds = typeof payload.staleTime === 'number' ? payload.staleTime : undefined
-    if (staleTimeSeconds === undefined) return undefined
-    segmentTreeCache.set(key, {
-      time: clientClockNow(),
-      staleTimeSeconds,
-      isStatic: Boolean(payload.isStatic),
-    })
-    return staleTimeSeconds
-  } catch {
-    return undefined
-  }
-}
 
 // Per-segment DOCUMENT cache: the HTML a `/_page`-style segment response
 // carries, keyed by segment path and reusable across search params.
@@ -2146,12 +2134,6 @@ function stripRscQuery(href: string): string {
 let revalidationPrefetchGeneration = 0
 let revalidationPrefetchBlocked = false
 
-// Segment body cache. Beyond `/_tree`, the client fetches the route's body segment (served
-// as text/x-component) into an LRU keyed by PATHNAME - search params are excluded from the
-// PPR segment key, so it is reusable across `?a`/`?b`. Entries expire on their own
-// x-nextjs-stale-time window, and a server-action revalidate evicts them.
-
-const ROUTE_SEGMENT_PATH = '/'
 const SEGMENT_CACHE_LIMIT = 32
 
 // Per-segment cache policy seam (compat: compat/client/segment-cache.ts). The caches above
@@ -2192,84 +2174,6 @@ function prefetchBodySegmentPath(href: string): string {
     : INDEX_SEGMENT_PATH
 }
 
-export interface SegmentBodyEntry {
-  time: number
-  staleTimeMs: number
-  body: string
-  /** A fully-static route body is a complete document safe to stitch on nav. */
-  complete: boolean
-}
-const segmentBodyCache = new Map<string, SegmentBodyEntry>()
-
-/** Fetch and cache the whole-route body segment for `url`. Best-effort. */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-async function segmentBodyPrefetch(url: URL): Promise<boolean> {
-  const key = segmentCachePathname(url)
-  const cached = segmentBodyCache.get(key)
-  if (cached && clientClockNow() - cached.time < cached.staleTimeMs) {
-    touchCacheEntry(segmentBodyCache, key, cached)
-    return true
-  }
-  try {
-    const response = await fetch(withRscQuery(url.href), {
-      headers: {
-        rsc: '1',
-        'next-router-prefetch': '1',
-        [SEGMENT_PREFETCH_HEADER]: ROUTE_SEGMENT_PATH,
-      },
-      credentials: 'same-origin',
-      priority: 'low',
-    })
-    if (!response.ok) return false
-    const type = response.headers.get('content-type') ?? ''
-    if (!type.includes('text/x-component')) return false
-    const body = await response.text()
-    const staleHeader = response.headers.get('x-nextjs-stale-time')
-    const staleSeconds = staleHeader ? Number(staleHeader) : 30
-    // A body served without x-nextjs-postponed is a complete (non-PPR) route
-    // body: safe to commit on navigation without a second fetch. A postponed
-    // (PPR shell) body is only the static shell, so it is cached for warmth but
-    // not stitched as the whole page.
-    const complete = response.headers.get('x-nextjs-postponed') !== '1'
-    setSegmentBody(
-      key,
-      body,
-      Number.isFinite(staleSeconds) ? staleSeconds * 1000 : 30_000,
-      complete,
-    )
-    return true
-  } catch {
-    return false
-  }
-}
-
-function setSegmentBody(key: string, body: string, staleTimeMs: number, complete: boolean): void {
-  segmentBodyCache.set(key, { time: clientClockNow(), staleTimeMs, body, complete })
-  // LRU: evict the oldest entries beyond the limit.
-  while (segmentBodyCache.size > SEGMENT_CACHE_LIMIT) {
-    const oldest = segmentBodyCache.keys().next().value
-    if (oldest === undefined) break
-    segmentBodyCache.delete(oldest)
-  }
-}
-
-/**
- * A cached, COMPLETE body segment for `pathname` within its staleTime window (safe to stitch
- * as the navigation page), or null. A PPR (postponed) shell is never returned here - it is a
- * static shell, not the whole page.
- */
-function takeSegmentBody(pathname: string): string | null {
-  const key = segmentCachePathname(pathname)
-  const entry = segmentBodyCache.get(key)
-  if (!entry) return null
-  if (clientClockNow() - entry.time >= entry.staleTimeMs) {
-    segmentBodyCache.delete(key)
-    return null
-  }
-  touchCacheEntry(segmentBodyCache, key, entry)
-  return entry.complete ? entry.body : null
-}
-
 function segmentCachePathname(url: URL | string): string {
   const pathname = typeof url === 'string' ? url : url.pathname
   // URL.pathname retains a literal %2F, which is the route-cache identity; do
@@ -2285,14 +2189,11 @@ function segmentCachePathname(url: URL | string): string {
 
 /**
  * Evict segment-cache entries on revalidation, so the next prefetch re-fetches fresh data.
- * Clears both the tree and body caches: Next evicts by tag, but pnext has no client-side tag
- * map, so a full clear is the honest superset.
+ * Next evicts by tag, but pnext has no client-side tag map, so a full clear is the honest superset.
  */
 function evictSegmentCache(options: { pageSegmentsOnly?: boolean } = {}): void {
-  segmentTreeCache.clear()
   learnedRouteTrees.clear()
   routeTreesEvicted.clear()
-  segmentBodyCache.clear()
   segmentDocumentCache.clear()
   // A same-URL navigation refreshes the PAGE segments only — the shared layout
   // and head segments of the current tree stay cached (Next's refresh
@@ -2316,10 +2217,8 @@ export function evictClientRouterCache(options: { rearmVisiblePrefetches?: boole
   bumpRouterCacheEpoch()
   revalidationPrefetchGeneration += 1
   revalidationPrefetchBlocked = true
-  segmentTreeCache.clear()
   learnedRouteTrees.clear()
   routeTreesEvicted.clear()
-  segmentBodyCache.clear()
   segmentDocumentCache.clear()
   segmentCachePolicy?.clear()
   const invalidated = Array.from(prefetchCache.values())
@@ -2387,12 +2286,6 @@ function notifyPrefetchInvalidation(entry: PrefetchEntry, afterRevalidation = fa
   }
 }
 
-/** Non-consuming freshness check for the segment body cache. */
-function peekSegmentBody(pathname: string): boolean {
-  const entry = segmentBodyCache.get(segmentCachePathname(pathname))
-  return Boolean(entry && clientClockNow() - entry.time < entry.staleTimeMs && entry.complete)
-}
-
 /** Drop the cached document + shell for a refreshed/revalidated URL. */
 function evictNavigationCache(key: string, pathname: string): void {
   const entries = [
@@ -2428,6 +2321,8 @@ export interface PrefetchFetchTask {
   phase: number
   cancelled: boolean
   element?: Element
+  /** A navigation awaits it: every phase starts at once, outside the limits. */
+  navigation?: boolean
 }
 
 let prefetchSortIdCounter = 0
@@ -2544,6 +2439,10 @@ function pumpPrefetchQueue(): void {
       if (waiter.task.cancelled) {
         prefetchSlotWaiters.splice(index, 1)
         waiter.resolve(false)
+      } else if (typeof __PNEXT_NEXT_ROUTER__ === 'undefined' && waiter.task.navigation) {
+        prefetchSlotWaiters.splice(index, 1)
+        inFlightPrefetchRequests++
+        waiter.resolve(true)
       }
     }
     prefetchSlotWaiters.sort(
@@ -2609,6 +2508,8 @@ export interface PrefetchEntry {
    * stay bound to the exact nav state they rendered against (stateKey).
    */
   originAgnostic?: boolean
+  /** A settled skip document serves any origin that still shows these layouts (`segmentKey`). */
+  keptLayouts?: string[]
   /**
    * The entry's document is an interception HOST render. Such an entry is bound to its
    * exact host nav state - it never serves via the origin-agnostic (slot-only) match,
@@ -2619,7 +2520,7 @@ export interface PrefetchEntry {
   slotsKey: string
   onInvalidate: (() => void)[]
   /** A core prefetch's streamed shell, painted by a click that attaches before the body lands. */
-  shell?: { html?: string; listeners: Set<(html: string) => void> }
+  shell?: { html?: string; listeners: Set<(html: string) => void>; task: PrefetchFetchTask }
 }
 
 const prefetchCache = new Map<string, PrefetchEntry>()
@@ -2716,8 +2617,7 @@ function matchesLearnedRoute(routes: Set<string>, pathname: string): boolean {
 
 // Learned route trees. Next's segment cache keys the ROUTE TREE by ROUTE, not by URL,
 // so once `/photo/1` has taught the client the tree of `/photo/:id`, revealing
-// `/photo/2` issues no `/_tree` request. `segmentTreeCache` above is keyed by exact
-// pathname and misses every sibling, so this map closes that gap. Entries are learned
+// `/photo/2` issues no `/_tree` request. Entries are learned
 // from both prefetch tree and navigation responses, and resolve to their route LAZILY:
 // a baked tree response carries no `route` field, but the segment cache learns the
 // pathname->route mapping from the payload that follows.
@@ -2780,11 +2680,7 @@ function learnRouteTree(pathname: string, search: string, route?: string, rewrit
     ...(route ? { route } : {}),
     ...(rewritten ? { rewritten: true } : {}),
   })
-  while (learnedRouteTrees.size > SEGMENT_CACHE_LIMIT) {
-    const oldest = learnedRouteTrees.keys().next().value
-    if (oldest === undefined) break
-    learnedRouteTrees.delete(oldest)
-  }
+  trimOldest(learnedRouteTrees, SEGMENT_CACHE_LIMIT)
 }
 
 /**
@@ -2806,11 +2702,7 @@ function forgetLearnedRouteTree(urlKey: string): void {
   // URL learns a tree of its own again.
   routeTreesEvicted.delete(key)
   routeTreesEvicted.add(key)
-  while (routeTreesEvicted.size > SEGMENT_CACHE_LIMIT) {
-    const oldest = routeTreesEvicted.values().next().value
-    if (oldest === undefined) break
-    routeTreesEvicted.delete(oldest)
-  }
+  trimOldest(routeTreesEvicted, SEGMENT_CACHE_LIMIT)
 }
 
 /**
@@ -3051,7 +2943,7 @@ export function prefetchRoute(
   const task = createPrefetchTask(cacheKey, options)
   // A core prefetch is the destination document itself, so its shell can paint an attached click.
   const shell: PrefetchEntry['shell'] =
-    typeof __PNEXT_NEXT_ROUTER__ === 'undefined' ? { listeners: new Set() } : undefined
+    typeof __PNEXT_NEXT_ROUTER__ === 'undefined' ? { listeners: new Set(), task } : undefined
   const page = fetchPage(url.href, {
     prefetch: full ? 'full' : 'auto',
     navState: prefetchState,
@@ -3105,6 +2997,8 @@ export function prefetchRoute(
           entry.intercepted = pageIsHostRender(fetched)
           entry.originAgnostic =
             fetched.shellOnly !== true && !fetched.html.includes(SKIP_MARKER) && !entry.intercepted
+          if (!entry.originAgnostic && !fetched.shellOnly && !entry.intercepted)
+            entry.keptLayouts = skippedLayoutKeys(fetched.html)
           entry.bytes = fetched.html.length
         }
         // This URL's STATIC data is now fresh for the response's window: a
@@ -3528,9 +3422,7 @@ async function fetchPage(
         init,
         `${rscVariant}:/_index`,
       )
-      segmentPayload =
-        indexResponse.headers.get('content-type')?.includes('text/x-component') === true &&
-        indexResponse.headers.get('x-nextjs-postponed') === '2'
+      segmentPayload = isSegmentPayload(indexResponse)
       if (!segmentPayload && !indexResponse.headers.get('content-type')) {
         strippedBody = await indexResponse.text()
       }
@@ -3565,9 +3457,7 @@ async function fetchPage(
         init,
         `${rscVariant}:${bodySegment}`,
       )
-      segmentPayload =
-        indexResponse.headers.get('content-type')?.includes('text/x-component') === true &&
-        indexResponse.headers.get('x-nextjs-postponed') === '2'
+      segmentPayload = isSegmentPayload(indexResponse)
       // Header-stripping intermediary: classify the frame by SHAPE, the way the
       // tree phase classifies its own payload.
       if (!segmentPayload && !indexResponse.headers.get('content-type')) {
@@ -3585,9 +3475,7 @@ async function fetchPage(
         init,
         `${rscVariant}:${TREE_SEGMENT_PATH}`,
       )
-      segmentPayload =
-        treeResponse.headers.get('content-type')?.includes('text/x-component') === true &&
-        treeResponse.headers.get('x-nextjs-postponed') === '2'
+      segmentPayload = isSegmentPayload(treeResponse)
       let treePayload: ReturnType<typeof parseSegmentTreePayload> = null
       if (!segmentPayload && !treeResponse.headers.get('content-type')) {
         const text = await treeResponse.text()
@@ -3727,8 +3615,8 @@ async function fetchPage(
         ? await readStreamedBody(
             response,
             options.onShell,
-            // A prefetch read can end mid-shell; its shell counts once the document's tail scripts land.
-            typeof __PNEXT_NEXT_ROUTER__ === 'undefined' && options.prefetch
+            // A read can end mid-shell; the shell counts once the document's tail scripts land.
+            typeof __PNEXT_NEXT_ROUTER__ === 'undefined'
               ? shell => shell.includes('id="__PNEXT_NAV_STATE__"') && /<\/script>\s*$/.test(shell)
               : undefined,
           )
@@ -3865,36 +3753,24 @@ async function fetchPageFrameNavigation(
   if (!(response.headers.get('content-type') ?? '').includes('text/x-component')) return null
   const responseBody = await response.text()
   const frame = segmentDocumentHtml(responseBody, PAGE_SEGMENT_REQUEST_PATH)
+  const staleTimeHeader = response.headers.get('x-nextjs-stale-time')
+  const staleTimeSeconds = staleTimeHeader === null ? undefined : Number(staleTimeHeader)
+  const page = (html: string): PrefetchedPage => ({
+    html,
+    finalUrl: url.href,
+    ok: true,
+    ...(Number.isFinite(staleTimeSeconds) ? { staleTimeSeconds } : {}),
+  })
   if (frame === null) {
     // The server could not frame this route (parallel slots, interception) and replied with
     // the WHOLE DOCUMENT. Commit it: falling through to `fetchPage` would refetch the same
     // URL and put two identical navigation responses on the wire for one navigation.
-    if (!responseBody.trimStart().startsWith('{') && !responseBody.startsWith('0:')) {
-      const wholeStaleHeader = response.headers.get('x-nextjs-stale-time')
-      const wholeStaleSeconds = wholeStaleHeader === null ? undefined : Number(wholeStaleHeader)
-      return {
-        html: responseBody,
-        finalUrl: url.href,
-        ok: true,
-        ...(wholeStaleSeconds !== undefined && Number.isFinite(wholeStaleSeconds)
-          ? { staleTimeSeconds: wholeStaleSeconds }
-          : {}),
-      }
-    }
-    return null
+    return !responseBody.trimStart().startsWith('{') && !responseBody.startsWith('0:')
+      ? page(responseBody)
+      : null
   }
   const html = policy.composePageFrame({ ...lookup, pageHtml: frame })
-  if (html === null) return null
-  const staleTimeHeader = response.headers.get('x-nextjs-stale-time')
-  const staleTimeSeconds = staleTimeHeader === null ? undefined : Number(staleTimeHeader)
-  return {
-    html,
-    finalUrl: url.href,
-    ok: true,
-    ...(staleTimeSeconds !== undefined && Number.isFinite(staleTimeSeconds)
-      ? { staleTimeSeconds }
-      : {}),
-  }
+  return html === null ? null : page(html)
 }
 
 /** Feed one segment-prefetch response into the registered per-segment policy. */
@@ -4030,8 +3906,6 @@ function parseSegmentTreePayload(body: string): {
   staleTime?: number
   isStatic: boolean
   route?: string
-  headOutlined?: boolean
-  headFirst?: boolean
 } | null {
   const json = body.startsWith('0:') ? body.slice(2) : body
   if (!json.startsWith('{')) return null
@@ -4041,8 +3915,6 @@ function parseSegmentTreePayload(body: string): {
       staleTime?: unknown
       isStatic?: unknown
       route?: unknown
-      headOutlined?: unknown
-      headFirst?: unknown
     }
     if (!payload.tree || typeof payload.tree !== 'object') return null
     return {
@@ -4052,12 +3924,18 @@ function parseSegmentTreePayload(body: string): {
       // stamped one (a BAKED tree carries none — the router then falls back to
       // the segment cache's own pathname->route map).
       ...(typeof payload.route === 'string' ? { route: payload.route } : {}),
-      ...(payload.headOutlined === true ? { headOutlined: true } : {}),
-      ...(payload.headFirst === true ? { headFirst: true } : {}),
     }
   } catch {
     return null
   }
+}
+
+/** A per-segment prefetch payload (not a document): Next's RSC content type with the segment postpone marker. */
+function isSegmentPayload(response: Response): boolean {
+  return (
+    response.headers.get('content-type')?.includes('text/x-component') === true &&
+    response.headers.get('x-nextjs-postponed') === '2'
+  )
 }
 
 /** Insert an outlined head fragment (`<title>…`) back before </head>. */
@@ -4100,6 +3978,8 @@ export function showLoadingShell(
   allowWithoutBoundary = false,
   /** The shell came from this navigation's live response at its commit boundary. */
   allowResponseSuspense = false,
+  /** Takes the paint's still-loading stylesheets instead of painting without them. */
+  hold?: SheetHold,
 ) {
   if (sequence !== navigationSequence) return false
   if (typeof DOMParser === 'undefined') return false
@@ -4152,6 +4032,34 @@ export function showLoadingShell(
     (container.id ? doc.getElementById(container.id) : null) ??
     doc.querySelector('[data-pnext-root]') ??
     (container === document.body ? doc.body : null)
+  // A boundary owned above the live slot's layout replaces that diverging layout, not its slot;
+  // a shell cut above its own page slot paints the boundary (or its new layout) into the slot.
+  const layouts =
+    typeof __PNEXT_NEXT_ROUTER__ === 'undefined' &&
+    markerRange &&
+    loadingBoundary &&
+    divergingLayout(markerRange[0], boundary!)
+  const [diverging, painted] =
+    typeof __PNEXT_NEXT_ROUTER__ === 'undefined' && layouts && (layouts[0] || !incomingSlot)
+      ? layouts
+      : []
+  // A CLIENT root layout owns the paint target: the page container sits inside a mounted
+  // island's Preact tree, which still points at the DOM nodes about to be replaced.
+  // Overwriting them behind Preact's back desynchronizes the live tree, so every later
+  // render patches detached nodes. Re-render the island with the shell as its incoming
+  // children instead - the same graft the final commit uses.
+  const liveOwner = liveIslandOwner(container)
+  const incomingOwner = liveOwner && incomingIslandFor(doc, liveOwner)
+  // The app root holds the live slot's own layouts: never paint it into that slot.
+  if (
+    typeof __PNEXT_NEXT_ROUTER__ === 'undefined' &&
+    markerRange &&
+    boundary &&
+    !incomingSlot &&
+    !painted &&
+    !incomingOwner
+  )
+    return false
   const sourceNodes = incomingSlot
     ? incomingSlot[2]
     : incomingTarget
@@ -4166,31 +4074,51 @@ export function showLoadingShell(
             // nothing this paint could put on screen.
             null
   if (!sourceNodes) return false
+  // Past every bailout: this paint puts the destination on screen and commits the
+  // navigation, so its sheets go in with it rather than waiting for the payload.
+  const sheets = installStylesheets(doc)
+  if (hold && sheets.length) {
+    hold(sheets)
+    return false
+  }
   // A painted loading shell IS a committed navigation (pushOptimisticUrl moves the address
   // bar the instant this returns true), so the window route state must reflect the
   // DESTINATION before any island reads useParams - otherwise usePathname and useParams
   // diverge and a history entry captures the new URL with the OLD params.
   const shellRoute = predictedRoute ?? documentRouteState(doc)
   if (shellRoute) window.__PNEXT_ROUTE__ = shellRoute
-  // Past every bailout: this paint puts the destination on screen and commits the
-  // navigation, so its sheets go in with it rather than waiting for the payload.
-  void installStylesheets(doc)
-  for (const node of sourceNodes) fragment.append(document.importNode(node, true))
+  // A bare boundary fills the shared layout's page slot; a new layout holds that slot itself.
+  if (painted && painted !== boundary) {
+    boundary!.before(doc.createComment('pnext-page:'))
+    boundary!.after(doc.createComment('/pnext-page'))
+  }
+  for (const node of painted === boundary
+    ? (inline?.nodes ?? [marker!])
+    : painted
+      ? [painted]
+      : sourceNodes)
+    fragment.append(document.importNode(node, true))
   // A STATIC STAGE paints committed content, so its fallbacks land bare — the
   // wrappers are stripped from the COPY (the source doc keeps them, so the
   // boundary lookups above stay valid).
   if (allowWithoutBoundary) unwrapSuspenseFallbacks(fragment)
-  // A CLIENT root layout owns the paint target: the page container sits inside a mounted
-  // island's Preact tree, which still points at the DOM nodes about to be replaced.
-  // Overwriting them behind Preact's back desynchronizes the live tree, so every later
-  // render patches detached nodes. Re-render the island with the shell as its incoming
-  // children instead - the same graft the final commit uses.
-  const liveOwner = liveIslandOwner(container)
-  const incomingOwner = liveOwner && incomingIslandFor(doc, liveOwner)
+  for (const layout of fragment.querySelectorAll('pnext-layout[data-pnext-segment]'))
+    layout.setAttribute(SHELL_LAYOUT_ATTRIBUTE, '')
   if (liveOwner && incomingOwner) liveOwner.__pnextIncoming = incomingOwner
-  else if (markerRange) {
+  else if (diverging) {
+    diverging.replaceWith(
+      ...(painted === boundary
+        ? [document.createComment('pnext-page:'), fragment, document.createComment('/pnext-page')]
+        : [fragment]),
+    )
+  } else if (markerRange) {
     for (const node of markerRange[2]) node.remove()
     markerRange[0].after(fragment)
+    // The new layout holds the page slot itself.
+    if (typeof __PNEXT_NEXT_ROUTER__ === 'undefined' && painted && painted !== boundary) {
+      markerRange[0].remove()
+      markerRange[1]?.remove()
+    }
   } else container.replaceChildren(fragment)
   // Any painted shell can carry islands (a loading fallback that calls
   // useOffline(), say), and an unmounted island keeps its SSR value forever.
@@ -4265,6 +4193,7 @@ export function commitStaticStage(
    * destination content beside the holes or an explicit loading.js boundary.
    */
   postponedShell = false,
+  hold?: SheetHold,
 ): boolean {
   if (sequence !== navigationSequence) return false
   // cacheComponents' postponed stage is a real segment-cache commit, including
@@ -4272,8 +4201,8 @@ export function commitStaticStage(
   // Ordinary apps retain the stricter rule that prevented their root splash
   // from painting merely because a shell arrived.
   if (!staticStageIsRealContent(html, postponedShell && activityBfcacheEnabled())) return false
-  if (paintStaticStageSubtree(html)) return true
-  return showLoadingShell(html, sequence, target, undefined, true)
+  if (paintStaticStageSubtree(html, hold)) return true
+  return showLoadingShell(html, sequence, target, undefined, true, false, hold)
 }
 
 /**
@@ -4371,7 +4300,7 @@ function unwrapSuspenseFallbacks(root: ParentNode): void {
  * returning false when a page-slot-only paint is enough (the caller then falls back to
  * `showLoadingShell`). Exported for the DOM-level unit test.
  */
-export function paintStaticStageSubtree(html: string): boolean {
+export function paintStaticStageSubtree(html: string, hold?: SheetHold): boolean {
   if (typeof DOMParser === 'undefined') return false
   const doc = new DOMParser().parseFromString(html, 'text/html')
   if (!isPNextDocument(doc)) return false
@@ -4383,7 +4312,11 @@ export function paintStaticStageSubtree(html: string): boolean {
   if (!staticStageFrameGrows(doc)) return false
   // This paint COMMITS the navigation, so the destination's sheets belong on the document
   // now; the commit below re-reads them from its own doc and waits out these loads.
-  void installStylesheets(doc)
+  const sheets = installStylesheets(doc)
+  if (hold && sheets.length) {
+    hold(sheets)
+    return false
+  }
   unwrapSuspenseFallbacks(doc)
   // A painted static stage IS a committed navigation (see showLoadingShell):
   // the window route state must describe the destination before any island
@@ -4521,10 +4454,8 @@ function loadingBoundaryChanges(marker: Element | null, target: URL): boolean {
 // segment reuse or a fresh fetch — and recording what the answer taught us.
 
 /**
- * How long a navigation may wait on a prefetch that has not landed yet. pnext attaches to
- * in-flight prefetches to avoid a duplicate request, but must never wait forever - a
- * partial prefetch of a route with an unresolvable Suspense boundary never responds, and
- * blocking on it would leave the click with no loading shell and no history push.
+ * How long a compat navigation may wait on a prefetch that has not landed yet. A partial
+ * prefetch of a route with an unresolvable Suspense boundary never responds.
  */
 const UNSETTLED_PREFETCH_WAIT_MS = 300
 
@@ -4533,27 +4464,22 @@ function unsettledPrefetchDeadline(): Promise<null> {
   return new Promise(resolve => setTimeout(() => resolve(null), UNSETTLED_PREFETCH_WAIT_MS))
 }
 
-/**
- * The in-flight prefetch's document, or `null` once it has waited long enough. A streamed shell
- * that paints this navigation first commits it to that prefetch, so it waits for the body.
- */
-function attachToPrefetch(
+/** Awaits the in-flight prefetch's document, painting its streamed shell when one lands first. */
+async function attachToPrefetch(
   entry: PrefetchEntry,
   onShell?: (shellHtml: string) => boolean,
 ): Promise<PrefetchedPage | null> {
-  return new Promise(resolve => {
-    const shell = entry.shell
-    const done = (page: PrefetchedPage | Promise<PrefetchedPage | null> | null) => {
-      clearTimeout(timer)
-      shell?.listeners.delete(paint)
-      resolve(page)
-    }
-    const paint = (html: string) => onShell?.(html) && done(entry.page)
-    const timer = setTimeout(done, UNSETTLED_PREFETCH_WAIT_MS, null)
-    void entry.page.then(done)
-    if (shell?.html) paint(shell.html)
-    else shell?.listeners.add(paint)
-  })
+  // Every unsettled core entry is a prefetchRoute entry, so it has a shell.
+  const shell = entry.shell!
+  // The navigation owns this prefetch now: a queued phase starts at once.
+  shell.task.navigation = true
+  pumpPrefetchQueue()
+  const paint = (html: string) => onShell?.(html) && shell.listeners.delete(paint)
+  if (shell.html) paint(shell.html)
+  else shell.listeners.add(paint)
+  const page = await entry.page
+  shell.listeners.delete(paint)
+  return page
 }
 
 // Core reuses a kept copy of a dynamic page this long; past it only the copy's frame paints.
@@ -4633,7 +4559,7 @@ async function pageForNavigation(
     // attach to it on its own settle signal (cancel/error resolve null), never a wall
     // clock - a slow machine must not make the router duplicate the request.
     const page =
-      cached.settled || cached.full
+      cached.settled || (cached.full && !cached.shell)
         ? await cached.page
         : typeof __PNEXT_NEXT_ROUTER__ === 'undefined'
           ? await attachToPrefetch(cached, onShell)
@@ -4683,10 +4609,6 @@ async function pageForNavigation(
     // cross-URL shared hit is PAINTED below and the dynamic stage still fetched.
     if (segmentHit?.networkFree && !slotStateSensitive(navState, segmentHit.html)) {
       return { html: segmentHit.html, finalUrl: url.href, ok: true }
-    }
-    const body = takeSegmentBody(url.pathname)
-    if (body && !slotStateSensitive(navState, body)) {
-      return { html: body, finalUrl: url.href, ok: true }
     }
     // No entry for this exact URL: a fresh fully-prerendered document for the
     // same pathname (different search params) still commits without a fetch.
@@ -4793,11 +4715,17 @@ function seedNavigationEntry(
   // resolve network-free and prefetch nothing. The shell/segment caches below are still
   // seeded, so the navigation itself stays instant. A DYNAMIC render is seedable, but only
   // when the app opted into a non-zero `staleTimes.dynamic` window (Next's default is 0).
+  const skipped = page.html.includes(SKIP_MARKER)
+  // Core keeps a skip-marker visit too, bound to the layouts it grafts onto like a prefetch.
+  const keptLayouts =
+    skipped && typeof __PNEXT_NEXT_ROUTER__ === 'undefined' && !prefetchStaleTimePolicy
+      ? skippedLayoutKeys(page.html)
+      : undefined
   const dynamicSeedAllowed =
     page.shellOnly !== true &&
     staleTimeMs > 0 &&
     prefetchStaleTimeMs({}) > 0 &&
-    !page.html.includes(SKIP_MARKER)
+    (!skipped || keptLayouts !== undefined)
   // `prefetch = 'allow-runtime'`: a visited document of such a route is request data with
   // the dynamic holes already filled in. Keeping it reusable would commit a later navigation
   // network-free off content the route promises to re-sample. Only its runtime-prefetch
@@ -4824,8 +4752,8 @@ function seedNavigationEntry(
       intercepted: pageIsHostRender(page),
       // A hard load (or complete DIRECT nav response) seeds a document any origin
       // can reuse — Next seeds its router cache the same way, origin-independent.
-      originAgnostic:
-        page.shellOnly !== true && !page.html.includes(SKIP_MARKER) && !pageIsHostRender(page),
+      originAgnostic: page.shellOnly !== true && !skipped && !pageIsHostRender(page),
+      keptLayouts,
       settled: true,
       onInvalidate: [],
     })
@@ -4850,11 +4778,18 @@ function seedNavigationEntry(
  */
 function preHydrationShell(): string | undefined {
   const stashed = (window as { __PNEXT_SHELL_HTML__?: string }).__PNEXT_SHELL_HTML__
+  if (!stashed) return
+  // The stash precedes the route-state and entry scripts; carry them like a prefetched stage does.
+  const tail = [
+    document.getElementById('__PNEXT_NAV_STATE__'),
+    [...document.scripts].find(script => script.textContent?.startsWith(ROUTE_STATE_PREFIX)),
+    document.body.querySelector('script[type="module"][src]'),
+  ].map(script => script?.outerHTML ?? '')
   // If a promotion script won the capture race, one or more dynamic continuations already sit in
   // the markup. Those carry the loaded URL's resolved content, so anything replaying this stage -
   // a sibling param reusing it across an empty vary set - would paint that URL's data. Drop any
   // carriers; the document-bootstrap zero-stream case simply has none.
-  return stashed && stripStreamChunks(stashed)
+  return stripStreamChunks(stashed) + tail.join('')
 }
 
 /** `html` without the hidden `<div data-pnext-stream>` carriers of its streamed continuations. */
@@ -4958,6 +4893,16 @@ function recordNavigationSegment(
 
 /** Server-skipped shared-layout marker — such a document is origin-bound. */
 const SKIP_MARKER = 'data-pnext-skip'
+const SKIPPED_LAYOUT =
+  /data-pnext-segment="[^"]*" data-pnext-skip(?:="")?(?: data-pnext-scope="[^"]*")?/g
+
+/** The segment keys of the live layouts a skip-marker document grafts onto. */
+function skippedLayoutKeys(html: string): string[] {
+  // Parsed like the live layouts, so escaped attribute values key the same.
+  const markers = document.createElement('template')
+  markers.innerHTML = (html.match(SKIPPED_LAYOUT) ?? []).map(m => `<p ${m}>`).join('')
+  return [...markers.content.children].map(segmentKey)
+}
 
 /**
  * A navigation issued from a HOST page (one rendering parallel-route slots) may be
@@ -4986,6 +4931,12 @@ function slotStateSensitive(state: DocumentNavState, cachedHtml?: string): boole
  */
 export function entryMatchesNavState(entry: PrefetchEntry, state: DocumentNavState): boolean {
   if (entry.stateKey === navStateKey(state)) return true
+  if (entry.keptLayouts?.length && entry.slotsKey === slotsStateKey(state.slots ?? {})) {
+    const live = new Set(
+      [...document.body.querySelectorAll('pnext-layout[data-pnext-segment]')].map(segmentKey),
+    )
+    return !isHostPageNavState(state) && entry.keptLayouts.every(key => live.has(key))
+  }
   // Interception host renders are host-bound: they only serve their exact host
   // nav state (matched above), never the origin-agnostic slot-only fallback.
   if (entry.originAgnostic !== true || entry.intercepted === true) return false
@@ -5143,6 +5094,8 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   if (refreshLike) evictNavigationCache(url.pathname + url.search, url.pathname)
 
   const sequence = ++navigationSequence
+  // Another navigation supersedes the pending link.
+  if (linkStatus?.[1] !== sequence) settleLinkStatus()
   // Snapshot the departing entry before a cached/streamed loading shell paints
   // into the live body. Capturing later would save the target's fallback as
   // the previous history entry and restore a permanently stuck "Loading...".
@@ -5212,26 +5165,45 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   // server-side, and re-painting would replace a committed loading state with a second,
   // different one. A segment's loading fallback commits ONCE per navigation.
   let cachedStagePainted = false
+  // A cached paint that left this layout on screen kept the chain the response grafts onto.
+  const departingLayout = document.body.querySelector('pnext-layout[data-pnext-segment]')
   // The route whose islands a stage paint mounted; the commit keeps them instead of remounting.
   let paintedRoute: BrowserRouteState | undefined
+  // An early paint waits on its sheets (React's 60 s cap), then paints unheld. The newest wins;
+  // another paint or the response landing first drops it.
+  let heldPaint: unknown
+  const early = <T>(paint: (hold?: SheetHold) => T) =>
+    paint(sheets => {
+      const go = () => heldPaint === paint && paint()
+      heldPaint = paint
+      setTimeout(go, 6e4)
+      void Promise.all(sheets).then(go)
+    })
   // A painted loading boundary or stage is a committed navigation state.
   const commitPaint = () => {
+    heldPaint = undefined
     paintedRoute = window.__PNEXT_ROUTE__
     if (typeof __PNEXT_NEXT_ROUTER__ === 'undefined')
       routerState.fallbackPaint = [sequence, performance.now()]
     pushOptimisticUrl()
     scheduleNavigationScroll(url, options)
+    settleLinkStatus(sequence)
   }
   const devSoftNavigation = nextDevDocument()
+  // A held shell can paint after its caller moved on, so a later twin must not repaint it.
+  let shellCommitted = false
   const onShell =
     restorePage || options.pop || refreshLike
       ? undefined
-      : (shellHtml: string) => {
-          if (cachedStagePainted || devSoftNavigation) return false
-          if (!showLoadingShell(shellHtml, sequence, url, undefined, false, true)) return false
-          commitPaint()
-          return true
-        }
+      : (shellHtml: string) =>
+          early(hold => {
+            if (cachedStagePainted || shellCommitted || devSoftNavigation) return false
+            if (!showLoadingShell(shellHtml, sequence, url, undefined, false, true, hold))
+              return false
+            shellCommitted = true
+            commitPaint()
+            return true
+          })
   // The per-segment cache's answer for this navigation, looked up ONCE: it decides both
   // whether the generic loading shell should paint (a real cached static segment is strictly
   // better) and, in pageForNavigation, whether the navigation commits network-free.
@@ -5246,12 +5218,13 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   // Paint a cached STATIC STAGE — the route's own content, not a fallback — and
   // treat it as a committed navigation exactly like a loading shell.
   const onStaticStage = onShell
-    ? (html: string, postponedShell = false) => {
-        if (devSoftNavigation) return
-        if (!commitStaticStage(html, sequence, url, postponedShell)) return
-        cachedStagePainted = true
-        commitPaint()
-      }
+    ? (html: string, postponedShell = false) =>
+        early(hold => {
+          if (devSoftNavigation || !commitStaticStage(html, sequence, url, postponedShell, hold))
+            return
+          cachedStagePainted = true
+          commitPaint()
+        })
     : undefined
   // Loading-shell reuse: when the navigation must fetch, paint the CACHED shell for the
   // target pathname synchronously - search-param independent, so `?a` reuses the shell a `?b`
@@ -5268,23 +5241,23 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
       pathname: url.pathname,
       search: url.search,
     }) &&
-    !hasFreshDocument(url) &&
-    !peekSegmentBody(url.pathname)
+    !hasFreshDocument(url)
   ) {
     const stored = takeShellForUrl(url)
     const predicted = loadingShellPredictionPolicy?.(
       url,
       stored ? new Map([[stored.key, stored.html]]) : shellHtmlByPath(),
     )
-    const shellPainted = predicted
-      ? showLoadingShell(predicted.html, sequence, url, predicted.route)
-      : stored
-        ? showLoadingShell(stored.html, sequence, url)
-        : false
-    if (shellPainted) {
+    const shell = predicted ?? stored
+    early(hold => {
+      if (
+        !shell ||
+        !showLoadingShell(shell.html, sequence, url, predicted?.route, false, false, hold)
+      )
+        return
       cachedStagePainted = true
       commitPaint()
-    }
+    })
   }
   // Which navigations may fetch the PAGE frame alone. Never on popstate (a history entry
   // restores its own render, layouts included) and never for a refresh/action revalidation,
@@ -5320,6 +5293,8 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
       departureUrl,
       pageFrame,
     ))
+  // The payload commits styled on its own; a shell still held for its sheets never paints.
+  heldPaint = undefined
   if (sequence !== navigationSequence) return abandonFetchedPage(page)
   if (!page) {
     // Offline: a hard navigation would land on the browser's error page and lose the app
@@ -5353,7 +5328,9 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
     !restorePage &&
     skippedSegmentsUngraftable(
       doc,
-      options.freshSegments || cachedStagePainted || (refreshLike && !options.pageRefresh),
+      options.freshSegments ||
+        (cachedStagePainted && !departingLayout?.isConnected) ||
+        (refreshLike && !options.pageRefresh),
     )
   ) {
     const fullPage = await fetchPage(url.href, {
@@ -5488,7 +5465,7 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   // skippedSegmentsUngraftable above.
   const preservedSegments =
     options.freshSegments ||
-    cachedStagePainted ||
+    (cachedStagePainted && !departingLayout?.isConnected) ||
     (refreshLike && !options.pageRefresh) ||
     parallelSlotsChanged
       ? (clearSegmentPreserveTags(doc), [])
@@ -5673,6 +5650,7 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
       // subscriber observes the matching tree (the same ordering as the former end-of-commit pair).
       emitNavigationCommit()
       emitLocationChange()
+      settleLinkStatus(sequence)
       // History traversal restores the popped entry's form state over the freshly mounted tree
       // (browser back/forward form restoration semantics). This runs BEFORE the paint hold's
       // settling frame below: mounting can recreate the controls the pre-mount fill populated,
@@ -5719,7 +5697,7 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
   // islandOwnedControl). The pop equivalent runs inside the commit above, ahead of the paint
   // hold's settling frame.
   if (!options.pop && departingBfcacheId && departingBfcacheId === historyBfcacheId()) {
-    restoreFormStateWhenMounted(departingBfcacheId, sequence, true)
+    restoreFormStateWhenMounted(departingBfcacheId, sequence, islandOwnedControl)
   }
 }
 
@@ -5781,11 +5759,7 @@ function saveFormState(bfcacheId: string) {
   }))
   entryFormStateCache.delete(bfcacheId)
   if (state.some(control => control.value !== '')) entryFormStateCache.set(bfcacheId, state)
-  while (entryFormStateCache.size > ENTRY_FORM_STATE_CACHE_LIMIT) {
-    const oldest = entryFormStateCache.keys().next().value
-    if (oldest === undefined) break
-    entryFormStateCache.delete(oldest)
-  }
+  trimOldest(entryFormStateCache, ENTRY_FORM_STATE_CACHE_LIMIT)
 }
 
 function restoreControl(
@@ -5814,14 +5788,18 @@ function islandOwnedControl(control: Element): boolean {
   return Boolean(root?.__pnextLive)
 }
 
-function restoreFormState(bfcacheId: string | undefined, onlyEmpty = false, skipIslands = false) {
+function restoreFormState(
+  bfcacheId: string | undefined,
+  onlyEmpty = false,
+  skip?: (control: Element) => boolean,
+) {
   if (!bfcacheId) return
   const state = entryFormStateCache.get(bfcacheId)
   if (!state) return
   const controls = formControls()
   if (controls.length !== state.length) return
   for (const [index, control] of controls.entries()) {
-    if (skipIslands && islandOwnedControl(control)) continue
+    if (skip?.(control)) continue
     // `onlyEmpty`: a freshly mounted control is empty, so filling it restores
     // what the remount lost — while anything already carrying a value (the app
     // set it, or the user typed after the commit) is left alone.
@@ -5835,14 +5813,10 @@ function restoreSharedLayoutFormState(
   departingPathname: string,
   targetPathname: string,
 ) {
-  const state = entryFormStateCache.get(bfcacheId)
-  if (!state) return
-  const controls = formControls()
-  if (controls.length !== state.length) return
   const departing = departingPathname.split('/').filter(Boolean)
   const target = targetPathname.split('/').filter(Boolean)
-  for (const [index, control] of controls.entries()) {
-    if (elementInPageSlot(control)) continue
+  restoreFormState(bfcacheId, false, control => {
+    if (elementInPageSlot(control)) return true
     // Only controls rendered by the layout island itself belong to this
     // shared scope. A nested page island may sit inside that host after it
     // adopts the page slot, but its bfcacheId intentionally changes on a fresh
@@ -5850,11 +5824,10 @@ function restoreSharedLayoutFormState(
     const raw = control
       .closest('pnext-client[data-pnext-client]')
       ?.getAttribute('data-pnext-layout-segments')
-    if (!raw) continue
+    if (!raw) return true
     const depth = (JSON.parse(raw) as { depth?: number }).depth
-    if (!depth || departing.slice(0, depth).join('/') !== target.slice(0, depth).join('/')) continue
-    restoreControl(control, state[index]!, false)
-  }
+    return !depth || departing.slice(0, depth).join('/') !== target.slice(0, depth).join('/')
+  })
 }
 
 /**
@@ -5863,10 +5836,14 @@ function restoreSharedLayoutFormState(
  * describes can appear after the swap. Keep trying while the DOM changes until the control
  * set matches the snapshot.
  */
-function restoreFormStateWhenMounted(bfcacheId: string, sequence: number, skipIslands = false) {
+function restoreFormStateWhenMounted(
+  bfcacheId: string,
+  sequence: number,
+  skip?: (control: Element) => boolean,
+) {
   const state = entryFormStateCache.get(bfcacheId)
   if (!state) return
-  restoreFormState(bfcacheId, true, skipIslands)
+  restoreFormState(bfcacheId, true, skip)
   // The controls can be rebuilt more than once while the commit settles, so the restore stays
   // armed for a short window instead of firing once. It only ever fills EMPTY controls, so a
   // value the app or the user set after the commit is never clobbered.
@@ -5875,7 +5852,7 @@ function restoreFormStateWhenMounted(bfcacheId: string, sequence: number, skipIs
       observer.disconnect()
       return
     }
-    restoreFormState(bfcacheId, true, skipIslands)
+    restoreFormState(bfcacheId, true, skip)
   })
   observer.observe(document.body, { childList: true, subtree: true })
   window.setTimeout(() => observer.disconnect(), FORM_STATE_RESTORE_WINDOW_MS)
@@ -5898,7 +5875,7 @@ function onLinkClick(event: MouseEvent) {
  * can decide (and preventDefault) synchronously and replay the navigation here once the
  * router chunk lands.
  */
-export function commitLinkNavigation({ url, replace, scroll }: LinkClickTarget) {
+export function commitLinkNavigation({ link, url, replace, scroll }: LinkClickTarget) {
   const samePage = url.pathname === location.pathname && url.search === location.search
 
   // A hash CHANGE on the current URL is pure scroll (no request). Clicking the
@@ -5909,6 +5886,7 @@ export function commitLinkNavigation({ url, replace, scroll }: LinkClickTarget) 
     else history.pushState(historyState(), '', url.href)
     scheduleNavigationScroll(url, { scroll })
     emitLocationChange()
+    settleLinkStatus()
     return
   }
 
@@ -5920,11 +5898,29 @@ export function commitLinkNavigation({ url, replace, scroll }: LinkClickTarget) 
     // and broadcast still happen up front.
     scheduleNavigationScroll(url, { scroll })
     emitLocationChange()
-    void softNavigate(url.href, { replace, scroll, refreshLike: true, pageRefresh: true })
-    return
   }
+  // useLinkStatus: the clicked Link is pending until its navigation paints, fails or is superseded.
+  const hints = (link as LinkStatusAnchor).__pnextHints
+  const sequence = navigationSequence + 1
+  if (hints) {
+    settleLinkStatus()
+    for (const setPending of hints) setPending(true)
+    linkStatus = [hints, sequence]
+  }
+  void softNavigate(
+    url.href,
+    samePage ? { replace, scroll, refreshLike: true, pageRefresh: true } : { replace, scroll },
+  ).finally(() => settleLinkStatus(sequence))
+}
 
-  void softNavigate(url.href, { replace, scroll })
+type LinkStatusAnchor = HTMLAnchorElement & { __pnextHints?: Set<(pending: boolean) => void> }
+
+let linkStatus: [Set<(pending: boolean) => void>, number] | undefined
+
+function settleLinkStatus(sequence?: number) {
+  if (!linkStatus || (sequence !== undefined && linkStatus[1] !== sequence)) return
+  for (const setPending of linkStatus[0]) setPending(false)
+  linkStatus = undefined
 }
 
 // A `prefetch={true}` Link marks itself `data-prefetch-full` so the router
@@ -6054,14 +6050,13 @@ export function pingVisiblePrefetchLinks() {
       prefetchedElements.delete(element)
       continue
     }
-    const href = element.getAttribute('href')
-    if (href) {
-      void prefetchRoute(href, {
-        element,
-        full: isFullPrefetchLink(element),
-      })
-    }
+    prefetchLinkElement(element)
   }
+}
+
+function prefetchLinkElement(element: Element) {
+  const href = element.getAttribute('href')
+  if (href) void prefetchRoute(href, { element, full: isFullPrefetchLink(element) })
 }
 
 // `load` links prefetch as soon as they appear; `visible` links when they
@@ -6088,9 +6083,8 @@ function scanEagerPrefetchLinks(root: Element) {
     if (eagerLinks.has(link)) continue
     eagerLinks.add(link)
     if (mode === 'load') {
-      const href = link.getAttribute('href')
       if (isElementVisible(link)) visiblePrefetchElements.add(link)
-      if (href) void prefetchRoute(href, { element: link, full: isFullPrefetchLink(link) })
+      prefetchLinkElement(link)
       continue
     }
     if (visibleLinkObserverDoc !== document) {
@@ -6110,20 +6104,13 @@ function scanEagerPrefetchLinks(root: Element) {
           continue
         }
         visiblePrefetchElements.add(entry.target)
-        const href = entry.target.getAttribute('href')
-        if (href)
-          void prefetchRoute(href, {
-            element: entry.target,
-            full: isFullPrefetchLink(entry.target),
-          })
+        prefetchLinkElement(entry.target)
       }
     })
     visibleLinkObserver.observe(link)
     if (isElementVisible(link)) {
       visiblePrefetchElements.add(link)
-      const href = link.getAttribute('href')
-      if (href) void prefetchRoute(href, { element: link, full: isFullPrefetchLink(link) })
-      continue
+      prefetchLinkElement(link)
     }
   }
 }
@@ -6160,10 +6147,7 @@ export function installRouterFull() {
   // Seed the hard-loaded entry's ids BEFORE any island mounts — the hub already
   // did that (see ./index.ts installRouter); this tier picks up from there.
   storeNavState()
-  // Next's initial RSC payload seeds the segment cache before request params resolve. PNext's hard
-  // HTML load carries only the resolved continuation, so obtain the prerendered current-route stage
-  // now and keep it as the cacheComponents segment seed. Default apps do no extra work.
-  if (activityBfcacheEnabled()) void prefetchRoute(location.href, { currentUrl: true })
+  routerState.settleLink = settleLinkStatus
   // Bind every delayed hard-load operation to the document and history entry that installed this
   // runtime. `load` can fire after a fast soft navigation has already committed; consulting the
   // then-current location/state would file the original source under the destination entry key.
@@ -6188,6 +6172,11 @@ export function installRouterFull() {
   const hardLoadStaticStage = documentStaticHintFromHtml(hardLoadRestoreSource.html)?.isStatic
     ? undefined
     : preHydrationShell()
+  // Next's initial RSC payload seeds the segment cache before request params resolve. The stashed
+  // pre-hydration stage is that seed (filed at load); without one, fetch the prerendered
+  // current-route stage as the cacheComponents seed. Default apps do no extra work.
+  if (activityBfcacheEnabled() && !hardLoadStaticStage)
+    void prefetchRoute(location.href, { currentUrl: true })
   // Entry-document identity is needed as soon as navigation can start, not at window.load.
   cacheEntryDocument(hardLoadRestoreSource)
   const hardLoadEntryId = historyState().__pnextEntry

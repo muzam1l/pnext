@@ -4,7 +4,7 @@ import path from 'node:path'
 import type { Plugin } from 'esbuild'
 import { hashedAssetName } from '../utils/asset-hash'
 import { build } from '../utils/esbuild'
-import { ensureDir, readText } from '../utils/fs'
+import { cssModuleScopePath, ensureDir, readText } from '../utils/fs'
 import { postcssConfigFile, runPostcss } from './postcss'
 import { extraPageExtensions, getCssExtensions } from '../extensions'
 import { nextCompatEnabled } from '../render/hooks'
@@ -132,8 +132,10 @@ export function globalCssSource(config: ResolvedConfig) {
   return globalCssSources(config)[0]
 }
 
-export function globalCssSources(config: Pick<ResolvedConfig, 'root' | 'appPath'>) {
-  return globalCssSourcesForPaths(config.root, config.appPath)
+export function globalCssSources(
+  config: Pick<ResolvedConfig, 'root' | 'appPath'> & Partial<Pick<ResolvedConfig, 'workspaceRoot'>>,
+) {
+  return globalCssSourcesForPaths(config.root, config.appPath, config.workspaceRoot)
 }
 
 // The walk below reads and resolves the ROOT LAYOUT'S WHOLE IMPORT GRAPH, and every render asks it
@@ -157,8 +159,8 @@ export function setGlobalCssSourceStore(store: GlobalCssSourceStore | undefined)
   globalCssStore = store
 }
 
-export function globalCssSourcesForPaths(root: string, appPath: string) {
-  const key = `${root}\0${appPath}`
+export function globalCssSourcesForPaths(root: string, appPath: string, workspaceRoot?: string) {
+  const key = `${root}\0${appPath}\0${workspaceRoot ?? ''}`
   const cached = globalCssSourceCache.get(key)
   if (cached) return cached
 
@@ -171,7 +173,14 @@ export function globalCssSourcesForPaths(root: string, appPath: string) {
   const sources = new Set<string>()
   const visited = new Set<string>()
   const missing = new Set<string>()
-  collectGlobalCssSources(root, rootLayoutFile(appPath, missing), sources, visited, missing)
+  collectGlobalCssSources(
+    root,
+    rootLayoutFile(appPath, missing),
+    sources,
+    visited,
+    missing,
+    workspaceRoot,
+  )
 
   const resolved = [...sources].map(file => path.resolve(file))
   globalCssSourceCache.set(key, resolved)
@@ -194,6 +203,7 @@ function collectGlobalCssSources(
   sources: Set<string>,
   visited: Set<string>,
   missing?: Set<string>,
+  workspaceRoot?: string,
 ) {
   const resolvedFile = path.resolve(file)
   if (visited.has(resolvedFile)) return
@@ -204,12 +214,12 @@ function collectGlobalCssSources(
   visited.add(resolvedFile)
 
   for (const specifier of moduleSpecifiers(readFileSync(resolvedFile, 'utf8'))) {
-    const resolved = resolveImport(root, resolvedFile, specifier)
+    const resolved = resolveImport(root, resolvedFile, specifier, workspaceRoot)
     if (!resolved) continue
     if (isCssFile(resolved)) {
       sources.add(resolved)
     } else {
-      collectGlobalCssSources(root, resolved, sources, visited, missing)
+      collectGlobalCssSources(root, resolved, sources, visited, missing, workspaceRoot)
     }
   }
 }
@@ -896,13 +906,6 @@ function cssModuleClassName(file: string, className: string) {
     .replace(/[^_a-zA-Z0-9]/g, '_')
   const hash = pathHash(cssModuleScopePath(file))
   return `${base}_${className}_${hash}`
-}
-
-function cssModuleScopePath(file: string) {
-  const normalized = file.split(path.sep).join('/')
-  const appIndex = normalized.lastIndexOf('/app/')
-  if (appIndex !== -1) return normalized.slice(appIndex + 1)
-  return normalized.split('/').slice(-3).join('/')
 }
 
 function rewriteClassSelector(css: string, scopedClassName: string, originalClassName: string) {

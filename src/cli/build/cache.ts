@@ -1,3 +1,4 @@
+import { resolveManifest } from '../../utils/fs'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { lstat, mkdir, readFile, readdir, readlink } from 'node:fs/promises'
@@ -73,9 +74,13 @@ export async function lookupBuildCache(
     return { enabled: true, context, inputs, reason: `output (${changed || 'unknown'})` }
   }
   try {
-    const manifest = JSON.parse(
-      await readFile(path.join(config.outPath, 'manifest.json'), 'utf8'),
-    ) as BuildManifest
+    const manifest = resolveManifest(
+      JSON.parse(
+        await readFile(path.join(config.outPath, 'manifest.json'), 'utf8'),
+      ) as BuildManifest,
+      config.outPath,
+      config.root,
+    )
     return { enabled: true, context, inputs, manifest, reason: 'hit' }
   } catch {
     return { enabled: true, context, inputs, reason: 'manifest' }

@@ -198,7 +198,7 @@ export class ClientErrorBoundary extends Component<BoundaryProps, BoundaryState>
       if (error === null || typeof error !== 'object') {
         // global-error rides the deferred tier (see ./lazy) — a primitive throw
         // with no error.js is the one path that reaches it from a render.
-        void import('./global-error').then(m => m.escalateToGlobalError(error))
+        void import('./install').then(m => m.escalateToGlobalError(error))
         return null
       }
       throw error as Error

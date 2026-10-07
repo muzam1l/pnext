@@ -181,6 +181,7 @@ interface ModuleEdge {
 
 interface ScanContext {
   root: string
+  workspaceRoot?: string
   appPath: string
   sources: Map<string, string>
   edges: Map<string, ModuleEdge[]>
@@ -198,11 +199,16 @@ interface ScanContext {
   globalCssImports(): Set<string>
 }
 
-function createScanContext(appPath: string, globalCss?: () => Set<string>): ScanContext {
+function createScanContext(
+  appPath: string,
+  globalCss?: () => Set<string>,
+  workspaceRoot?: string,
+): ScanContext {
   const root = rootFromAppPath(appPath)
   let memo: Set<string> | undefined
   return {
     root,
+    workspaceRoot,
     appPath,
     sources: new Map(),
     edges: new Map(),
@@ -213,7 +219,8 @@ function createScanContext(appPath: string, globalCss?: () => Set<string>): Scan
     usesNavigation: new Map(),
     entryReasons: new Map(),
     globalCssImports:
-      globalCss ?? (() => (memo ??= new Set(globalCssSourcesForPaths(root, appPath)))),
+      globalCss ??
+      (() => (memo ??= new Set(globalCssSourcesForPaths(root, appPath, workspaceRoot)))),
   }
 }
 
@@ -375,14 +382,21 @@ function withDeferredFacts(
   return entry
 }
 
-export async function scanRoutes(appPath: string): Promise<RouteManifestEntry[]> {
+export async function scanRoutes(
+  appPath: string,
+  workspaceRoot?: string,
+): Promise<RouteManifestEntry[]> {
   const files = await listFiles(appPath)
-  return withDirCache(() => buildRouteTable(appPath, files))
+  return withDirCache(() => buildRouteTable(appPath, files, workspaceRoot))
 }
 
 /** The path pass: file paths in, route table out — no file content is read. */
-function buildRouteTable(appPath: string, files: string[]): RouteManifestEntry[] {
-  const context = createScanContext(appPath)
+function buildRouteTable(
+  appPath: string,
+  files: string[],
+  workspaceRoot?: string,
+): RouteManifestEntry[] {
+  const context = createScanContext(appPath, undefined, workspaceRoot)
   const routes: RouteManifestEntry[] = []
   const slotPageFiles: { file: string; relative: string }[] = []
   const defaultPageFiles: { file: string; relative: string }[] = []
@@ -1893,7 +1907,7 @@ function defaultReexportsClientModule(
     if (importBinding?.[1]) specifiers.push(importBinding[1])
   }
   for (const specifier of specifiers) {
-    const resolved = resolveModuleEdge(context.root, file, specifier)
+    const resolved = resolveModuleEdge(context, file, specifier)
     if (!resolved || !fileExists(context, resolved)) continue
     if (isClientModule(context, resolved)) return true
     if (defaultReexportsClientModule(context, resolved, visited)) return true
@@ -2126,7 +2140,7 @@ function readScanSource(context: ScanContext, file: string, visited = new Set<st
   const parts = [source]
   for (const edge of scanFacts(file, source).imports) {
     if (!edge.reexport || !edge.specifier.startsWith('.')) continue
-    const resolved = resolveModuleEdge(context.root, file, edge.specifier)
+    const resolved = resolveModuleEdge(context, file, edge.specifier)
     if (!resolved || !existsSync(resolved)) continue
     parts.push(readScanSource(context, resolved, visited))
   }
@@ -2274,12 +2288,12 @@ function moduleEdges(context: ScanContext, file: string) {
 // `next` package, plain resolveImport finds the real package's directive-less re-export stub and the
 // 'use client' boundary of the compat module is silently missed, so the route never gets its client
 // reference or entry.
-function resolveModuleEdge(root: string, file: string, specifier: string) {
+function resolveModuleEdge(context: ScanContext, file: string, specifier: string) {
   return (
     resolveModuleAlias(specifier) ??
-    resolveImport(root, file, specifier) ??
-    getBundlerExtensions().resolveRouteDependency(root, file, specifier) ??
-    getCssExtensions().resolveCssDependency(root, file, specifier)
+    resolveImport(context.root, file, specifier, context.workspaceRoot) ??
+    getBundlerExtensions().resolveRouteDependency(context.root, file, specifier) ??
+    getCssExtensions().resolveCssDependency(context.root, file, specifier)
   )
 }
 
@@ -2288,7 +2302,7 @@ function publishedClientImports(context: ScanContext, file: string) {
   const source = readSource(context, file)
   const found: ModuleEdge[] = []
   for (const edge of scanFacts(file, source).imports) {
-    if (resolveModuleEdge(context.root, file, edge.specifier)) continue
+    if (resolveModuleEdge(context, file, edge.specifier)) continue
     found.push(...publishedClientEdges(context, file, edge.specifier, edge.exports))
   }
   return found
@@ -2316,7 +2330,7 @@ function resolvePublishedEdge(
   kind: 'import' | 'require',
 ) {
   return (
-    resolveModuleEdge(context.root, file, specifier) ??
+    resolveModuleEdge(context, file, specifier) ??
     resolvePackageSpecifier(context.root, file, specifier, [kind, 'default'])
   )
 }
@@ -2376,7 +2390,7 @@ function moduleEdgesFromSource(context: ScanContext, file: string, source: strin
   const facts = scanFacts(file, source)
 
   for (const edge of facts.imports) {
-    const resolved = resolveModuleEdge(context.root, file, edge.specifier)
+    const resolved = resolveModuleEdge(context, file, edge.specifier)
     if (!resolved) continue
     ordered.push({
       file: resolved,
@@ -2389,7 +2403,7 @@ function moduleEdgesFromSource(context: ScanContext, file: string, source: strin
   ordered.sort((a, b) => a.index - b.index)
   const imports: ModuleEdge[] = ordered.map(({ index: _index, ...edge }) => edge)
 
-  for (const imported of dynamicImportEdgesFromSource(context.root, file, source, dynamicNames))
+  for (const imported of dynamicImportEdgesFromSource(context, file, source, dynamicNames))
     imports.push(imported)
 
   return imports
@@ -2488,7 +2502,7 @@ function assertSupportedDynamicCalls(file: string, source: string, dynamicNames:
 }
 
 function dynamicImportEdgesFromSource(
-  root: string,
+  context: ScanContext,
   file: string,
   source: string,
   dynamicNames: Set<string>,
@@ -2499,7 +2513,7 @@ function dynamicImportEdgesFromSource(
   const optionObjects = dynamicOptionObjects(source)
   for (const fact of dynamicCallFacts(source, file)) {
     if (!dynamicNames.has(fact.name)) continue
-    const resolved = resolveModuleEdge(root, file, fact.specifier)
+    const resolved = resolveModuleEdge(context, file, fact.specifier)
     if (!resolved) continue
     imports.push({
       file: resolved,

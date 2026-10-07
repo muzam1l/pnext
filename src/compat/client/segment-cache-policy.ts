@@ -5,7 +5,6 @@
 
 import type { SegmentCacheHit, SegmentCachePolicy, SegmentCacheRecord } from '../../client/router'
 import {
-  BODY_SEGMENT_PATHS,
   clearSegmentCache,
   composeFetchedLayoutFrame,
   composeCachedLayout,
@@ -20,7 +19,6 @@ import {
   recordSegment,
   resolvedRouteFor,
   segmentPrefetchCovered,
-  takeComposedSegment,
   takeSegment,
   type SegmentPayloadMeta,
 } from './segment-cache'
@@ -119,27 +117,12 @@ function take(input: {
   segmentPath: string
 }): SegmentCacheHit | null {
   const hit = takeSegment(input)
-  if (hit) {
-    return {
-      html: hit.html,
-      networkFree: hit.networkFree,
-      prefetchSatisfied: hit.prefetchSatisfied,
-      postponedShell: hit.postponedShell,
-    }
-  }
-  // w9-segment-split: the whole-document entry missed because ONE of the two
-  // frames varied. Compose the cached layout + page frames instead of going to
-  // the network for both. No-op until segment-split commit is enabled.
-  if (!BODY_SEGMENT_PATHS.includes(input.segmentPath as (typeof BODY_SEGMENT_PATHS)[number])) {
-    return null
-  }
-  const composed = takeComposedSegment({ pathname: input.pathname, search: input.search })
-  return composed
+  return hit
     ? {
-        html: composed.html,
-        networkFree: composed.networkFree,
-        prefetchSatisfied: composed.prefetchSatisfied,
-        postponedShell: composed.postponedShell,
+        html: hit.html,
+        networkFree: hit.networkFree,
+        prefetchSatisfied: hit.prefetchSatisfied,
+        postponedShell: hit.postponedShell,
       }
     : null
 }

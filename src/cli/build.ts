@@ -1,3 +1,4 @@
+import { serializeBuildManifest } from '../utils/fs'
 import { copyFile, mkdir, rename, writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -257,7 +258,7 @@ async function runBuild(
   const partytownLib = log.step('partytown lib', () => copyPartytownLib(config))
   partytownLib.catch(() => undefined)
 
-  let routes = await log.step('scan routes', () => scanRoutes(config.appPath))
+  let routes = await log.step('scan routes', () => scanRoutes(config.appPath, config.workspaceRoot))
   log.log(`found ${routes.length} route${routes.length === 1 ? '' : 's'}`)
   if (options.debugBuildPaths) {
     routes = filterDebugBuildRoutes(config.root, routes, options.debugBuildPaths)
@@ -1055,7 +1056,7 @@ async function writeBuildManifest(outPath: string, manifest: BuildManifest) {
   assertManifestServerArtifacts(outPath, manifest)
   const file = path.join(outPath, 'manifest.json')
   const temporary = path.join(outPath, `.manifest-${process.pid}.tmp`)
-  await writeFile(temporary, `${JSON.stringify(manifest, null, 2)}\n`)
+  await writeFile(temporary, serializeBuildManifest(manifest))
   await rename(temporary, file)
 }
 

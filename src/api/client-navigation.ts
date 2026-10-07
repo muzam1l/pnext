@@ -1,6 +1,8 @@
+import { options } from 'preact'
 import { useEffect, useState } from 'preact/hooks'
 import { ReadonlyURLSearchParams, type HrefOptions } from './navigation'
 import { blockJavascriptUrl, prefetchRoute, softNavigate } from '../client/router'
+import { routerState } from '../client/router/hub'
 import { seedHistoryEntry } from '../client/router/history'
 import {
   emitLocationChange,
@@ -158,8 +160,31 @@ export function useRoute<Route extends RoutePath = RoutePath>(): CurrentRoute<Ro
   }
 }
 
+interface HookOptions {
+  __h?: (component: { __P?: Element }, ...rest: unknown[]) => void
+}
+
 export function useLinkStatus() {
-  return { pending: false }
+  // The router marks a link pending through its anchor, so find the Link this component renders in.
+  const hookOptions = options as HookOptions
+  const hook = hookOptions.__h
+  let parent: Element | undefined
+  hookOptions.__h = (component, ...rest) => {
+    parent = component.__P
+    hook?.(component, ...rest)
+  }
+  const [pending, setPending] = useState(false)
+  hookOptions.__h = hook
+  useEffect(() => {
+    const link = parent?.closest<HTMLAnchorElement & { __pnextHints?: Set<typeof setPending> }>(
+      'a[data-pnext-link]',
+    )
+    if (!link) return
+    const hints = (link.__pnextHints ??= new Set())
+    hints.add(setPending)
+    return () => hints.delete(setPending)
+  }, [])
+  return { pending }
 }
 
 function useLocation() {
@@ -196,11 +221,33 @@ function locationSignature(location: { pathname: string; search: string; hash: s
   return `${location.pathname}${location.search}${location.hash}`
 }
 
+// Server only: a request/context store, anchored on globalThis.
+interface ServerStore {
+  request?: { url: string }
+  params?: Record<string, RouteParamValue>
+  routeMode?: string
+}
+
+function serverStore(key: string) {
+  const storage = (globalThis as Record<symbol, { getStore(): ServerStore | undefined }>)[
+    Symbol.for(key)
+  ]
+  return storage?.getStore()
+}
+
 function currentLocation() {
   if (!process.browser && typeof window === 'undefined') {
+    const href = serverStore('pnext.requestStorage')?.request?.url
+    const url = href ? new URL(href) : undefined
     return {
-      pathname: '/',
-      search: '',
+      pathname: url?.pathname ?? '/',
+      // Like Next: dev and dynamic renders see the query; static and cached HTML must not bake it in.
+      search:
+        // eslint-disable-next-line turbo/no-undeclared-env-vars
+        process.env.NODE_ENV === 'development' ||
+        serverStore('pnext.workUnitStorage')?.routeMode === 'dynamic'
+          ? (url?.search ?? '')
+          : '',
       hash: '',
     }
   }
@@ -212,7 +259,8 @@ function currentLocation() {
 }
 
 function routeState() {
-  if (!process.browser && typeof window === 'undefined') return {}
+  if (!process.browser && typeof window === 'undefined')
+    return { params: serverStore('pnext.requestStorage')?.params } as RouteState
   const state = (history.state as Record<string, unknown> | null) ?? {}
   const routeState = window.__PNEXT_ROUTE__ ?? {}
   const bfcacheId = typeof state.__pnextBfcacheId === 'string' ? state.__pnextBfcacheId : undefined
@@ -242,6 +290,7 @@ function navigate(url: string, mode: 'push' | 'replace', scroll = true) {
   if (mode === 'replace') window.history.replaceState(history.state, '', next)
   else window.history.pushState(history.state, '', next)
   scheduleNavigationScroll(next, { scroll })
+  routerState.settleLink?.()
 }
 
 // Exported so compat's link-status can guarantee raw history.pushState /

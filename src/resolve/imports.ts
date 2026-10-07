@@ -189,7 +189,12 @@ export function resolveModuleAlias(specifier: string): string | undefined {
  * Resolve a specifier to a LOCAL source file, or undefined when it belongs to
  * an external package. Callers read undefined as "leave this to node/esbuild".
  */
-export function resolveImport(root: string, fromFile: string, specifier: string) {
+export function resolveImport(
+  root: string,
+  fromFile: string,
+  specifier: string,
+  workspaceRoot?: string,
+) {
   // A `?query`/`#fragment` resource belongs to its loader chain (turbopack
   // rules, `.wasm?module`): those plugins strip the suffix and resolve the base
   // themselves, and the query is part of the module's identity — so it is never
@@ -215,7 +220,7 @@ export function resolveImport(root: string, fromFile: string, specifier: string)
     return resolved ? realImportPath(resolved) : undefined
   }
 
-  const workspaceResolved = resolveWorkspacePackageImport(root, specifier)
+  const workspaceResolved = resolveWorkspacePackageImport(root, specifier, workspaceRoot)
   if (workspaceResolved) return workspaceResolved
 
   return resolveAppTreePackage(resolutionRoot, root, fromFile, specifier)
@@ -344,8 +349,8 @@ type PackageExport = unknown
  * on-disk subpath fallback no standard resolver takes, because the published `exports` point at build output
  * that does not exist in a checkout.
  */
-function resolveWorkspacePackageImport(root: string, specifier: string) {
-  const workspaceRoot = findWorkspaceRoot(root)
+function resolveWorkspacePackageImport(root: string, specifier: string, boundary?: string) {
+  const workspaceRoot = boundary ? path.resolve(boundary) : findWorkspaceRoot(root)
   if (!workspaceRoot) return undefined
 
   const packageName = packageNameFromSpecifier(specifier)
@@ -999,14 +1004,14 @@ const workspaceMembershipCache = new Map<string, boolean>()
  * dependency. An app outside the workspace (a checkout linked into it) sees the package only through
  * node_modules, so the package's own real dir is asked about its manifest too.
  */
-export function isWorkspacePackage(root: string, name: string): boolean {
-  const key = `${path.resolve(root)}\0${name}`
+export function isWorkspacePackage(root: string, name: string, boundary?: string): boolean {
+  const key = `${path.resolve(root)}\0${name}\0${boundary ?? ''}`
   const cached = workspaceMembershipCache.get(key)
   if (cached !== undefined) return cached
 
-  const workspaceRoot = findWorkspaceRoot(root)
+  const workspaceRoot = boundary ? path.resolve(boundary) : findWorkspaceRoot(root)
   let member = Boolean(workspaceRoot && workspacePackages(workspaceRoot).has(name))
-  if (!member) {
+  if (!member && !boundary) {
     const packageRoot = findNodePackageRoot(path.resolve(root), name)
     const real = packageRoot ? realImportPath(packageRoot) : undefined
     const linkedRoot = real ? findWorkspaceRoot(real) : undefined

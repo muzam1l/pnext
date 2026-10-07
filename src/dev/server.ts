@@ -285,7 +285,7 @@ export async function startDevServer(options: DevServerOptions) {
   // stylesheet, and both the warm tier and the render force it at Ready+0.
   installGlobalCssCache(config)
   markBoot('boot:registry')
-  let routes = await scanRoutes(config.appPath)
+  let routes = await scanRoutes(config.appPath, config.workspaceRoot)
   setDevClientRoutes(config, routes)
   markBoot('boot:scanRoutes')
   await validateProxyFiles(config)
@@ -359,7 +359,7 @@ export async function startDevServer(options: DevServerOptions) {
     // The route table is built from file paths only, so only an added, removed
     // or renamed file can change it — a plain save never does.
     if (structural) {
-      routes = await scanRoutes(config.appPath)
+      routes = await scanRoutes(config.appPath, config.workspaceRoot)
       setDevClientRoutes(config, routes)
     }
     await validateProxyFiles(config)

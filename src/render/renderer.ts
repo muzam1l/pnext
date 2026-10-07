@@ -286,6 +286,10 @@ const renderBufferScope = ((globalThis as Record<PropertyKey, unknown>)[RENDER_B
   new AsyncLocalStorage<RenderBufferFrame>()) as AsyncLocalStorage<RenderBufferFrame>
 /** True while a render that SUSPENDS in place is running; see installRawTextRendering. */
 const suspendingStreamScope = new AsyncLocalStorage<boolean>()
+/** The shell body's hoisted resource links; see applyHoistable. */
+const hoistScope = new AsyncLocalStorage<{ nodes?: VNode<Record<string, unknown>>[] }>()
+/** The segment that renders the islands resolved inside it; see islandIdSeed. */
+const islandOwnerScope = new AsyncLocalStorage<string>()
 
 type PNextPreactOptions = typeof preactOptions & {
   [rawTextRenderingInstalled]?: true
@@ -315,7 +319,99 @@ function installRawTextRendering() {
     applyServerActionFormVNode(vnode)
     applyLayoutSegmentSnapshot(vnode)
   }
+  // `__b` is preact's mangled diff hook: render-to-string calls it with parents linked.
+  const diffOptions = preactOptions as { __b?: (vnode: VNode) => void }
+  const previousDiff = diffOptions.__b
+  diffOptions.__b = vnode => {
+    applyHoistable(vnode)
+    previousDiff?.(vnode)
+  }
 }
+
+// React 19 hoists resource links rendered in the body into `<head>`, once per resource. Hydrating
+// trees keep theirs in place, as do head, svg and noscript content and Suspense fallbacks.
+const HOIST_BARRIERS = new Set([
+  'head',
+  'svg',
+  'noscript',
+  'template',
+  'pnext-client',
+  'pnext-suspense',
+])
+const RESOURCE_LINKS = new Set([
+  'stylesheet',
+  'preload',
+  'modulepreload',
+  'preconnect',
+  'dns-prefetch',
+])
+
+function applyHoistable(vnode: VNode) {
+  if (vnode.type !== 'link') return
+  const nodes = hoistScope.getStore()?.nodes
+  if (!nodes) return
+  const { precedence, ...props } = vnode.props as Record<string, unknown>
+  if (
+    !RESOURCE_LINKS.has(props.rel as string) ||
+    typeof props.href !== 'string' ||
+    !props.href ||
+    props.itemProp != null ||
+    props.disabled != null ||
+    props.onLoad ||
+    props.onError ||
+    (props.rel === 'stylesheet' && typeof precedence !== 'string')
+  )
+    return
+  for (let parent = (vnode as HoistVNode).__; parent; parent = parent.__) {
+    const host = parent.type
+    if (
+      typeof host === 'string'
+        ? HOIST_BARRIERS.has(host)
+        : host === SuspenseFallback || isClientPageComponent(host)
+    )
+      return
+  }
+  const key = resourceKey(props)
+  if (!nodes.some(node => resourceKey(node.props) === key)) {
+    if (precedence != null) props['data-precedence'] = precedence
+    nodes.push(h('link', props))
+  }
+  vnode.props = { vnode, type: vnode.type, props: vnode.props } as never
+  vnode.type = RestoreHoisted as VNode['type']
+}
+
+// Renders nothing in the hoisted link's place and restores the vnode, which may be module-shared.
+function RestoreHoisted({
+  vnode,
+  type,
+  props,
+}: {
+  vnode: VNode
+  type: VNode['type']
+  props: VNode['props']
+}) {
+  vnode.type = type
+  vnode.props = props
+  return null
+}
+
+// React keys a stylesheet by href, a hint also by what picks its fetched variant.
+function resourceKey(props: Record<string, unknown>) {
+  const key = [props.rel, props.href]
+  const cors = props.crossOrigin ?? props.crossorigin
+  if (props.rel !== 'stylesheet')
+    key.push(
+      props.as,
+      props.imageSrcSet ?? props.imagesrcset,
+      props.imageSizes ?? props.imagesizes,
+      props.media,
+      // React's CORS buckets: absent, use-credentials, anonymous for any other value.
+      cors == null || cors === 'use-credentials' ? cors : 'anonymous',
+    )
+  return key.join('\n')
+}
+
+type HoistVNode = VNode & { __?: HoistVNode }
 
 const LAYOUT_SCOPE_PROP = '__pnextLayoutScope'
 // Rides a client template's stub vnode into clientIslandVNode, which strips it
@@ -551,6 +647,7 @@ interface PageRender {
   hasClientMounts?: boolean
   devScript: string
   streamChunks: Promise<string>[]
+  shellTime?: boolean
   /** Chunks written AFTER `</html>` (late metadata); no document consumer waits on them. */
   lateChunks?: Promise<string>[]
   status?: number
@@ -802,6 +899,8 @@ interface DocumentPage extends MetadataRenderPage {
   documentHeadTags?: string
   deferredScripts?: string
   nonce?: string
+  /** A streamed document load: stamp the shell's first frame for PROMO_RUNTIME. */
+  shellTime?: boolean
 }
 
 interface RenderTreeExtra {
@@ -894,7 +993,7 @@ function renderDocumentStart(page: DocumentPage) {
     ${page.routeScript}
     ${page.clientScript}
     ${page.deferredScripts ?? ''}
-    ${page.devScript}`
+    ${page.devScript}${page.shellTime ? `<script>${SHELL_TIME_SCRIPT}</script>` : ''}`
   return dropLoadingDepthMarkers(stampDocumentNonce(html, page.nonce))
 }
 
@@ -2086,6 +2185,11 @@ export function renderPprResponse(options: RenderOptions, prebuilt: PrebuiltShel
       // eslint-disable-next-line turbo/no-undeclared-env-vars
       if (process.env.__NEXT_TEST_MODE) {
         controller.enqueue(encoder.encode('<!-- PPR_BOUNDARY_SENTINEL -->'))
+      }
+      if (!routerPayload(options)) {
+        const nonce = documentNonce(options.request)
+        const stamp = `<script${nonce ? ` nonce="${escapeHtml(nonce)}"` : ''}>${SHELL_TIME_SCRIPT}</script>`
+        controller.enqueue(encoder.encode(stamp))
       }
       schedulePprShellUpgrade(options)
       void (async () => {
@@ -3327,6 +3431,11 @@ function normalizeRenderOptions(options: RenderOptions): RenderOptions {
 // Streaming isolates each Suspense boundary, dropping client-provider context
 // from ancestor layouts. Compat can narrow this through the streamRoute hook;
 // core routes stream by default.
+/** A response the client router fetched, not a document load. */
+function routerPayload(options: RenderOptions) {
+  return Boolean(options.nav?.soft) || options.request?.headers.get('rsc') === '1'
+}
+
 function canStreamRoute(options: RenderOptions) {
   return getStreamRouteExtensions().canStreamRoute({
     config: options.config,
@@ -3551,10 +3660,13 @@ async function renderTreeInFrame(
           : await resolveServerTree(layoutRender.tree, resolveState)
       : layoutRender.tree,
   )
-  const renderBody =
-    stream && (options.route.client || streamState.inlineSuspense)
-      ? (vnode: VNode) => renderClientPageStreamShell(vnode, streamState)
-      : renderVNodeToString
+  const hoist: { nodes?: VNode<Record<string, unknown>>[] } = { nodes: [] }
+  const renderBody = (vnode: VNode, state?: ActionSerializeState) =>
+    hoistScope.run(hoist, () =>
+      stream && (options.route.client || streamState.inlineSuspense)
+        ? renderClientPageStreamShell(vnode, streamState)
+        : renderVNodeToString(vnode, state),
+    )
   const document = await profileRenderStep(profile, 'render document body', async () =>
     layoutRender.documentLayoutFile
       ? await readDocumentLayout(
@@ -3571,6 +3683,10 @@ async function renderTreeInFrame(
           body: await renderBody(h(Fragment, null, resolved), resolveState),
         },
   )
+  // Later streamed renders keep theirs in place: the head has gone out by then.
+  const hoisted = hoist.nodes!
+  hoist.nodes = undefined
+  if (hoisted.length) document.head += renderToString(h(Fragment, null, hoisted))
   // Stable per-root-layout id so the client router can detect root-layout
   // switches and fall back to an MPA navigation (rootLayoutChanged).
   if (layoutRender.documentLayoutFile) {
@@ -3613,8 +3729,7 @@ async function renderTreeInFrame(
   // render and only metadata that misses the flush stays below it (conformance "metadata body
   // placement matches Next" vs metadata-streaming "should delay the metadata render to body").
   // A router payload has no head to hoist into, so it always rides the body.
-  const navMetadataRender =
-    Boolean(options.nav?.soft) || options.request?.headers.get('rsc') === '1'
+  const navMetadataRender = routerPayload(options)
   const startedPageMetadata =
     metadataMayStream && !navMetadataRender && typeof pageMetadata === 'function'
       ? runInCacheScope(() => pageMetadata(mergeMetadataEntries(layoutRender.metadata)))
@@ -3978,6 +4093,7 @@ async function renderTreeInFrame(
     hasClientMounts: pageSlotIsMountTarget(options),
     devScript,
     streamChunks: streamState.deferred,
+    shellTime: streamState.deferred.length > 0 && !routerPayload(options),
     lateChunks,
     status: extra.status,
     viewport,
@@ -4867,6 +4983,7 @@ function ClientIsland(
     __pnextComponent?: ComponentType<Record<string, unknown>>
     __pnextSerializedProps?: string
     __pnextLayoutScope?: LayoutSegmentSnapshot
+    __pnextOwner?: string
     __pnextParamsScope?: RouteParamsSnapshot
     __pnextTemplate?: boolean
     __pnextSkipSsr?: boolean
@@ -4878,6 +4995,7 @@ function ClientIsland(
     __pnextComponent,
     __pnextSerializedProps,
     __pnextLayoutScope,
+    __pnextOwner,
     __pnextParamsScope,
     __pnextTemplate,
     __pnextSkipSsr,
@@ -4928,6 +5046,12 @@ function ClientIsland(
     islandProps['data-pnext-params'] = serializeProps(__pnextParamsScope)
   }
   const staticChildren = islandStaticChildren(__pnextClient.id, islandChildren)
+  const seed = islandIdSeed(
+    __pnextOwner ?? '',
+    __pnextClient.id,
+    islandProps['data-pnext-props'] as string,
+  )
+  islandProps['data-pnext-id'] = seed
 
   if (__pnextSkipSsr) {
     return staticChildren
@@ -4964,6 +5088,8 @@ function ClientIsland(
     revivePromiseProps(ssrProps),
     plainChildren !== undefined ? islandChildren : probedChildren,
   )
+  // useId's mask (preact's mangled `_mask`): the client seeds the island root from data-pnext-id.
+  ;(island as { __m?: unknown }).__m = [seed, 0]
   if (__pnextLayoutScope) {
     island = h(
       LayoutSegmentContext.Provider,
@@ -5005,6 +5131,36 @@ function ClientIsland(
     fallbackChildren,
     csrFallback: __pnextCsrFallback,
   })
+}
+
+// React numbers useId across its one root; each island root here seeds its own id space from its
+// owning segment and identity, so ids stay unique across islands and across documents that keep a
+// layout's islands. Identical islands of one owner in one render take the next copy suffix.
+function islandIdSeed(owner: string, id: string, props: string) {
+  let hash = 0
+  for (const text of [owner, id, props])
+    for (let index = 0; index < text.length; index++)
+      hash = (Math.imul(31, hash) + text.charCodeAt(index)) | 0
+  const seed = (hash >>> 0).toString(36)
+  const frame = renderBufferScope.getStore()
+  const seeds = frame
+    ? (frame.islandSeeds ??= new Map<string, number>())
+    : new Map<string, number>()
+  const copies = seeds.get(seed) ?? 0
+  seeds.set(seed, copies + 1)
+  return copies ? `${seed}_${copies}` : seed
+}
+
+// Layout and template markers own the islands they render, the page slot owns the route's.
+function inIslandOwner<T>(node: VNode, options: RenderOptions, resolve: () => T): T {
+  const props = node.props as Record<string, unknown>
+  const owner =
+    node.type === 'pnext-layout'
+      ? (props['data-pnext-segment'] as string)
+      : props.id === 'pnext-page'
+        ? `page${options.route.route}`
+        : undefined
+  return owner === undefined ? resolve() : islandOwnerScope.run(owner, resolve)
 }
 
 // Marks the island's static-children wrapper as rendered when the component
@@ -5257,7 +5413,10 @@ async function resolveServerTree(node: unknown, state: ResolveState): Promise<Co
     if (state.partial?.shellPending && node.type === 'html') {
       state.partial.shellPending = false
     }
-    return elementVNode(node, await resolveServerTree(node.props.children, state), state)
+    const children = await inIslandOwner(node, state.options, () =>
+      resolveServerTree(node.props.children, state),
+    )
+    return elementVNode(node, children, state)
   }
 
   const component = node.type
@@ -5708,12 +5867,16 @@ async function inlineSuspenseBoundary(
   const fallback = await resolveServerTreeForStream(node.props.fallback, state)
   // The fallback must be a single vnode: the stream renderer renders it with no
   // parent vnode, and its array branch would crash on one (swallowing the
-  // fallback entirely). A Fragment wrapper is byte-neutral.
+  // fallback entirely). The wrapper is byte-neutral and marks it for applyHoistable.
   return h(
     boundaryType,
-    { ...node.props, fallback: h(Fragment, null, fallback) },
+    { ...node.props, fallback: h(SuspenseFallback, null, fallback) },
     h(Suspended, null),
   )
+}
+
+function SuspenseFallback(props: { children?: ComponentChildren }) {
+  return props.children
 }
 
 // Wraps a pending subtree as a suspending component. A throw AFTER the boundary suspended can only
@@ -5934,7 +6097,9 @@ function resolveServerTreeForStream(
     // component) wrongly takes the doc-shell blocking branch and awaits its slow
     // content before the shell can flush. Mirrors resolveServerTree's html flip.
     if (isDocument) state.shellPending = false
-    const children = resolveServerTreeForStream(node.props.children, state)
+    const children = inIslandOwner(node, state.options, () =>
+      resolveServerTreeForStream(node.props.children, state),
+    )
     if (isPromise(children)) {
       return children.then(resolved => elementVNode(node, resolved, state))
     }
@@ -6375,7 +6540,15 @@ function dynamicTargetReference(
 ) {
   const target = dynamicReference.target
   if (!target) return undefined
-  return state.clientReferences.get(`c-${clientReferenceId(target.file, target.exportName)}`)
+  const stored = state.clientReferences.get(
+    `c-${clientReferenceId(target.file, target.exportName)}`,
+  )
+  if (stored) return stored
+  for (const reference of state.clientReferences.values()) {
+    if (reference.file === target.file && reference.exportName === target.exportName)
+      return reference
+  }
+  return undefined
 }
 
 function clientIslandVNode(
@@ -6424,6 +6597,7 @@ function clientIslandVNode(
       __pnextComponent: component,
       __pnextTemplate: templateMarker === true,
       __pnextLayoutScope: layoutScope as LayoutSegmentSnapshot | undefined,
+      __pnextOwner: islandOwnerScope.getStore(),
       // Params visible at this island's position in the route (route params plus
       // any enclosing parallel-route slot's own dynamic/catch-all captures). Read
       // from the active params scope (render/slots.ts) so a slot island's
@@ -7279,10 +7453,11 @@ const PROMO_RUNTIME =
   'if(d.nodeType===8){var mm=/^\\$ps:(\\d+)$/.exec(d.data);if(mm){cur=m[mm[1]]=[];continue}' +
   'if(/^\\/\\$ps:\\d+$/.test(d.data)){cur=null;continue}}' +
   'if(cur)cur.push(d);}return m}' +
+  "function B(i){return document.querySelector('pnext-suspense[data-pnext-suspense=\"'+i+'\"]')}" +
   'function tryPromote(i){' +
   "var t=document.querySelector('[data-pnext-stream=\"'+i+'\"]');" +
   'if(!t){delete P[i];return true;}' +
-  "var e=document.querySelector('pnext-suspense[data-pnext-suspense=\"'+i+'\"]');" +
+  'var e=B(i);' +
   'if(!e){P[i]=1;return false;}' +
   // A boundary inside a client island: this promotion rewrites DOM the island's mounted
   // preact tree adopted at hydration, which still names the fallback. Mark the root so the
@@ -7304,17 +7479,23 @@ const PROMO_RUNTIME =
   '}else{while(t.firstChild)f.appendChild(t.firstChild);}' +
   'e.replaceWith(f);t.remove();delete P[i];return true;' +
   '}' +
-  'function drain(){var changed=true;while(changed){changed=false;var k=Object.keys(P);for(var j=0;j<k.length;j++){if(P[k[j]]&&tryPromote(k[j]))changed=true;}}}' +
-  'if(document.addEventListener)document.addEventListener("DOMContentLoaded",drain);' +
+  'function drain(){var any,changed=true;while(changed){changed=false;var k=Object.keys(P);for(var j=0;j<k.length;j++){if(P[k[j]]&&tryPromote(k[j]))changed=any=true;}}return any}' +
+  // Islands in a promoted chunk hydrate only now: the entry's scan skips unrevealed chunks.
+  'function M(){window.__PNEXT_MATERIALIZE_CLIENT_ISLANDS__&&window.__PNEXT_MATERIALIZE_CLIENT_ISLANDS__(document);' +
+  'window.__PNEXT_MOUNT_ISLANDS__&&window.__PNEXT_MOUNT_ISLANDS__();}' +
+  'if(document.addEventListener)document.addEventListener("DOMContentLoaded",function(){drain()&&M()});' +
   'return function(i){' +
-  'var ok=tryPromote(i);' +
-  'window.__PNEXT_MATERIALIZE_CLIENT_ISLANDS__&&window.__PNEXT_MATERIALIZE_CLIENT_ISLANDS__(document);' +
-  'window.__PNEXT_MOUNT_ISLANDS__&&window.__PNEXT_MOUNT_ISLANDS__();' +
-  'if(ok)drain();' +
-  '};' +
+  // React's $RC: reveal in the shell's first frame, else no sooner than 300 ms after the last reveal.
+  // Inside an island at once: a held reveal lands after hydration, under the island's adopted tree.
+  '(B(i)?.closest("pnext-client")?f=>f():self.$RT?setTimeout:requestAnimationFrame)(function(){$RT=performance.now();' +
+  'if(tryPromote(i))drain();M();' +
+  '},self.$RT+300-performance.now())};' +
   '}'
 
-function suspenseReplaceScript(id: string) {
+// React Fizz's shell-time stamp: PROMO_RUNTIME reveals no sooner than 300 ms after this frame.
+const SHELL_TIME_SCRIPT = 'requestAnimationFrame(()=>$RT=performance.now())'
+
+export function suspenseReplaceScript(id: string) {
   return `(function(){(window.__PNEXT_PROMO__=window.__PNEXT_PROMO__||(${PROMO_RUNTIME})())(${JSON.stringify(id)});var s=document.currentScript;if(s)s.remove();}())`
 }
 
@@ -7595,7 +7776,7 @@ async function applyLayouts(
       tree = h(
         'pnext-layout',
         {
-          'data-pnext-segment': segmentIdentityToken(file),
+          'data-pnext-segment': segmentIdentityToken(relative(options.config.root, file)),
           'data-pnext-skip': '',
           ...(scope !== undefined ? { 'data-pnext-scope': scope } : {}),
           style: { display: 'contents' },
@@ -7728,7 +7909,11 @@ async function wrapSegment(
   })
   return (component as ClientComponent)[clientReferenceSymbol]
     ? segment
-    : serverSegment(layoutFile, segment, segmentScopeFor(options, dir))
+    : serverSegment(
+        relative(options.config.root, layoutFile),
+        segment,
+        segmentScopeFor(options, dir),
+      )
 }
 
 // An explicit `@children` parallel-route slot directory is Next's way to supply
@@ -7769,7 +7954,7 @@ async function wrapInTemplate(
   const Template = markServerReference(module.default)
   if (!Template) return tree
   return serverSegment(
-    templateFile,
+    relative(options.config.root, templateFile),
     h(Template as ComponentType<ServerVNodeProps>, { children: tree }),
     segmentScopeFor(options, dirname(templateFile)),
   )

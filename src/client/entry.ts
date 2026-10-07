@@ -104,10 +104,23 @@ function serializeModulePath() {
 // Re-provide the per-island layout-segment snapshot (stamped by the renderer as
 // `data-pnext-layout-segments`) around a hydrated island so compat's
 // useSelectedLayoutSegment(s) recomputes live from the layout depth. Emitted
-// only under next compat (the hooks are compat-only); a no-op wrapper otherwise.
+// only under next compat (the hooks are compat-only); core keeps the children guard.
 function layoutSegmentHelperSource(nextCompat?: boolean) {
-  if (!nextCompat) return ''
-  return `
+  // useId's mask (preact's _mask), seeded by data-pnext-id and kept on the instance (__c) across re-adoption.
+  const seed = `
+function pnextIslandMask(vnode, root) {
+  const mask = root.__pnextMask ??= [root.getAttribute('data-pnext-id'), 0];
+  Object.defineProperty(vnode, '__m', { enumerable: true, get() { return (this.__c || this).__pnextMask ??= mask; } });
+}`
+  if (!nextCompat)
+    return `${seed}
+function pnextIslandVNode(h, Component, props, children, root) {
+  const vnode = children !== undefined ? h(Component, props, children) : h(Component, props);
+  pnextIslandMask(vnode, root);
+  return vnode;
+}
+`
+  return `${seed}
 import { LayoutSegmentContext as __PNextLayoutSegmentContext, RouteParamsContext as __PNextRouteParamsContext } from ${JSON.stringify(islandContextModulePath())};
 function pnextIslandReadJson(root, attr) {
   const raw = root && root.getAttribute ? root.getAttribute(attr) : null;
@@ -118,6 +131,7 @@ function pnextIslandVNode(h, Component, props, children, root) {
   // An explicit undefined children argument clobbers props.children in
   // preact's createElement; plain children travel inside the parsed props.
   let vnode = children !== undefined ? h(Component, props, children) : h(Component, props);
+  pnextIslandMask(vnode, root);
   const segments = pnextIslandReadJson(root, 'data-pnext-layout-segments');
   if (segments) vnode = h(__PNextLayoutSegmentContext.Provider, { value: segments }, vnode);
   const params = pnextIslandReadJson(root, 'data-pnext-params');
@@ -132,11 +146,8 @@ function islandVNodeExpr(
   propsExpr: string,
   childrenExpr: string,
   rootExpr: string,
-  nextCompat?: boolean,
 ) {
-  return nextCompat
-    ? `pnextIslandVNode(h, ${componentExpr}, ${propsExpr}, ${childrenExpr}, ${rootExpr})`
-    : `h(${componentExpr}, ${propsExpr}, ${childrenExpr})`
+  return `pnextIslandVNode(h, ${componentExpr}, ${propsExpr}, ${childrenExpr}, ${rootExpr})`
 }
 
 /**
@@ -1136,11 +1147,10 @@ function observeVisibleIsland(root, island) {
 }
 
 function visibleTarget(root) {
-  // The host's OWN box: hostMeasureSource delegates the patched one to the
-  // parent, and IntersectionObserver never fires for a display:contents target.
-  const rect = Element.prototype.getBoundingClientRect.call(root);
-  if (rect.width || rect.height) return root;
-  return root.parentElement ?? root;
+  // IntersectionObserver never fires for a display:contents target: observe the nearest box.
+  let target = root;
+  while (target.parentElement && getComputedStyle(target).display === 'contents') target = target.parentElement;
+  return target;
 }
 
 ${mountOnceSource()}
@@ -1159,7 +1169,8 @@ async function mountIslandTree(root, island) {
   ]);
 ${facts.suspense !== false ? '  islandBoundary = Suspense;\n' : ''}  const rawProps = root.getAttribute('data-pnext-props') ?? '{}';
   const source = preservedSource(root, render);
-  const vnode = islandVNode(h, Component, await islandProps(rawProps, source, node => domChildren(h, node), h), await staticChildren(h, source, island.id));
+  if (!source) return adoptPreserved(render, root);
+  const vnode = islandVNode(h, Component, await islandProps(rawProps, source, node => domChildren(h, node), h), await staticChildren(h, source, island.id), root);
   const wrapped = ${facts.suspense !== false ? 'h(Suspense, { fallback: null }, pnextClientBoundary(h, vnode))' : 'pnextClientBoundary(h, vnode)'};
   if (source !== root) adoptPreserved(render, root, wrapped);
   else mount(hydrate, render, root, wrapped);
@@ -1172,7 +1183,8 @@ async function mountIslandTree(root, island) {
   const [{ h, hydrate, render }, Component] = await Promise.all([import('preact'), islandComponent(island)]);
   const rawProps = root.getAttribute('data-pnext-props') ?? '{}';
   const source = preservedSource(root, render);
-  const vnode = islandVNode(h, Component, await islandProps(rawProps, source, node => domChildren(h, node), h), await staticChildren(h, source, island.id));
+  if (!source) return adoptPreserved(render, root);
+  const vnode = islandVNode(h, Component, await islandProps(rawProps, source, node => domChildren(h, node), h), await staticChildren(h, source, island.id), root);
   if (source !== root) adoptPreserved(render, root, vnode);
   else mount(hydrate, render, root, vnode);
 }`
@@ -1200,16 +1212,18 @@ function preservedSource(root, render) {
   const incoming = root.__pnextIncoming;
   root.__pnextIncoming = undefined;
   if (!incoming) return root;
-  if (root.__pnextLive === render) return incoming;
+  // A kept layout's island stashed as its own incoming has no new render: keep its tree.
+  if (root.__pnextLive === render) return incoming === root ? null : incoming;
   root.replaceChildren(...incoming.childNodes);
   root.__pnextLive = undefined;
+  root.__pnextMask = [incoming.getAttribute('data-pnext-id'), 0];
   return root;
 }
 
 // Re-render the preserved root in place so component state survives while the
 // routed content under the island updates.
 function adoptPreserved(render, root, vnode) {
-  render(vnode, root);
+  if (vnode) render(vnode, root);
   pnextRender = render;
   pnextMountedRoots.add(root);
 }
@@ -1230,8 +1244,10 @@ function mount(hydrate, render, root, vnode) {
 // Adopted DOM children win (element children); plain children travel inside
 // the serialized props instead, and an explicit undefined third argument would
 // clobber props.children in preact's createElement — so only pass it when set.
-function islandVNode(h, Component, props, adopted) {
-  return adopted !== undefined ? h(Component, props, adopted) : h(Component, props);
+function islandVNode(h, Component, props, adopted, root) {
+  const vnode = adopted !== undefined ? h(Component, props, adopted) : h(Component, props);
+  pnextIslandMask(vnode, root);
+  return vnode;
 }
 
 async function staticChildren(h, root, id) {
@@ -1278,7 +1294,7 @@ async function domNode(h, node) {
     // A nested island must match its previous incarnation by IDENTITY, or the shift remounts
     // it and resets its state - Next never remounts layout components on navigation.
     if (props.key === undefined) props.key = 'pnext-island:' + id;
-    const vnode = islandVNode(h, Component, props, await staticChildren(h, element, island.id));
+    const vnode = islandVNode(h, Component, props, await staticChildren(h, element, island.id), element);
     return ${nextCompat ? 'islandBoundary ? h(islandBoundary, { fallback: null }, pnextClientBoundary(h, vnode)) : pnextClientBoundary(h, vnode)' : 'vnode'};
   }
 
@@ -1531,7 +1547,7 @@ function diagnoseSkippedIslands() {
     // claim pass adopted is no longer in the document. Everything else is a host
     // this route can never hydrate.
     if (island?.options?.load === 'visible') continue;
-    if (root.closest('pnext-hole-capture')) continue;
+    if (root.closest('pnext-hole-capture, [data-pnext-stream]')) continue;
     if (parent && !parent.__pnextLive) continue;
     const reason = island
       ? 'was materialized after its parent island mounted, outside any streamed hole this route can re-adopt'
@@ -1562,6 +1578,8 @@ for (const island of islands) {
   }
 for (const island of islands) {
   for (const root of document.querySelectorAll(\`[data-pnext-client="\${island.id}"]\`)) {
+    // React hydrates a streamed boundary only once revealed; its promotion re-runs this scan.
+    if (root.closest('[data-pnext-stream]')) continue;
     const parent = nestedIslandParent(root);
     if (parent) {
       pending.push(claimNestedIslandRoot(root, parent));
@@ -1625,8 +1643,11 @@ async function mountIslandTree(root, island) {
     // Preserved across a soft navigation: re-render in place with the incoming
     // document's props/children so component state survives while the routed
     // content under the island updates.
-    const vnode = ${islandVNodeExpr('Component', 'await islandProps(rawProps, incoming, domChildren, h)', 'await staticChildren(incoming, island.id)', 'root', nextCompat)};
-    render(${wrapInBoundary('vnode', nextCompat)}, root);
+    // A kept layout's island (its own incoming) keeps its tree.
+    if (incoming !== root) {
+      const vnode = ${islandVNodeExpr('Component', 'await islandProps(rawProps, incoming, domChildren, h)', 'await staticChildren(incoming, island.id)', 'root')};
+      render(${wrapInBoundary('vnode', nextCompat)}, root);
+    }
     pnextMountedRoots.add(root);
     return;
   }
@@ -1635,8 +1656,9 @@ async function mountIslandTree(root, island) {
     // instance can't diff its tree — restore the SSR children and mount fresh.
     root.replaceChildren(...incoming.childNodes);
     root.__pnextLive = undefined;
+    root.__pnextMask = [incoming.getAttribute('data-pnext-id'), 0];
   }
-  const vnode = ${islandVNodeExpr('Component', 'await islandProps(rawProps, root, domChildren, h)', 'await staticChildren(root, island.id)', 'root', nextCompat)};
+  const vnode = ${islandVNodeExpr('Component', 'await islandProps(rawProps, root, domChildren, h)', 'await staticChildren(root, island.id)', 'root')};
   mount(root, ${wrapInBoundary('vnode', nextCompat)});
 }
 
@@ -1713,7 +1735,7 @@ async function domNode(node) {
         : ''
     }
     const Component = await islandComponent(island);
-    return ${wrapInBoundary(islandVNodeExpr('Component', 'await islandProps(rawProps, element, domChildren, h)', 'children', 'element', nextCompat), nextCompat)};
+    return ${wrapInBoundary(islandVNodeExpr('Component', 'await islandProps(rawProps, element, domChildren, h)', 'children', 'element'), nextCompat)};
   }
 
   if (Page && element.id === 'pnext-page') {
@@ -1755,11 +1777,10 @@ ${holeSeamSource()}${
     visibleIslands
       ? `
 function visibleTarget(root) {
-  // The host's OWN box: hostMeasureSource delegates the patched one to the
-  // parent, and IntersectionObserver never fires for a display:contents target.
-  const rect = Element.prototype.getBoundingClientRect.call(root);
-  if (rect.width || rect.height) return root;
-  return root.parentElement ?? root;
+  // IntersectionObserver never fires for a display:contents target: observe the nearest box.
+  let target = root;
+  while (target.parentElement && getComputedStyle(target).display === 'contents') target = target.parentElement;
+  return target;
 }
 `
       : ''

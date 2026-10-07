@@ -19,8 +19,7 @@ export interface TaggedPrimitiveThrow extends Error {
 }
 
 export function tagPrimitiveThrow(value: unknown): TaggedPrimitiveThrow {
-  const message = typeof value === 'string' ? value : String(value)
-  const error = new Error(message) as TaggedPrimitiveThrow
+  const error = new Error(String(value)) as TaggedPrimitiveThrow
   error[RAW_VALUE] = value
   return error
 }
@@ -58,6 +57,10 @@ function crashesPreactThenCheck(value: unknown): boolean {
   return value === null || value === undefined
 }
 
+function retagThrow(value: unknown): unknown {
+  return crashesPreactThenCheck(value) ? tagPrimitiveThrow(value) : value
+}
+
 /**
  * Wrap a function/class component so a thrown value that would crash preact's own `e.then` suspense
  * check is re-thrown as a tagged Error instead. Safe to call repeatedly on the same component type -
@@ -76,69 +79,49 @@ const wrapped = new WeakMap<object, unknown>()
 // unmount and remount of that subtree instead of an update.
 const ALREADY_WRAPPED = Symbol('pnext.primitiveThrowWrapped')
 
-function copyMetadata(from: object, to: object): void {
-  for (const key of Object.getOwnPropertyNames(from)) {
-    if (key === 'length' || key === 'name' || key === 'prototype') continue
-    const descriptor = Object.getOwnPropertyDescriptor(from, key)
-    if (descriptor) Object.defineProperty(to, key, descriptor)
-  }
-  for (const symbol of Object.getOwnPropertySymbols(from)) {
-    const descriptor = Object.getOwnPropertyDescriptor(from, symbol)
-    if (descriptor) Object.defineProperty(to, symbol, descriptor)
-  }
-}
-
 export function wrapComponentForPrimitiveThrows<T extends object>(type: T): T {
   if ((type as { [ALREADY_WRAPPED]?: true })[ALREADY_WRAPPED]) return type
   const cached = wrapped.get(type)
   if (cached) return cached as T
   if (typeof type !== 'function') return type
 
-  const isClassComponent = Boolean((type as { prototype?: { render?: unknown } }).prototype?.render)
-  let result: unknown
-
-  if (isClassComponent) {
-    // Class components: preact does `new Type(props, context)` then calls
-    // `.render()`. Subclass so `render()` is wrapped; static lifecycle methods
-    // (getDerivedStateFromError, etc.) and everything else pass through
-    // untouched via normal prototype-chain inheritance.
-    const Base = type as unknown as new (...args: unknown[]) => {
-      render(...args: unknown[]): unknown
-    }
-    class PrimitiveThrowSafe extends Base {
-      render(...args: unknown[]) {
-        try {
-          return super.render(...args)
-        } catch (e) {
-          if (crashesPreactThenCheck(e)) throw tagPrimitiveThrow(e)
-          throw e
+  const Base = type as unknown as new (...args: unknown[]) => {
+    render(...args: unknown[]): unknown
+  }
+  // Class components: preact does `new Type(props, context)` then calls
+  // `.render()`. Subclass so `render()` is wrapped; static lifecycle methods
+  // (getDerivedStateFromError, etc.) and everything else pass through
+  // untouched via normal prototype-chain inheritance.
+  const result: object = (type as { prototype?: { render?: unknown } }).prototype?.render
+    ? class PrimitiveThrowSafe extends Base {
+        render(...args: unknown[]) {
+          try {
+            return super.render(...args)
+          } catch (e) {
+            throw retagThrow(e)
+          }
         }
       }
-    }
-    Object.defineProperty(PrimitiveThrowSafe, 'name', { value: Base.name })
-    // Copy static properties AND symbol-keyed metadata (displayName, getDerivedStateFromError,
-    // contextType, defaultProps, plus the framework's own client-reference/dynamic-reference/params-
-    // scope symbol markers stashed directly on component function objects). resolveServerTree branches
-    // on those, so losing them mis-routes a client-reference class through the server-component call
-    // path instead of the island path.
-    copyMetadata(Base, PrimitiveThrowSafe)
-    result = PrimitiveThrowSafe
-  } else {
-    const fn = type as unknown as (...args: unknown[]) => unknown
-    const wrappedFn = function pnextPrimitiveThrowSafe(this: unknown, ...args: unknown[]) {
-      try {
-        return fn.apply(this, args)
-      } catch (e) {
-        if (crashesPreactThenCheck(e)) throw tagPrimitiveThrow(e)
-        throw e
+    : function pnextPrimitiveThrowSafe(this: unknown, ...args: unknown[]) {
+        try {
+          return (type as unknown as (...args: unknown[]) => unknown).apply(this, args)
+        } catch (e) {
+          throw retagThrow(e)
+        }
       }
-    }
-    Object.defineProperty(wrappedFn, 'name', { value: fn.name })
-    copyMetadata(fn, wrappedFn)
-    result = wrappedFn
+  Object.defineProperty(result, 'name', { value: Base.name })
+  // Copy static properties AND symbol-keyed metadata (displayName, getDerivedStateFromError,
+  // contextType, defaultProps, plus the framework's own client-reference/dynamic-reference/params-
+  // scope symbol markers stashed directly on component function objects). resolveServerTree branches
+  // on those, so losing them mis-routes a client-reference class through the server-component call
+  // path instead of the island path. ownKeys = string names, then symbols, in the same order as before.
+  for (const key of Reflect.ownKeys(Base)) {
+    if (key === 'length' || key === 'name' || key === 'prototype') continue
+    const descriptor = Object.getOwnPropertyDescriptor(Base, key)
+    if (descriptor) Object.defineProperty(result, key, descriptor)
   }
 
-  Object.defineProperty(result as object, ALREADY_WRAPPED, { value: true })
+  Object.defineProperty(result, ALREADY_WRAPPED, { value: true })
   wrapped.set(type, result)
   return result as T
 }

@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { mkdir, readdir, rename, rm, stat, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { BuildManifest } from '../types'
 
 // Write-then-rename so a concurrent import never observes a truncated file; Bun caches a failed load for the
 // life of the process. The temp name must be unique per CALL, not per process: two writers of the same output
@@ -145,6 +146,34 @@ export function toPosixPath(value: string) {
   return value.split(path.sep).join('/')
 }
 
+export function cssModuleScopePath(file: string) {
+  const normalized = toPosixPath(file)
+  const appIndex = normalized.lastIndexOf('/app/')
+  if (appIndex !== -1) return normalized.slice(appIndex + 1)
+  let dir = path.dirname(file)
+  let fallback: string | undefined
+  while (true) {
+    const packageFile = path.join(dir, 'package.json')
+    if (
+      existsSync(packageFile) ||
+      existsSync(path.join(dir, 'pnext.config.ts')) ||
+      existsSync(path.join(dir, 'node_modules'))
+    ) {
+      const relative = toPosixPath(path.relative(dir, file))
+      try {
+        const { name } = JSON.parse(readFileSync(packageFile, 'utf8')) as { name?: unknown }
+        if (typeof name === 'string') return `${name}/${relative}`
+      } catch {
+        // Unnamed projects still have a root-relative identity.
+      }
+      fallback ??= relative
+    }
+    const parent = path.dirname(dir)
+    if (parent === dir) return fallback ?? path.basename(file)
+    dir = parent
+  }
+}
+
 /** '^' + pnext's own running version, read from its package.json (this module lives at src/utils/). */
 export function pnextVersionRange() {
   const pkgPath = fileURLToPath(new URL('../../package.json', import.meta.url))
@@ -163,4 +192,97 @@ export function pnextOptionalDependencyRange(name: string) {
     optionalDependencies?: Record<string, string>
   }
   return pkg.optionalDependencies?.[name]
+}
+
+export function includeTypes(config: { include?: unknown }, files: string[], defaults: string[]) {
+  if (!('include' in config)) {
+    config.include = [...files, ...defaults]
+    return files
+  }
+  const include = config.include
+  if (!Array.isArray(include)) return []
+  const added = files.filter(file => !include.includes(file))
+  include.push(...added)
+  return added
+}
+
+/** Relativize only source-path fields while writing; build hooks keep absolute paths. */
+export function serializeBuildManifest(data: BuildManifest): string {
+  const { root, appDir, outDir } = data
+  const stored = {
+    ...mapSourcePaths(data, file => toPosixPath(path.relative(root, file))),
+    root: toPosixPath(path.relative(outDir, root)) || '.',
+    appDir: toPosixPath(path.relative(root, appDir)),
+    outDir: '.',
+  }
+  return `${JSON.stringify(stored, null, 2)}\n`
+}
+
+export function resolveManifest(data: BuildManifest, outPath: string, root: string): BuildManifest {
+  if (path.isAbsolute(data.root)) return data
+  const absolute = (file: string) => path.join(root, file)
+  return {
+    ...mapSourcePaths(data, absolute),
+    root,
+    appDir: absolute(data.appDir),
+    outDir: outPath,
+  }
+}
+
+const sourcePathFields = [
+  'file',
+  'sourceFiles',
+  'cssImports',
+  'templateFiles',
+  'forbiddenFiles',
+  'unauthorizedFiles',
+  'slotDirs',
+  'slotDir',
+  'syntheticSlotDir',
+  'childrenDefault',
+  'serverActionFile',
+  'globalErrorFile',
+] as const
+
+type SourcePathFields = Partial<Record<(typeof sourcePathFields)[number], string | string[]>>
+
+function mapSourcePaths(data: BuildManifest, map: (file: string) => string): BuildManifest {
+  // Only schema path owners are visited; params and user metadata remain data.
+  function owner<T extends SourcePathFields | undefined>(value: T): T {
+    if (!value) return value
+    const mapped = { ...value }
+    for (const key of sourcePathFields) {
+      const field = value[key]
+      if (field !== undefined) mapped[key] = Array.isArray(field) ? field.map(map) : map(field)
+    }
+    return mapped
+  }
+  const mapped = owner(data)
+  mapped.routes = data.routes.map(route => ({
+    ...owner(route),
+    clientReferences: route.clientReferences.map(owner),
+    ...(route.interception && { interception: owner(route.interception) }),
+  }))
+  if (data.staticMetadataFiles) mapped.staticMetadataFiles = data.staticMetadataFiles.map(owner)
+  if (data.staticRouteMetadata) {
+    mapped.staticRouteMetadata = Object.fromEntries(
+      Object.entries(data.staticRouteMetadata).map(([route, entry]) => [
+        route,
+        {
+          ...entry,
+          favicon: owner(entry.favicon),
+          manifest: owner(entry.manifest),
+          icons: entry.icons.map(owner),
+          appleIcons: entry.appleIcons.map(owner),
+          rootIcons: entry.rootIcons.map(owner),
+        },
+      ]),
+    )
+  }
+  if (data.staticModuleMetadata) {
+    mapped.staticModuleMetadata = Object.fromEntries(
+      Object.entries(data.staticModuleMetadata).map(([file, metadata]) => [map(file), metadata]),
+    )
+  }
+  return mapped
 }

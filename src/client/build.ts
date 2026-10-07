@@ -1532,7 +1532,8 @@ function createClientSourcePipeline(config: ResolvedConfig, dev = false, routeId
       contents = rewriteDeferredDynamicImports(
         contents,
         resolved,
-        specifier => resolveImport(rootFromFile(resolved), resolved, specifier),
+        specifier =>
+          resolveImport(rootFromFile(resolved), resolved, specifier, config.workspaceRoot),
         target => {
           const id = clientReferenceId(target.file, target.exportName)
           const ref = { ...target, routeId }
@@ -2089,7 +2090,9 @@ export async function clientCacheKeyParts(
 ): Promise<ClientCacheKeyParts> {
   const staticDigest = staticHash ?? clientCacheStaticHash(route, nextCompat, config)
   const sources = await Promise.all(
-    (await clientSourceFiles(route)).map(file => readClientCacheSource(file)),
+    (await clientSourceFiles(route, config?.workspaceRoot)).map(file =>
+      readClientCacheSource(file),
+    ),
   )
   return { key: clientCacheKeyFrom(staticDigest, sources), staticHash: staticDigest, sources }
 }
@@ -2102,14 +2105,14 @@ export async function clientCacheKey(
   return (await clientCacheKeyParts(route, nextCompat, config)).key
 }
 
-async function clientSourceFiles(route: RouteManifestEntry) {
+async function clientSourceFiles(route: RouteManifestEntry, workspaceRoot?: string) {
   const entryFiles = [
     ...(route.client ? [route.file] : []),
     ...route.clientReferences.map(reference => reference.file),
   ]
   const files = new Set<string>()
 
-  await Promise.all(entryFiles.map(file => collectClientSourceFile(file, files)))
+  await Promise.all(entryFiles.map(file => collectClientSourceFile(file, files, workspaceRoot)))
 
   return [...files].sort()
 }
@@ -2117,7 +2120,7 @@ async function clientSourceFiles(route: RouteManifestEntry) {
 // The walk fans out: every file joins `files` before its own read starts, so
 // concurrent branches still visit each file once. Serially this was the whole
 // cost of a route's client cache key (~1.8 s on a 300-module route).
-async function collectClientSourceFile(file: string, files: Set<string>) {
+async function collectClientSourceFile(file: string, files: Set<string>, workspaceRoot?: string) {
   if (files.has(file) || !existsSync(file)) return
   files.add(file)
   if (isAssetLike(file)) return
@@ -2125,8 +2128,8 @@ async function collectClientSourceFile(file: string, files: Set<string>) {
   const source = rewriteLiteralDynamicCalls(await readText(file), file)
   await Promise.all(
     [...localImports(file, source)].map(specifier => {
-      const resolved = resolveImport(rootFromFile(file), file, specifier)
-      return resolved ? collectClientSourceFile(resolved, files) : Promise.resolve()
+      const resolved = resolveImport(rootFromFile(file), file, specifier, workspaceRoot)
+      return resolved ? collectClientSourceFile(resolved, files, workspaceRoot) : Promise.resolve()
     }),
   )
 }

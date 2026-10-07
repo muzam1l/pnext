@@ -7,6 +7,7 @@ import { resolveImport } from '../../resolve/imports'
 import { hoistCssImports } from '../../css/build'
 import { maybeLightningcssTransform } from './lightningcss'
 import { escapeRegex } from '../../utils/code'
+import { cssModuleScopePath } from '../../utils/fs'
 
 interface ComposeRef {
   names: string[]
@@ -343,13 +344,6 @@ function cssModuleClassName(file: string, className: string) {
     .replace(/[^_a-zA-Z0-9]/g, '_')
   const hash = pathHash(cssModuleScopePath(file))
   return `${base}_${className}_${hash}`
-}
-
-function cssModuleScopePath(file: string) {
-  const normalized = file.split(path.sep).join('/')
-  const appIndex = normalized.lastIndexOf('/app/')
-  if (appIndex !== -1) return normalized.slice(appIndex + 1)
-  return normalized.split('/').slice(-3).join('/')
 }
 
 function rewriteClassSelector(css: string, scopedClassName: string, originalClassName: string) {

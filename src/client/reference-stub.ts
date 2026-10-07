@@ -86,7 +86,7 @@ export async function clientReferenceExportNames(
   // excluded, per ES module star semantics). `export * as ns from` exports
   // only `ns`, which the own-module scan already lists.
   for (const specifier of moduleExportStars(text, file)) {
-    const resolved = resolveImport(config.root, file, specifier)
+    const resolved = resolveImport(config.root, file, specifier, config.workspaceRoot)
     if (!resolved || !isInside(config.workspaceRoot, resolved)) continue
     for (const name of await clientReferenceExportNames(config, resolved, undefined, visited)) {
       if (name !== 'default') names.add(name)

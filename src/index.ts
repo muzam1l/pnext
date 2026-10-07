@@ -1,3 +1,5 @@
+// eslint-disable-next-line @typescript-eslint/triple-slash-reference -- Ambient CSS declarations have no runtime module.
+/// <reference path="./styles.d.ts" />
 export type {
   LayoutProps,
   Metadata,
