@@ -91,6 +91,7 @@ import {
 import { interceptionMarkerLevels } from '../routing/slots'
 import { writeTypegen } from './typegen'
 import { lookupBuildCache, writeBuildCache } from './build/cache'
+import { emitServerEntry } from './serve/entry'
 import { createVerboseLogger, type VerboseLogger } from '../utils/verbose'
 import { bold, cyan, dim, green } from '../utils/ansi'
 import type {
@@ -230,15 +231,6 @@ async function runBuild(
     await ensureEmptyDir(config.outPath, [devOutSegment])
     await copyPublicDir(config.publicPath, path.join(config.outPath, 'public'))
   })
-  // Prebundled server entry for `pnext start`: framework-only, independent of the
-  // app build, so it runs in a child process for the whole build — its bundling
-  // heap never stacks on the build's peak RSS and its wall hides under the build.
-  // Best-effort — a failure only costs start time. Awaited before the summary.
-  const serverEntryDone = import('./serve/entry')
-    .then(entry => entry.emitServerEntryChild(config.outPath))
-    .catch((error: Error) => {
-      console.warn(`pnext build: server entry bundling skipped — ${error.message}`)
-    })
   // The document-level stylesheets run their postcss/Tailwind pass on the CSS
   // worker, so they overlap with the route scan below instead of serializing
   // ahead of it. Awaited before prepareRouteCssChunks — route CSS still builds
@@ -938,7 +930,7 @@ async function runBuild(
   }
   await writeBuildManifest(config.outPath, manifest)
   log.log(`wrote manifest.json (${routes.length} route${routes.length === 1 ? '' : 's'})`)
-  await log.step('server entry', () => serverEntryDone)
+  await log.step('server entry', () => emitServerEntry(config.outPath))
   for (const hook of getBuildExtensions().completeHooks) {
     await hook({ config, manifest, log })
   }

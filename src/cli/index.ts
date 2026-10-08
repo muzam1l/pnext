@@ -90,14 +90,7 @@ try {
   } else if (command === 'start') {
     warnUnknownFlags(command, args)
     const root = positionalRoot(args)
-    // The build emits src/cli/start.ts prebundled into one file; parsing that
-    // instead of walking the framework's source graph is most of `start`'s
-    // spawn→first-200. Absent (no build yet, custom outDir) → source path.
-    const { prebuiltServerEntry } = await import('./serve/entry')
-    const prebuilt = prebuiltServerEntry(root)
-    const { start } = prebuilt
-      ? ((await import(prebuilt)) as typeof import('./start'))
-      : await import('./start')
+    const { start } = await import('./start')
     await start({
       root,
       port: optionNumber(args, '--port'),

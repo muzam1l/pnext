@@ -2,7 +2,7 @@
  * `pnext start`: the listen path only. Everything a request needs — renderer,
  * routing, server runtime — lives in `./serve/pipeline` and is imported
  * dynamically once the port is bound, so neither the listen syscall nor the
- * ready banner waits on parsing it (it is ~700 KB of the prebundled entry).
+ * ready banner waits on parsing it.
  */
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
