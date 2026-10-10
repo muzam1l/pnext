@@ -20,6 +20,7 @@ import { setRouteFactsStore, type RouteFacts, type RouteFactsStore } from '../..
 import { traceEnabled } from '../../utils/trace-flags'
 import { restartCacheEnabled } from './enabled'
 import { hash, lazyRecordCacheKey, revalidate, sourceEntry, type SourceEntry } from './record'
+import { outCachePath } from '../../out-paths'
 
 interface RecordFile {
   version: number
@@ -45,7 +46,7 @@ export function installRouteFactsCache(config: ResolvedConfig) {
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   if (process.env.PNEXT_DEV_FACTS_CACHE === '0') return
   const cache: FactsCache = {
-    dir: path.join(config.outPath, 'cache', 'route-facts'),
+    dir: path.join(outCachePath(config.outPath), 'route-facts'),
     key: lazyRecordCacheKey(config, RECORD_VERSION),
     written: new Set(),
   }

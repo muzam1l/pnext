@@ -1,12 +1,21 @@
 import { existsSync, realpathSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import path from 'node:path'
+import { outCachePath, standaloneOutSegment } from './out-paths'
 import { loadEnv } from './env'
 import { findWorkspaceRoot } from './resolve/package-json'
 import { PREFETCH_MODES, type PNextConfig } from './types'
 import { setCacheComponents } from './render/ppr'
 import { setLegacyRequestAPIs } from './request/context'
-import { attachRelease, locateRelease, readBuildIndex, releaseConfig } from './runtime/production'
+import {
+  attachRelease,
+  buildIndexFile,
+  linkStandaloneOrigins,
+  readBuildIndex,
+  releaseConfig,
+  releaseSourceRoot,
+  servingReleaseDir,
+} from './runtime/production'
 
 export type ResolvedConfig = Required<Pick<PNextConfig, 'outDir' | 'basePath'>> &
   Omit<PNextConfig, 'outDir' | 'basePath'> & {
@@ -16,7 +25,7 @@ export type ResolvedConfig = Required<Pick<PNextConfig, 'outDir' | 'basePath'>> 
     publicDir: 'public'
     appPath: string
     publicPath: string
-    /** Where this process writes and serves from: the out root, or `<outRoot>/dev` in dev. */
+    /** Where this process writes and serves from: `<outRoot>/standalone`, or `<outRoot>/dev` in dev. */
     outPath: string
     /** The out root itself (`.pnext`), identical in dev and build. */
     outRootPath: string
@@ -97,7 +106,7 @@ export async function loadConfig(
   options: { dev?: boolean; serve?: boolean; warnings?: boolean } = {},
 ): Promise<ResolvedConfig> {
   const root = canonicalRoot(path.resolve(rootInput))
-  const released = options.serve ? locateRelease(root, DEFAULT_OUT_DIR) : undefined
+  const released = options.serve ? servingReleaseDir() : undefined
   if (released) return loadReleasedConfig(root, released, options)
   await loadEnv(root, options)
   const configPath = path.join(root, 'pnext.config.ts')
@@ -129,6 +138,12 @@ export async function loadConfig(
   const sourceOverrides = stripUndefined(await resolveConfigSource(config, root, options))
   const merged = { ...defaultConfig, ...config, ...sourceOverrides }
   const outRootPath = path.resolve(root, merged.outDir)
+  // `pnext start` reads outDir from the config, as `next start` reads distDir, then serves the release.
+  const release = path.join(outRootPath, standaloneOutSegment)
+  if (options.serve && existsSync(buildIndexFile(release))) {
+    // The source config above already warned; its compiled copy must not warn again.
+    return loadReleasedConfig(root, release, { ...options, warnings: false })
+  }
   // A build materializes pages into its output, so the release names them portably.
   const appPath = await resolveAppPath(
     root,
@@ -163,7 +178,7 @@ export async function loadConfig(
     // Dev owns `<outRoot>/dev` exclusively so a concurrent `pnext build` — which
     // wipes its own outputs under the out root — can never pull a running dev
     // server's cache, manifest or assets out from under it.
-    outPath: options.dev ? path.join(outRootPath, devOutSegment) : outRootPath,
+    outPath: path.join(outRootPath, options.dev ? devOutSegment : standaloneOutSegment),
     outRootPath,
     typesPath: path.join(outRootPath, 'types'),
     checksPath: path.join(outRootPath, 'typecheck', 'checks'),
@@ -180,7 +195,9 @@ async function loadReleasedConfig(
   options: { dev?: boolean; serve?: boolean; warnings?: boolean },
 ): Promise<ResolvedConfig> {
   const index = readBuildIndex(outPath)
-  const config = releaseConfig(index.config, root, outPath)
+  linkStandaloneOrigins(outPath)
+  const sourceRoot = releaseSourceRoot(outPath, index.config.outPath as string)
+  const config = releaseConfig(index.config, sourceRoot, outPath)
   await loadEnv(root, options)
   setLegacyRequestAPIs(
     typeof config.compat?.next === 'object' && config.compat.next.legacyRequestAPIs === true,
@@ -218,6 +235,8 @@ function validateConfig(config: PNextConfig) {
 
 /** Dev's private subtree under the out root. Build never touches it. */
 export const devOutSegment = 'dev'
+
+export { outCachePath, standaloneOutSegment }
 
 // Relative-import resolution realpaths the importing file (so a materialized shim resolves `./sibling`
 // against real source), so every containment check against root/workspaceRoot compares realpaths.
@@ -296,6 +315,10 @@ export function frameworkRuntimeAliasEntries(): Record<FrameworkRuntimeAlias, st
   }
   return frameworkRuntimeAliases
 }
+
+/** Packages the framework resolves at runtime by name, not by import. */
+export const frameworkRuntimeSpecifiers = (): string[] =>
+  Object.keys(frameworkRuntimeAliasEntries())
 
 function resolveRuntimeModule(specifier: string) {
   return fileURLToPath(import.meta.resolve(specifier))

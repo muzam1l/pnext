@@ -15,6 +15,7 @@ import { restartCacheEnabled } from '../../../dev/restart/enabled'
 import { frameworkFingerprint } from '../../../runtime/fingerprint'
 import { writeFileAtomic } from '../../../utils/fs'
 import type { MetadataLink } from '../../../types'
+import { outCachePath } from '../../../out-paths'
 
 export interface PersistableFont {
   css: string
@@ -54,7 +55,7 @@ interface FontIndex {
 const indexes = new Map<string, FontIndex>()
 
 function fontIndex(config: ResolvedConfig): FontIndex {
-  const file = path.join(config.outPath, 'cache', 'fonts', 'index.json')
+  const file = path.join(outCachePath(config.outPath), 'fonts', 'index.json')
   const existing = indexes.get(file)
   if (existing) return existing
   const created: FontIndex = { file, fonts: readIndex(file), dirty: false }

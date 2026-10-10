@@ -40,6 +40,7 @@ export {
   withAssetPrefix,
   type AssetHrefConfig,
 } from './assets'
+import { outCachePath } from '../out-paths'
 
 interface Pending {
   resolve: () => void
@@ -114,14 +115,20 @@ export async function stopCssWorker(): Promise<void> {
   if (active) await Promise.resolve(active.terminate())
 }
 
+// Tailwind skips the out root and caches candidates in it; dev keeps its own subtree.
+function scanOutDir(config: Pick<ResolvedConfig, 'outPath' | 'outRootPath'>, dev: boolean) {
+  return dev ? config.outPath : config.outRootPath
+}
+
 export async function runPostcssOffThread(
-  config: Pick<ResolvedConfig, 'root' | 'outPath'>,
+  config: Pick<ResolvedConfig, 'root' | 'outPath' | 'outRootPath'>,
   cssFile: string,
   options: { dev?: boolean },
   from?: string,
 ) {
-  const { root, outPath: outDir } = config
   const dev = options.dev ?? false
+  const { root } = config
+  const outDir = scanOutDir(config, dev)
   const sent = send(id => ({ kind: 'process', id, root, dev, outDir, cssFile, from }))
   if (sent) return sent
   return runPostcss(root, cssFile, { dev, outDir }, from)
@@ -132,7 +139,7 @@ export async function runPostcssOffThread(
  * stylesheet, so a cold Tailwind boot overlaps with the rest of dev startup.
  */
 export function warmCssWorker(
-  config: Pick<ResolvedConfig, 'root' | 'outPath'>,
+  config: Pick<ResolvedConfig, 'root' | 'outPath' | 'outRootPath'>,
   options: { dev?: boolean } = {},
 ) {
   send(id => ({
@@ -140,7 +147,7 @@ export function warmCssWorker(
     id,
     root: config.root,
     dev: options.dev ?? false,
-    outDir: config.outPath,
+    outDir: scanOutDir(config, options.dev ?? false),
   }))?.catch(() => {
     // A broken postcss config surfaces on the real build; warming stays quiet.
   })
@@ -265,7 +272,7 @@ function rootLayoutFile(appPath: string, missing?: Set<string>) {
  * instead of landing on the first request. No-op without a postcss config.
  */
 export function warmCssPipeline(
-  config: Pick<ResolvedConfig, 'root' | 'outPath'>,
+  config: Pick<ResolvedConfig, 'root' | 'outPath' | 'outRootPath'>,
   options: CssBuildOptions = {},
 ) {
   if (!hasPostcssConfig(config.root)) return
@@ -281,8 +288,8 @@ export async function buildGlobalCss(config: ResolvedConfig, options: CssBuildOp
   }
 
   const outDir = options.dev
-    ? path.join(config.outPath, 'cache', 'assets')
-    : path.join(config.outPath, 'public', 'assets')
+    ? path.join(outCachePath(config.outPath), 'assets')
+    : path.join(config.outPath, 'static', 'assets')
   const outfile = path.join(outDir, 'global.css')
   await ensureDir(outDir)
 
@@ -606,8 +613,8 @@ async function writeCssChunk(
   const log = createVerboseLogger(options.verbose ?? false, 'css')
 
   const outDir = options.dev
-    ? path.join(config.outPath, 'cache', 'assets')
-    : path.join(config.outPath, 'public', 'assets')
+    ? path.join(outCachePath(config.outPath), 'assets')
+    : path.join(config.outPath, 'static', 'assets')
   const outfile = path.join(outDir, assetName)
   await ensureDir(outDir)
 

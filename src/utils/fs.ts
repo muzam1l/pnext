@@ -301,11 +301,16 @@ export function serializeBuildManifest(data: BuildManifest): string {
   return `${JSON.stringify(stored, null, 2)}\n`
 }
 
-export function resolveManifest(data: BuildManifest, outPath: string, root: string): BuildManifest {
+export function resolveManifest(
+  data: BuildManifest,
+  outPath: string,
+  root: string,
+  framework = frameworkRoot,
+): BuildManifest {
   if (path.isAbsolute(data.root)) return data
   const absolute = (file: string) =>
     file.startsWith(frameworkPrefix)
-      ? path.join(frameworkRoot, file.slice(frameworkPrefix.length))
+      ? path.join(framework, file.slice(frameworkPrefix.length))
       : path.join(root, file)
   return {
     ...mapSourcePaths(data, absolute),

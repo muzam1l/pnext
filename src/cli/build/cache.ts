@@ -7,9 +7,11 @@ import type { ResolvedConfig } from '../../config'
 import { frameworkFingerprint } from '../../runtime/fingerprint'
 import type { BuildManifest } from '../../types'
 import { writeFileAtomic } from '../../utils/fs'
+import { buildManifestFile } from '../../runtime/production'
+import { outCachePath } from '../../out-paths'
 
 const CACHE_VERSION = 2
-const CACHE_SEGMENTS = ['cache', 'build'] as const
+const CACHE_SEGMENTS = ['build'] as const
 const SKIP_INPUT_DIRS = new Set([
   '.claude',
   '.git',
@@ -75,9 +77,7 @@ export async function lookupBuildCache(
   }
   try {
     const manifest = resolveManifest(
-      JSON.parse(
-        await readFile(path.join(config.outPath, 'manifest.json'), 'utf8'),
-      ) as BuildManifest,
+      JSON.parse(await readFile(buildManifestFile(config.outPath), 'utf8')) as BuildManifest,
       config.outPath,
       config.root,
     )
@@ -121,7 +121,7 @@ function cacheEnabled(options: BuildCacheOptions) {
 }
 
 function cacheDir(outPath: string) {
-  return path.join(outPath, ...CACHE_SEGMENTS)
+  return path.join(outCachePath(outPath), ...CACHE_SEGMENTS)
 }
 
 function recordFile(outPath: string) {
@@ -220,7 +220,7 @@ async function collectModuleGraphInputs(config: ResolvedConfig, files: Map<strin
   let parsed: ModuleGraphIndex
   try {
     parsed = JSON.parse(
-      await readFile(path.join(config.outPath, 'cache', 'server', 'graph.json'), 'utf8'),
+      await readFile(path.join(outCachePath(config.outPath), 'server', 'graph.json'), 'utf8'),
     ) as ModuleGraphIndex
   } catch {
     return

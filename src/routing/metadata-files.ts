@@ -216,7 +216,7 @@ export function staticMetadataLink(file: StaticMetadataFile): MetadataLink {
 }
 
 export function staticMetadataOutputFile(outPath: string, file: StaticMetadataFile) {
-  return path.join(outPath, 'public', file.outputPath)
+  return path.join(outPath, 'static', file.outputPath)
 }
 
 export function metadataHasOwnImages(metadata: Metadata, field: 'openGraph' | 'twitter') {

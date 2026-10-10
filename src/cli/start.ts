@@ -4,8 +4,10 @@
  * dynamically once the port is bound, so neither the listen syscall nor the
  * ready banner waits on parsing it.
  */
+import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { loadConfig } from '../config'
 import type { ResolvedConfig } from '../config'
 import { bootstrapCompat } from '../compat-bootstrap'
@@ -17,6 +19,7 @@ import { registerPrebundleResolve } from '../runtime/prebundle'
 import { browserHost, ensurePortFree, openBrowser, printServerReady } from './serve/ui'
 import type { BuildManifest } from '../types'
 import type { PeerAddressSource } from '../routing/forwarded'
+import { buildIndexFile, buildManifestFile, linkStandaloneOrigins } from '../runtime/production'
 
 interface StartOptions {
   root?: string
@@ -35,8 +38,24 @@ export async function createRequestHandler(
   options: { root?: string; config?: ResolvedConfig; manifest?: BuildManifest } = {},
 ): Promise<RequestHandler> {
   registerPrebundleResolve()
+  const config = options.config ?? (await loadConfig(options.root, { serve: true }))
+  // A release this copy cannot serve in place runs on the framework copy it ships.
+  if (shipsElsewhere(config)) {
+    const shipped = await shippedStart(config)
+    return shipped.createRequestHandler({ root: options.root, manifest: options.manifest })
+  }
   const { createRequestHandler: create } = await import('./serve/pipeline')
-  return create(options)
+  return create({ ...options, config })
+}
+
+/** A built release this copy cannot serve in place; a missing build falls through to its error. */
+function shipsElsewhere(config: ResolvedConfig) {
+  return existsSync(buildIndexFile(config.outPath)) && !linkStandaloneOrigins(config.outPath)
+}
+
+function shippedStart(config: ResolvedConfig) {
+  const entry = pathToFileURL(path.join(config.outPath, 'server', 'entry.js')).href
+  return import(entry) as Promise<typeof import('./start')>
 }
 
 export async function maybeBuiltFile(
@@ -51,8 +70,14 @@ export async function start(options: StartOptions = {}) {
   const port = options.port ?? 3000
   // Next's documented default. Bun resolves 'localhost' to ::1 only, refusing IPv4 clients.
   const hostname = options.hostname ?? '0.0.0.0'
+  const config = await loadConfig(options.root, { serve: true })
+  // Delegate before compat bootstraps here, so only the shipped copy patches process globals.
+  if (shipsElsewhere(config)) {
+    await (await shippedStart(config)).start(options)
+    return
+  }
   // Export builds are not served; pnext serves its standalone output directly.
-  const config = await guardUnservableOutputMode(options.root)
+  await guardUnservableOutputMode(config)
   const manifest = await readProductionManifest(config)
   await ensurePortFree(port, hostname)
 
@@ -110,9 +135,7 @@ function installProcessErrorHandlers(): void {
 
 export async function readProductionManifest(config: ResolvedConfig): Promise<BuildManifest> {
   try {
-    return JSON.parse(
-      await readFile(path.join(config.outPath, 'manifest.json'), 'utf8'),
-    ) as BuildManifest
+    return JSON.parse(await readFile(buildManifestFile(config.outPath), 'utf8')) as BuildManifest
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       throw new Error("No production build found. Run 'pnext build' first.")
@@ -122,8 +145,7 @@ export async function readProductionManifest(config: ResolvedConfig): Promise<Bu
 }
 
 // Export output is unservable; pnext production output remains serveable for standalone apps.
-async function guardUnservableOutputMode(root?: string): Promise<ResolvedConfig> {
-  const config = await loadConfig(root, { serve: true })
+async function guardUnservableOutputMode(config: ResolvedConfig) {
   await bootstrapCompat(config)
   const mode = getBuildExtensions().compat.nextOutputMode()
   if (mode === 'export') {
@@ -142,7 +164,6 @@ async function guardUnservableOutputMode(root?: string): Promise<ResolvedConfig>
         'Use "node .next/standalone/server.js" instead.',
     )
   }
-  return config
 }
 
 // Graceful stop: quit accepting connections, wait for in-flight after() flushes (bounded), then exit

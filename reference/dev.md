@@ -48,7 +48,7 @@ Debug flags: `--experimental-build-mode compile|generate` splits the build into 
 
 ## Deploy
 
-pnext deploys anywhere Bun runs: a VPS, a container, or any host you control. Run `pnext build` on the machine or in CI, then `pnext start` serves the app on your port.
+pnext deploys anywhere Bun runs: a VPS, a container, or any host you control. Run `pnext build`, then ship `<outDir>/standalone`; it needs nothing else. Serve it with `pnext start`, or import `standalone/server/entry.js` in your own server and call `createRequestHandler()`. To use a CDN, upload `standalone/static/` as-is.
 
 Vercel has a dedicated adapter: `pnext build --adapter vercel` writes Build Output to `.vercel/output`. Static pages and static route-handler responses are emitted as files; everything dynamic runs in a single `_pnext` function on Vercel's Bun runtime.
 

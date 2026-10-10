@@ -21,7 +21,7 @@ This is the form `pnext create` scaffolds. With `compat.next`, pnext also loads 
 
 | Field                         | Default     | What it does                                                                                               |
 | ----------------------------- | ----------- | ---------------------------------------------------------------------------------------------------------- |
-| `outDir`                      | `'.pnext'`  | Build output for HTML, client assets, cache files, and `manifest.json`.                                    |
+| `outDir`                      | `'.pnext'`  | Build output: the shippable `standalone/` folder, the build `cache/`, and generated `types/`.              |
 | `basePath`                    | `''`        | Path prefix for an app served below the domain root.                                                       |
 | `assetPrefix`                 | `basePath`  | URL prefix for emitted assets. Set it when assets come from a CDN.                                         |
 | `trailingSlash`               | `false`     | Canonicalizes URLs to a trailing slash and redirects the form without one.                                 |
@@ -51,7 +51,7 @@ Both `compat.next` and `compat.reactCompiler` imply `compat.react`. Direct Preac
 
 ## Deployment adapter
 
-`exclude` and `keep` are string lists that adjust which directories and file suffixes an adapter packs. The Vercel adapter consumes them.
+`exclude` drops matching directories and file suffixes from `standalone/`. `keep` ships matching app files the server reads at runtime. Both apply to the Vercel function.
 
 ```ts
 export default {

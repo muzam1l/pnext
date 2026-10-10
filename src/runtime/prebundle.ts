@@ -55,6 +55,21 @@ export function prebundledFile(file: string): string {
   return entries.has(entry) ? path.join(distRoot, `${entry}.js`) : file
 }
 
+/** A resolve-only `Bun.plugin`, typed here: these modules sit in app type graphs without bun-types. */
+interface ResolvePlugin {
+  name: string
+  setup(build: {
+    onResolve(
+      options: { filter: RegExp },
+      resolve: (args: { path: string; importer: string }) => { path: string } | undefined,
+    ): void
+  }): void
+}
+
+export function registerResolvePlugin(plugin: ResolvePlugin) {
+  ;(globalThis as unknown as { Bun: { plugin(plugin: ResolvePlugin): void } }).Bun.plugin(plugin)
+}
+
 let registered = false
 
 /** Route imports of framework source, by path, to the prebundle. */
@@ -62,11 +77,16 @@ export function registerPrebundleResolve(): void {
   if (!prebundle || registered) return
   registered = true
   const escaped = srcRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  Bun.plugin({
+  registerResolvePlugin({
     name: 'pnext-prebundle',
     setup(build) {
-      build.onResolve({ filter: new RegExp(`^(?:file://)?${escaped}.*\\.tsx?$`) }, args => {
-        const file = args.path.startsWith('file:') ? fileURLToPath(args.path) : args.path
+      build.onResolve({ filter: new RegExp(`^${escaped}.*\\.tsx?$`) }, args => {
+        const target = prebundledFile(args.path)
+        return target === args.path ? undefined : { path: target }
+      })
+      // A URL encodes the root (`%20` for a space), so it is decoded before the root is compared.
+      build.onResolve({ filter: /^file:.*\.tsx?$/ }, args => {
+        const file = fileURLToPath(args.path)
         const target = prebundledFile(file)
         return target === file ? undefined : { path: target }
       })

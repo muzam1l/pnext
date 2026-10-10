@@ -488,6 +488,9 @@ function mapOverrides(config: NextConfigObject): NextConfigCoreOverrides {
     config.output !== 'export'
   ) {
     overrides.outDir = config.distDir
+  } else if (config.output === 'standalone') {
+    // Next's `.next/standalone`: the folder its standalone contract names.
+    overrides.outDir = '.next'
   }
   return overrides
 }

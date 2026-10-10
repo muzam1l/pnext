@@ -224,6 +224,7 @@ export function deferredDynamicImportSpecifiers(source: string, file?: string) {
   }
 
   const facts = dynamicCallFacts(source, file)
+  const rendered = new Set<string>()
   for (const call of dynamicCallsFromSource(source, dynamicNames)) {
     const target = loaderImportTargetForCall(call, facts)
     if (!target) continue
@@ -239,7 +240,10 @@ export function deferredDynamicImportSpecifiers(source: string, file?: string) {
     const visible =
       /\bload\s*:\s*['"]visible['"]/.test(options) && !/\bssr\s*:\s*true\b/.test(options)
     if (ssrFalse || visible) deferred.add(target.specifier)
+    else rendered.add(target.specifier)
   }
+  // A target another call server-renders must compile for the server.
+  for (const specifier of rendered) deferred.delete(specifier)
   return deferred
 }
 

@@ -76,6 +76,8 @@ export interface RewriteFacts {
   edges: SpecifierEdge[]
   imports: ImportStatement[]
   importMetas: { start: number; end: number }[]
+  /** `import()` calls whose argument is not a plain string literal. */
+  computedImports: { start: number; end: number }[]
   /**
    * The parse recovered from errors, so the record may be incomplete — folded
    * passes fall back to their textual form rather than silently under-rewrite.
@@ -146,6 +148,7 @@ const emptyRewriteFacts: RewriteFacts = {
   edges: [],
   imports: [],
   importMetas: [],
+  computedImports: [],
   unreliable: false,
 }
 
@@ -373,10 +376,14 @@ function parseFacts(file: string, source: string, lang: ParserLang) {
   imports.sort((a, b) => a.index - b.index)
 
   const dynamicImports: { specifier: string; index: number }[] = []
+  const computedImports: { start: number; end: number }[] = []
   for (const entry of result.module.dynamicImports) {
     const raw = source.slice(entry.moduleRequest.start, entry.moduleRequest.end)
     const specifier = literalSpecifier(raw)
-    if (specifier === undefined) continue
+    if (specifier === undefined) {
+      computedImports.push({ start: entry.start, end: entry.end })
+      continue
+    }
     dynamicImports.push({ specifier, index: entry.start })
     // The literal's own span, without the whitespace `moduleRequest` includes.
     const lead = raw.length - raw.trimStart().length
@@ -419,6 +426,7 @@ function parseFacts(file: string, source: string, lang: ParserLang) {
       edges,
       imports: importStatements,
       importMetas: result.module.importMetas.map(meta => ({ start: meta.start, end: meta.end })),
+      computedImports,
       unreliable: result.errors.length > 0,
     },
   }
@@ -579,6 +587,182 @@ function isNode(value: unknown): value is AstNode {
 function child(node: AstNode | undefined, key: string): AstNode | undefined {
   const value = node?.[key]
   return isNode(value) ? value : undefined
+}
+
+/** A string literal argument: its cooked value and the span of its quoted text. */
+export interface LiteralSpan {
+  specifier: string
+  start: number
+  end: number
+}
+
+/** How a module refers to its own location (see `importMetaRefs`). */
+export interface ImportMetaRefs {
+  /** `new URL('<literal>', import.meta.url)`. */
+  urls: LiteralSpan[]
+  /** `import.meta.resolve('<literal>')`. */
+  resolves: LiteralSpan[]
+  /** Reads `import.meta.url`/`dirname`/`filename`/`resolve`, or takes `import.meta` whole. */
+  readsLocation: boolean
+  /** Spans of each `import()` whose argument is not a string literal. */
+  computedImports: { start: number; end: number }[]
+  /** The parse recovered from errors: callers keep their conservative answer. */
+  unreliable: boolean
+}
+
+const noMetaRefs: ImportMetaRefs = {
+  urls: [],
+  resolves: [],
+  readsLocation: false,
+  computedImports: [],
+  unreliable: false,
+}
+const metaRefMemo = new Map<string, ImportMetaRefs>()
+const locationMembers = new Set(['url', 'dirname', 'filename', 'resolve'])
+
+/** Every reference a module makes to its own location, from the AST: never a comment or a string. */
+export function importMetaRefs(file: string, source: string): ImportMetaRefs {
+  if (stylesheetOrData.test(file)) return noMetaRefs
+  if (!source.includes('import.meta') && !source.includes('import(')) return noMetaRefs
+  // The memoized module record answers computed imports and whether `import.meta` occurs at all;
+  // only a module that really uses it pays for the AST.
+  const record = rewriteFacts(file, source)
+  if (record.importMetas.length === 0)
+    return { ...noMetaRefs, computedImports: record.computedImports, unreliable: record.unreliable }
+  const lang = langForFile(file)
+  const key = `${lang}\0${source.length}\0${bun.hash(source).toString()}`
+  const cached = metaRefMemo.get(key)
+  if (cached) return cached
+  const result = parseSync(file, source, { lang })
+  const refs: ImportMetaRefs = {
+    ...noMetaRefs,
+    urls: [],
+    resolves: [],
+    computedImports: record.computedImports,
+  }
+  refs.unreliable = result.errors.length > 0
+  const isImportMeta = (node: AstNode | undefined) =>
+    node?.type === 'MetaProperty' &&
+    child(node, 'meta')?.name === 'import' &&
+    child(node, 'property')?.name === 'meta'
+  const memberName = (node: AstNode) =>
+    node.computed ? stringValue(child(node, 'property')) : (child(node, 'property')?.name as string)
+  const literal = (node: AstNode | undefined): LiteralSpan | undefined => {
+    if (!node) return undefined
+    const value =
+      stringValue(node) ??
+      (node.type === 'TemplateLiteral' && (node.expressions as unknown[]).length === 0
+        ? ((node.quasis as AstNode[])[0]?.value as { cooked?: string } | undefined)?.cooked
+        : undefined)
+    return value === undefined ? undefined : { specifier: value, start: node.start, end: node.end }
+  }
+  const visit = (value: unknown, parent: AstNode | undefined) => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, parent)
+      return
+    }
+    if (!isNode(value)) return
+    if (isImportMeta(value)) {
+      const member = parent?.type === 'MemberExpression' && parent.object === value
+      if (!member || locationMembers.has(memberName(parent) ?? '')) refs.readsLocation = true
+    } else if (value.type === 'NewExpression' && child(value, 'callee')?.name === 'URL') {
+      const [target, base] = value.arguments as AstNode[]
+      const span = literal(target)
+      if (span && base?.type === 'MemberExpression' && isImportMeta(child(base, 'object')))
+        if (memberName(base) === 'url') refs.urls.push(span)
+    } else if (value.type === 'CallExpression') {
+      const callee = child(value, 'callee')
+      if (callee?.type === 'MemberExpression' && isImportMeta(child(callee, 'object'))) {
+        const span = literal((value.arguments as AstNode[])[0])
+        if (span && memberName(callee) === 'resolve') refs.resolves.push(span)
+      }
+    }
+    for (const key in value) {
+      if (key !== 'start' && key !== 'end' && key !== 'type') visit(value[key], value)
+    }
+  }
+  visit(result.program, undefined)
+  metaRefMemo.set(key, refs)
+  return refs
+}
+
+/**
+ * Whether the module declares top-level state: a `const`/`let`/`var` initialized by `new`, or by a
+ * call through a plain name (not `require`, not `/* @__PURE__ *\/`), from the AST: never a line
+ * inside a string, and every declarator counts.
+ */
+export function hasModuleState(file: string, source: string): boolean {
+  const result = parseSync(file, source, { lang: langForFile(file) })
+  const pureEnds = new Set(
+    result.comments
+      .filter(comment => /^\s*[#@]__PURE__\s*$/.test(comment.value))
+      .map(comment => comment.end),
+  )
+  const annotatedPure = (node: AstNode) => {
+    for (let index = node.start - 1; index >= 0; index -= 1) {
+      if (pureEnds.has(index + 1)) return true
+      if (!/\s/.test(source[index]!)) return false
+    }
+    return false
+  }
+  const plainCallee = (node: AstNode | undefined): boolean =>
+    node?.type === 'Identifier' ||
+    (node?.type === 'MemberExpression' && !node.computed && plainCallee(child(node, 'object')))
+  const declarations = (result.program.body as unknown as AstNode[]).flatMap(statement => {
+    const declaration =
+      statement.type === 'ExportNamedDeclaration' ? child(statement, 'declaration') : statement
+    return declaration?.type === 'VariableDeclaration'
+      ? (declaration.declarations as AstNode[])
+      : []
+  })
+  return declarations.some(declarator => {
+    const init = unwrapExpression(child(declarator, 'init'))
+    if (init?.type === 'NewExpression') return true
+    if (init?.type !== 'CallExpression') return false
+    const callee = child(init, 'callee')
+    return plainCallee(callee) && callee?.name !== 'require' && !annotatedPure(init)
+  })
+}
+
+/** A string literal holding an absolute path or `file:` URL, and whether it is an object key. */
+export interface PathLiteral {
+  value: string
+  start: number
+  end: number
+  key: boolean
+}
+
+/** Absolute path literals in emitted code, from the AST; undefined when the parse recovered. */
+export function absolutePathLiterals(file: string, source: string): PathLiteral[] | undefined {
+  const result = parseSync(file, source, { lang: langForFile(file) })
+  if (result.errors.length > 0) return undefined
+  const found: PathLiteral[] = []
+  const visit = (value: unknown, parent: AstNode | undefined) => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, parent)
+      return
+    }
+    if (!isNode(value)) return
+    const literal = stringValue(value)
+    if (literal !== undefined && (literal.startsWith('/') || literal.startsWith('file:///'))) {
+      const key = parent?.type === 'Property' && parent.key === value && !parent.computed
+      found.push({ value: literal, start: value.start, end: value.end, key })
+    }
+    for (const key in value) {
+      if (key !== 'start' && key !== 'end' && key !== 'type') visit(value[key], value)
+    }
+  }
+  visit(result.program, undefined)
+  return found
+}
+
+/** Line comments (`// …`), from the parse; undefined when it recovered. */
+export function lineComments(file: string, source: string) {
+  const result = parseSync(file, source, { lang: langForFile(file) })
+  if (result.errors.length > 0) return undefined
+  return result.comments
+    .filter(comment => comment.type === 'Line')
+    .map(comment => ({ value: comment.value, start: comment.start, end: comment.end }))
 }
 
 /**

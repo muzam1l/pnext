@@ -42,7 +42,7 @@ export async function emitStaticExport({ config, manifest, log }: EmitStaticExpo
   // the running server - client runtime code fetches it unconditionally, and Next's own asset-404 tests
   // probe it as "a known valid asset path". Export mode additionally snapshots a standalone `out/` tree
   // below; the manifest files it needs are the same bytes, so write the server-served copy first.
-  await log.step('build manifest', () => writeBuildManifests(path.join(config.outPath, 'public')))
+  await log.step('build manifest', () => writeBuildManifests(path.join(config.outPath, 'static')))
   const output = getNextConfig().output
   if (output === 'standalone') {
     await emitStandalone({ config, manifest, log })
@@ -74,7 +74,7 @@ async function writeExportTree(config: ResolvedConfig, manifest: BuildManifest):
  * can be pointed at their new location.
  */
 async function copyRuntimeAssets(config: ResolvedConfig, outDir: string): Promise<Set<string>> {
-  const assetsDir = path.join(config.outPath, 'public', 'assets')
+  const assetsDir = path.join(config.outPath, 'static', 'assets')
   const assets = new Set<string>()
   for (const file of await listFiles(assetsDir)) {
     const relative = toPosixPath(path.relative(assetsDir, file))
@@ -91,7 +91,7 @@ async function copyPublicTree(
   outDir: string,
   assets: ReadonlySet<string>,
 ): Promise<void> {
-  const publicDir = path.join(config.outPath, 'public')
+  const publicDir = path.join(config.outPath, 'static')
   for (const file of await listFiles(publicDir)) {
     const relative = toPosixPath(path.relative(publicDir, file))
     if (relative.startsWith('assets/')) continue
@@ -159,7 +159,7 @@ function exportPages(config: ResolvedConfig, manifest: BuildManifest): ExportPag
     if (metadata.kind !== 'page' || !relative.endsWith('.html')) continue
     const route = metadata.routeId ? routeById.get(metadata.routeId) : undefined
     if (route?.kind !== 'page') continue
-    const htmlFile = path.join(config.outPath, 'public', ...relative.split('/'))
+    const htmlFile = path.join(config.outPath, 'static', ...relative.split('/'))
     pages.push({
       route,
       htmlFile,

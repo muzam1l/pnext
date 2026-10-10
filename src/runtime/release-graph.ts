@@ -9,7 +9,8 @@ import { readFile, readdir, rm } from 'node:fs/promises'
 import path from 'node:path'
 import type { ResolvedConfig } from '../config'
 import { getExternalPackagePolicy } from '../resolve/imports'
-import { importSpecifiers } from '../resolve/scan-facts'
+import { importMetaRefs, importSpecifiers } from '../resolve/scan-facts'
+import { splitResourceQuery } from '../utils/resource-query'
 import { toPosixPath, writeFileAtomic } from '../utils/fs'
 import { hashBundleSpecifier } from './loader'
 import { cacheRoot, devSourceIdentity } from './module-cache'
@@ -242,9 +243,7 @@ export async function pruneReleaseVendor(config: ResolvedConfig, sources: Map<st
   const cache = cacheRoot(config.outPath)
   const vendor = path.join(cache, 'vendor')
   const graphs = path.join(cache, 'deps')
-  const compiled = (await readdir(cache, { recursive: true, withFileTypes: true }))
-    .filter(entry => !entry.isDirectory() && /\.[cm]?js$/.test(entry.name))
-    .map(entry => path.join(entry.parentPath, entry.name))
+  const compiled = await compiledFiles(cache)
   const reached = new Set<string>()
   let frontier = compiled.filter(file => !isInside(vendor, file) && !isInside(graphs, file))
   while (frontier.length > 0) {
@@ -260,7 +259,7 @@ export async function pruneReleaseVendor(config: ResolvedConfig, sources: Map<st
           (/\.[cm]?js$/.test(file)
             ? await readFile(file, 'utf8').catch(() => undefined)
             : undefined)
-        for (const specifier of code ? relativeReferences(code) : []) {
+        for (const specifier of code ? relativeReferences(file, code) : []) {
           const target = path.resolve(path.dirname(file), splitSuffix(specifier).specifier)
           if (isInside(vendor, target)) next.push(target)
         }
@@ -275,14 +274,25 @@ export async function pruneReleaseVendor(config: ResolvedConfig, sources: Map<st
   )
 }
 
+// The compat cache mirrors app-root entries (node_modules included) as symlinks; never follow them.
+async function compiledFiles(dir: string): Promise<string[]> {
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => [])
+  const nested = await Promise.all(
+    entries.map(async entry => {
+      const file = path.join(dir, entry.name)
+      if (entry.isDirectory()) return compiledFiles(file)
+      return entry.isFile() && /\.[cm]?js$/.test(entry.name) ? [file] : []
+    }),
+  )
+  return nested.flat()
+}
+
 /** Relative module references in emitted code: imports, requires and `new URL(…, import.meta.url)`. */
-function relativeReferences(code: string) {
+function relativeReferences(file: string, code: string) {
   return [
     ...outputSpecifiers(code).map(found => found.value),
     ...emittedRefs(code).map(ref => ref.specifier),
-    ...[...code.matchAll(/new URL\(("[^"]+"),\s*import\.meta\.url\)/g)].map(
-      match => JSON.parse(match[1]!) as string,
-    ),
+    ...importMetaRefs(file, code).urls.map(url => url.specifier),
   ].filter(specifier => specifier.startsWith('.'))
 }
 
@@ -296,10 +306,8 @@ function entryName(config: ResolvedConfig, entry: string) {
 }
 
 function splitSuffix(value: string) {
-  const index = value.search(/[?#]/)
-  return index < 0
-    ? { specifier: value, suffix: '' }
-    : { specifier: value.slice(0, index), suffix: value.slice(index) }
+  const { path: specifier, query: suffix } = splitResourceQuery(value)
+  return { specifier, suffix }
 }
 
 function packageName(specifier: string) {

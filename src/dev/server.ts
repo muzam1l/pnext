@@ -121,6 +121,7 @@ import { cacheRoot, setDevWatcherFreshness } from '../runtime/module-cache'
 import { abortUpstreamFetchOnDisconnect } from '../runtime/fetch-host'
 import { markBoot } from '../cli/boot/trace'
 import { formatDuration } from '../utils/verbose'
+import { outCachePath } from '../out-paths'
 
 interface DevServerOptions {
   config: ResolvedConfig
@@ -217,7 +218,7 @@ async function evictStaleClientCaches(outPath: string) {
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   const keep = Number(process.env.PNEXT_DEV_CLIENT_CACHE_KEEP || 32)
   if (!Number.isFinite(keep) || keep <= 0) return
-  const clientRoot = path.join(outPath, 'cache', 'client')
+  const clientRoot = path.join(outCachePath(outPath), 'client')
   try {
     const entries = await readdir(clientRoot)
     if (entries.length <= keep) return
@@ -597,7 +598,7 @@ export async function startDevServer(options: DevServerOptions) {
           .some(prefix => url.pathname.startsWith(prefix))
       ) {
         const emitted = await maybeStaticFile(
-          path.join(config.outPath, 'public'),
+          path.join(config.outPath, 'static'),
           url.pathname,
           exactNames,
         )
@@ -613,7 +614,7 @@ export async function startDevServer(options: DevServerOptions) {
       )
       if (staticAssetPathname) {
         const outPublicStatic = await maybeStaticFile(
-          path.join(config.outPath, 'public'),
+          path.join(config.outPath, 'static'),
           staticAssetPathname,
           exactNames,
         )
@@ -1274,7 +1275,7 @@ async function buildDevClient(config: ResolvedConfig, route: RouteManifestEntry)
     batchRoutes.length === 1
       ? cacheKeys[0]!
       : `batch-${clientSourceHash([...cacheKeys].sort().join('\n'))}`
-  const outDir = path.join(config.outPath, 'cache', 'client', cacheKey)
+  const outDir = path.join(outCachePath(config.outPath), 'client', cacheKey)
   const outFile = path.join(outDir, `${clientEntryName(route)}.js`)
 
   // Dedup in-flight builds first. A single page view fires up to three requests
@@ -1361,7 +1362,7 @@ async function resolveDevClientChunk(config: ResolvedConfig, name: string) {
   const settled = clientChunks.get(name)
   if (settled && existsSync(settled)) return settled
 
-  const clientRoot = path.join(config.outPath, 'cache', 'client')
+  const clientRoot = path.join(outCachePath(config.outPath), 'client')
   for (const generation of await readdir(clientRoot).catch(() => [])) {
     const chunksDir = path.join(clientRoot, generation, 'chunks')
     const file = path.join(chunksDir, name)
@@ -1500,8 +1501,8 @@ async function maybeBuiltAsset(
   }
 
   const outPath = config.outPath
-  const filePath = path.join(outPath, 'cache', pathname.replace(/^\/+/, ''))
-  if (!isInside(path.join(outPath, 'cache'), filePath) || !existsSync(filePath)) return null
+  const filePath = path.join(outCachePath(outPath), pathname.replace(/^\/+/, ''))
+  if (!isInside(path.join(outCachePath(outPath)), filePath) || !existsSync(filePath)) return null
   const fileStat = await stat(filePath)
   if (!fileStat.isFile()) return null
   return new Response(await readFile(filePath), {

@@ -25,6 +25,7 @@ import type { Plugin } from 'esbuild'
 import type { ResolvedConfig } from '../../config'
 import { rewriteSpecifierLiterals } from '../../resolve/scan-facts'
 import { turbopackLoaderRules, turbopackResolveAlias, type WebpackLoaderRule } from './config'
+import { outCachePath } from '../../out-paths'
 
 interface LoaderFn {
   (this: LoaderContext, content: string | Buffer): unknown
@@ -293,7 +294,7 @@ function resolveLoaderRequest(root: string, context: string, request: string): P
  */
 function originalResourcePath(resourcePath: string, config: ResolvedConfig | undefined): string {
   if (config) {
-    const cacheRoot = path.join(config.outPath, 'cache', 'server')
+    const cacheRoot = path.join(outCachePath(config.outPath), 'server')
     const rel = path.relative(cacheRoot, resourcePath)
     if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
       const segments = rel.split(path.sep)
@@ -451,7 +452,7 @@ async function emitAssetResourceModule(
     .basename(resourcePath, path.extname(resourcePath))
     .replace(/[^A-Za-z0-9_-]+/g, '-')
   const relative = path.posix.join('_next', 'static', 'media', `${base}.${hash}${ext}`)
-  const target = path.join(config.outPath, 'public', ...relative.split('/'))
+  const target = path.join(config.outPath, 'static', ...relative.split('/'))
   await mkdir(path.dirname(target), { recursive: true })
   if (!existsSync(target)) await writeFile(target, bytes)
   const src = `/${relative}`

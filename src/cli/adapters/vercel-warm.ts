@@ -29,10 +29,17 @@ import { existsSync } from 'node:fs'
 import { mkdir, readFile, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { DEFAULT_OUT_DIR, loadConfig, pathToFileHref, type ResolvedConfig } from '../../config'
+import {
+  DEFAULT_OUT_DIR,
+  loadConfig,
+  pathToFileHref,
+  standaloneOutSegment,
+  type ResolvedConfig,
+} from '../../config'
 import { bootstrapCompat } from '../../compat-bootstrap'
 import { compiledClientReferenceFiles, ssrClientReference } from '../../client/reference'
 import { hasUseClientDirective } from '../../client/reference-stub'
+import { moduleExportNames } from '../../resolve/scan-facts'
 import { globalCssSources } from '../../css/build'
 import {
   devClientModuleHref,
@@ -61,6 +68,8 @@ import {
   releaseSourceKey,
   serializeReleaseConfig,
   writeBuildIndex,
+  buildManifestFile,
+  buildIndexFile,
 } from '../../runtime/production'
 import { frameworkFingerprint } from '../../runtime/fingerprint'
 import { releaseDependencyLog } from '../../runtime/vendor-build'
@@ -716,33 +725,35 @@ async function writeRelease(
   }
   const source = (file: string) => readSourceSync(file)
   const proxy = releasedProxy(config)
-  await writeBuildIndex(
-    config,
-    {
-      version: BUILD_INDEX_VERSION,
-      framework: frameworkFingerprint(),
-      config: serializeReleaseConfig(config),
-      ...compat,
-      modules,
-      conventions,
-      clientConventions: conventionFiles
-        .filter(file => hasUseClientDirective(source(file)))
-        .map(fromRoot),
-      documentLayouts: conventionFiles
-        .filter(
-          file =>
-            path.basename(file).startsWith('layout.') && /\bexport\s+default\b/.test(source(file)),
-        )
-        .map(fromRoot),
-      globalCss: globalCss.map(fromRoot),
-      ...(proxy ? { proxy: { ...proxy, file: fromRoot(proxy.file) } } : {}),
-      ...(fonts ? { fonts } : {}),
-      ...(dependencies.length > 0
-        ? { dependencies: dependencies.map(file => toPosix(path.relative(config.outPath, file))) }
-        : {}),
-    },
-    DEFAULT_OUT_DIR,
-  )
+  await writeBuildIndex(config, {
+    version: BUILD_INDEX_VERSION,
+    framework: frameworkFingerprint(),
+    config: serializeReleaseConfig(config),
+    ...compat,
+    modules,
+    conventions,
+    clientConventions: conventionFiles
+      .filter(file => hasUseClientDirective(source(file)))
+      .map(fromRoot),
+    documentLayouts: conventionFiles
+      .filter(
+        file =>
+          path.basename(file).startsWith('layout.') &&
+          moduleExportNames(source(file), file).includes('default'),
+      )
+      .map(fromRoot),
+    globalCss: globalCss.map(fromRoot),
+    ...(proxy ? { proxy: { ...proxy, file: fromRoot(proxy.file) } } : {}),
+    ...(fonts ? { fonts } : {}),
+    ...(dependencies.length > 0
+      ? { dependencies: dependencies.map(file => toPosix(path.relative(config.outPath, file))) }
+      : {}),
+  })
+  // A build that moved outDir leaves no default-dir release behind for `pnext start` to serve.
+  const defaultRelease = path.join(config.root, DEFAULT_OUT_DIR, standaloneOutSegment)
+  if (path.resolve(config.outPath) !== defaultRelease) {
+    await rm(buildIndexFile(defaultRelease), { force: true })
+  }
 }
 
 /**
@@ -796,7 +807,7 @@ if (import.meta.main) {
   // A build that fails closes stdin without a go-ahead and never writes the manifest. There is
   // nothing to warm and nothing to report: exiting quietly keeps the failed build's own error the
   // only thing on stderr.
-  const manifestFile = path.join(config.outPath, 'manifest.json')
+  const manifestFile = buildManifestFile(config.outPath)
   if (!request.skip || !existsSync(manifestFile)) process.exit(0)
   const manifest = resolveManifest(
     JSON.parse(await readFile(manifestFile, 'utf8')) as BuildManifest,

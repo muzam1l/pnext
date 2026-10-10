@@ -9,9 +9,10 @@ import { createHash } from 'node:crypto'
 import { link, mkdir, readFile, readdir, rm, stat, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { listFiles } from '../utils/fs'
+import { outCachePath } from '../out-paths'
 
 export function clientChunkStoreDir(outPath: string) {
-  return path.join(outPath, 'cache', 'client-store')
+  return path.join(outCachePath(outPath), 'client-store')
 }
 
 function contentHash(data: Buffer) {

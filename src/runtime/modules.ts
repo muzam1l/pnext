@@ -61,7 +61,9 @@ import {
   resolvePackageSpecifier,
 } from '../resolve/imports'
 import {
+  absolutePathLiterals,
   importSpecifiers,
+  lineComments,
   moduleSpecifierEdges,
   rewriteSpecifierLiterals,
   stripJsonImportAttributes,
@@ -1498,16 +1500,38 @@ function relocateSource(
   const specifiers = spliceSource(contents, edits)
   if (!isReleaseCompile()) return specifiers
   // Path literals (client-reference targets, module URLs) resolve beside the artifact at runtime.
-  return specifiers.replace(
-    /(?<!\\)"((?:file:\/\/)?\/[^"\\\n]+)"(\s*:)?/g,
-    (literal, value: string, key: string | undefined) => {
-      const url = value.startsWith('file:')
-      const target = locate(url ? fileURLToPath(value) : value)
-      if (!target) return literal
-      const href = `new URL(${JSON.stringify(relativeTo(target))}, import.meta.url)`
-      const expression = url ? `${href}.href` : `decodeURIComponent(${href}.pathname)`
-      return key ? `[${expression}]${key}` : expression
-    },
+  const expression = (value: string) => {
+    const url = value.startsWith('file:')
+    const target = locate(url ? fileURLToPath(value) : value)
+    if (!target) return undefined
+    const href = `new URL(${JSON.stringify(relativeTo(target))}, import.meta.url)`
+    return url ? `${href}.href` : `decodeURIComponent(${href}.pathname)`
+  }
+  const literals = absolutePathLiterals(file, specifiers)
+  if (!literals) {
+    // A recovered parse: the textual form, double-quoted literals only.
+    return specifiers.replace(
+      /(?<!\\)"((?:file:\/\/)?\/[^"\\\n]+)"(\s*:)?/g,
+      (literal, value: string, key: string | undefined) => {
+        const replacement = expression(value)
+        if (!replacement) return literal
+        return key ? `[${replacement}]${key}` : replacement
+      },
+    )
+  }
+  return spliceSource(
+    specifiers,
+    literals.flatMap(literal => {
+      const replacement = expression(literal.value)
+      if (!replacement) return []
+      return [
+        {
+          start: literal.start,
+          end: literal.end,
+          value: literal.key ? `[${replacement}]` : replacement,
+        },
+      ]
+    }),
   )
 }
 
@@ -1591,7 +1615,7 @@ export function releaseArtifactSource(file: string, contents: string) {
   if (!cacheRoot || !anchors) return contents
   return relocateSource(
     file,
-    releaseInputComments(contents),
+    releaseInputComments(file, contents),
     absolute => (isInside(cacheRoot, absolute) ? absolute : portableTarget(anchors, absolute)),
     absolute => !isInside(cacheRoot, absolute) && isInstalled(absolute),
   )
@@ -1601,11 +1625,21 @@ export function releaseArtifactSource(file: string, contents: string) {
  * esbuild's per-input `// <path>` comments, cut to the file name (or its `node_modules/` path, which
  * names a vendored font caller): their paths walk the build machine.
  */
-function releaseInputComments(contents: string) {
-  return contents.replace(/^\/\/ (?:[\w-]+:)?\.{0,2}\/[^\s]*$/gm, comment => {
+function releaseInputComments(file: string, contents: string) {
+  const shorten = (comment: string) => {
     const installed = comment.indexOf('node_modules/')
     return `// ${installed === -1 ? path.basename(comment) : comment.slice(installed)}`
-  })
+  }
+  const inputPath = /^ (?:[\w-]+:)?\.{0,2}\/\S*$/
+  const comments = lineComments(file, contents)
+  // A recovered parse: the textual form, whole lines only.
+  if (!comments) return contents.replace(/^\/\/ (?:[\w-]+:)?\.{0,2}\/[^\s]*$/gm, shorten)
+  return spliceSource(
+    contents,
+    comments
+      .filter(comment => inputPath.test(comment.value))
+      .map(comment => ({ ...comment, value: shorten(`//${comment.value}`) })),
+  )
 }
 
 /** `target` as a path a moved release still reaches: through the app's own tree, never the machine's. */
@@ -1634,7 +1668,7 @@ async function writeCompiledFile(file: string, contents: string) {
     const cacheRoot = path.dirname(profileRoot)
     contents = relocateSource(
       file,
-      anchors ? releaseInputComments(contents) : contents,
+      anchors ? releaseInputComments(file, contents) : contents,
       absolute =>
         isInside(cacheRoot, absolute) ? absolute : anchors && portableTarget(anchors, absolute),
       absolute => !isInside(cacheRoot, absolute) && isInstalled(absolute),
@@ -3585,7 +3619,7 @@ async function staticImageModuleSource(config: ResolvedConfig, file: string) {
   const compat = await getAssetExtensions().staticAssetModule({ sourcePath, bytes, emit })
   const source = compat ?? coreStaticAssetModule(sourcePath, bytes, emit)
   for (const relative of emitted) {
-    const target = path.join(config.outPath, 'public', ...relative.split('/'))
+    const target = path.join(config.outPath, 'static', ...relative.split('/'))
     await mkdir(path.dirname(target), { recursive: true })
     if (!existsSync(target)) await copyFile(sourcePath, target)
   }

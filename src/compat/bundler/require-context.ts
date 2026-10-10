@@ -12,6 +12,7 @@
 
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
+import { outCachePath } from '../../out-paths'
 
 /** Extensions whose files also get an extension-less request key (webpack resolves both). */
 const RESOLVABLE_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.json']
@@ -210,7 +211,7 @@ function resolveContextDir(
   const direct = path.resolve(path.dirname(file), specifier)
   if (existsSync(direct)) return direct
   if (paths?.outPath && paths.workspaceRoot) {
-    const cacheRoot = path.join(paths.outPath, 'cache', 'server')
+    const cacheRoot = path.join(outCachePath(paths.outPath), 'server')
     const relative = path.relative(cacheRoot, file)
     if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
       const segments = relative.split(path.sep)

@@ -3403,7 +3403,7 @@ export function withDevReloadScript(html: string, request?: Request): string {
 }
 
 function withGlobalErrorStylesheet(html: string, config: ResolvedConfig): string {
-  const asset = `${config.outPath}/public/assets/${emittedAssetName(config, 'global-error.css')}`
+  const asset = `${config.outPath}/static/assets/${emittedAssetName(config, 'global-error.css')}`
   if (!existsSync(asset)) return html
   const link = `<link rel="stylesheet" href="${assetHref(config, 'global-error.css')}">`
   if (html.includes('</head>')) return html.replace('</head>', `${link}</head>`)

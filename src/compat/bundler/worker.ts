@@ -128,7 +128,7 @@ async function workerAssetModuleSource(config: ResolvedConfig, file: string): Pr
     source = `const src = ${JSON.stringify(src)};\nexport default { src };\nexport { src };\n`
   }
   for (const relative of emitted) {
-    const target = path.join(config.outPath, 'public', ...relative.split('/'))
+    const target = path.join(config.outPath, 'static', ...relative.split('/'))
     await mkdir(path.dirname(target), { recursive: true })
     if (!existsSync(target)) await copyFile(sourcePath, target)
   }
@@ -208,7 +208,7 @@ async function bundleWorkerEntry(config: ResolvedConfig, entry: string): Promise
   const hash = createHash('sha256').update(output.contents).digest('hex').slice(0, 8)
   const base = path.basename(entry, path.extname(entry)).replace(/[^A-Za-z0-9_-]+/g, '-')
   const relative = path.posix.join('assets', 'workers', `${base}.${hash}.js`)
-  const target = path.join(config.outPath, 'public', ...relative.split('/'))
+  const target = path.join(config.outPath, 'static', ...relative.split('/'))
   await mkdir(path.dirname(target), { recursive: true })
   await writeFile(target, output.contents)
   return `/${relative}`

@@ -41,7 +41,7 @@ pnext start
 
 `pnext build` makes the production build and `pnext start` serves it. Routes render on the server per request; ones that never read the request are prerendered to static HTML at build time.
 
-That deploys anywhere Bun runs. For Vercel, build with `pnext build --adapter vercel` and it writes ready-to-deploy Build Output.
+Ship `.pnext/standalone` to any host with Bun. For Vercel, build with `pnext build --adapter vercel` and it writes ready-to-deploy Build Output.
 
 ## A quick tour
 

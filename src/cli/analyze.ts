@@ -8,6 +8,7 @@ import { matchRoute } from '../routing/routes'
 import { bold, cyan, dim } from '../utils/ansi'
 import { listFiles } from '../utils/fs'
 import type { BuildManifest, RouteManifestEntry } from '../types'
+import { buildManifestFile } from '../runtime/production'
 
 export interface AnalyzeResult {
   root: string
@@ -109,7 +110,7 @@ async function analyzeRouteBundles(
   files: AnalyzeFile[],
   routeFilter?: string,
 ) {
-  const manifestPath = path.join(outPath, 'manifest.json')
+  const manifestPath = buildManifestFile(outPath)
   if (!existsSync(manifestPath)) return []
 
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as BuildManifest
@@ -374,7 +375,7 @@ function prerenderedPathname(route: RouteManifestEntry) {
 function analyzeTarget(outPath: string) {
   // PPR shells live in `.pnext/ppr`, outside `public`: they are resumed
   // server-side and never downloaded, so they are not shipped weight.
-  const publicPath = path.join(outPath, 'public')
+  const publicPath = path.join(outPath, 'static')
   return existsSync(publicPath) ? { root: publicPath } : null
 }
 

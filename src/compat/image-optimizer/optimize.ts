@@ -378,7 +378,7 @@ async function fetchUpstream(
   }
   const publicFile = await readPublicFile(
     [
-      path.join(coreConfig.outPath, 'public'),
+      path.join(coreConfig.outPath, 'static'),
       coreConfig.publicPath,
       path.join(coreConfig.root, 'public'),
     ],

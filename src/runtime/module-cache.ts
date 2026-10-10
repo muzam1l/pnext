@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url'
 import type { ResolvedConfig } from '../config'
 import { writeFileAtomic } from '../utils/fs'
 import { traceEnabled } from '../utils/trace-flags'
+import { outCachePath } from '../out-paths'
 
 /**
  * Kill switch for the request-head trims: the naming walk's synchronous source
@@ -205,7 +206,7 @@ export function devModuleCache(
 }
 
 export function cacheRoot(outPath: string) {
-  return path.join(outPath, 'cache', 'server')
+  return path.join(outCachePath(outPath), 'server')
 }
 
 function createDevModuleCache(

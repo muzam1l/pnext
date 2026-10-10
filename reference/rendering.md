@@ -40,7 +40,7 @@ Put the directive at the top of a page when the whole page needs browser-only be
 
 ## Lazy loading
 
-`dynamic()` defers loading a component. It works in Server Components and Client Components alike, and inside a Client Component it is a browser lazy loader. The loader can also be a literal module path for a default export.
+`dynamic()` defers loading a component in Server and Client Components. The loader can also be a literal module path for a default export.
 
 ```tsx
 import { dynamic } from '@wular/pnext/dynamic'
@@ -50,10 +50,10 @@ const Chart = dynamic(() => import('./chart').then(m => m.Chart), {
 })
 ```
 
-A Client Component target renders on the server and hydrates by default. The options change that:
+The component renders on the server and hydrates by default. The options change that:
 
-- `ssr: false` produces browser-only output.
-- `load: 'visible'` waits for the island to enter view, and accepts `rootMargin` and `threshold`. It is browser-only as well unless `ssr` is true.
+- `ssr: false` renders only in the browser.
+- `load: 'visible'` waits for the component to enter view, and accepts `rootMargin` and `threshold`. It renders only in the browser, except with `ssr: true` in a Server Component.
 - `loading` supplies fallback UI.
 
 ## Props that cross the boundary

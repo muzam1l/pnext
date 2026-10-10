@@ -122,7 +122,7 @@ async function writeImagesManifestStep(ctx: BuildStepContext): Promise<void> {
 async function mirrorStaticMedia(config: ResolvedConfig): Promise<void> {
   const { cp } = await import('node:fs/promises')
   for (const dir of ['media', 'immutable/media']) {
-    const source = path.join(config.outPath, 'public', '_next', 'static', dir)
+    const source = path.join(config.outPath, 'static', '_next', 'static', dir)
     const target = path.join(config.root, '.next', 'static', dir)
     try {
       await cp(source, target, { recursive: true, force: true })

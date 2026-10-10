@@ -17,6 +17,7 @@ import { setGlobalCssSourceStore, type GlobalCssSourceStore } from '../../css/bu
 import { traceEnabled } from '../../utils/trace-flags'
 import { restartCacheEnabled } from './enabled'
 import { hash, lazyRecordCacheKey, revalidate, sourceEntries, type SourceEntry } from './record'
+import { outCachePath } from '../../out-paths'
 
 interface RecordFile {
   version: number
@@ -34,7 +35,7 @@ export function installGlobalCssCache(config: ResolvedConfig) {
   if (!restartCacheEnabled()) return
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   if (process.env.PNEXT_DEV_GLOBAL_CSS_CACHE === '0') return
-  const dir = path.join(config.outPath, 'cache', 'global-css')
+  const dir = path.join(outCachePath(config.outPath), 'global-css')
   setGlobalCssSourceStore(createStore(dir, lazyRecordCacheKey(config, RECORD_VERSION)))
 }
 

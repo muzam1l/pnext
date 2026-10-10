@@ -34,7 +34,12 @@ import {
   serverDefineOptions,
   type ServerEsbuildPluginOptions,
 } from '../extensions'
-import { pathToFileHref, type CompatAliasTarget, type ResolvedConfig } from '../config'
+import {
+  pathToFileHref,
+  type CompatAliasTarget,
+  type ResolvedConfig,
+  outCachePath,
+} from '../config'
 import {
   cacheRoot,
   devArtifactUsable,
@@ -65,9 +70,10 @@ import {
 } from '../client/reference-stub'
 import { noteCompiledClientReference } from '../client/reference'
 import { reactCompatEnabled } from '../render/hooks'
-import { writeFileAtomic } from '../utils/fs'
+import { toPosixPath, writeFileAtomic } from '../utils/fs'
 import { releaseArtifactSource } from './modules'
 import { formatDuration } from '../utils/verbose'
+import { hasModuleState, importMetaRefs, scanFacts } from '../resolve/scan-facts'
 import {
   addCommonJsNamedExports,
   canonicalVendorCode,
@@ -263,6 +269,21 @@ function appendReleaseLog(config: ResolvedConfig, record: object) {
  * itself (`import.meta.url`) or imports computed paths loads in place, as in 0.1.6: Next's webpack
  * contexts bundle computed imports instead. Returns the files written and the entries left in place.
  */
+/**
+ * esbuild names CommonJS modules by path from `absWorkingDir`; a `node_modules` linked from outside
+ * the app makes those names climb to the build machine's absolute path. The quoted prefix to rewrite.
+ */
+function machineModuleKeyPrefix(root: string) {
+  let real: string
+  try {
+    real = realpathSync(path.join(root, 'node_modules'))
+  } catch {
+    return undefined
+  }
+  const relative = toPosixPath(path.relative(root, real))
+  return relative.startsWith('../') ? `"${relative}/` : undefined
+}
+
 export async function linkReleaseDependencies(
   config: ResolvedConfig,
   layer: ReleaseDependencyLayer,
@@ -338,10 +359,12 @@ export async function linkReleaseDependencies(
   await rm(staging, { recursive: true, force: true })
   try {
     await mkdir(path.join(staging, 'chunks'), { recursive: true })
+    const keys = machineModuleKeyPrefix(config.root)
     for (const output of outputs) {
+      const text = keys ? output.text.replaceAll(keys, '"node_modules/') : output.text
       const code = entryFiles.has(output.path)
-        ? addCommonJsNamedExports(output.text, sharedCommonJsBody(output.path, output.text, texts))
-        : output.text
+        ? addCommonJsNamedExports(text, sharedCommonJsBody(output.path, text, texts))
+        : text
       await writeFile(
         path.join(staging, path.relative(outdir, output.path)),
         releaseArtifactSource(
@@ -364,16 +387,13 @@ export async function linkReleaseDependencies(
 
 // `import.meta` paths and an `import()` of a computed path resolve where the file lies; an import marked
 // `webpackIgnore`/`@vite-ignore` is meant to stay a runtime import, as Next's bundle keeps it.
-const IMPORT_META_PATH = /\bimport\.meta\.(?:url|dirname|filename|resolve)\b/
-const COMPUTED_IMPORT =
-  /(?<![.\w$])import\s*\(((?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*\n)*)(?!['"`)\s/])/g
-
-function readsBesideItself(source: string) {
-  if (IMPORT_META_PATH.test(source)) return true
-  for (const match of source.matchAll(COMPUTED_IMPORT)) {
-    if (!/webpackIgnore:\s*true|@vite-ignore/.test(match[1]!)) return true
-  }
-  return false
+/** Reads its own location or imports a computed path (unless it opts out with a magic comment). */
+function readsBesideItself(file: string, source: string) {
+  const refs = importMetaRefs(file, source)
+  if (refs.readsLocation) return true
+  return refs.computedImports.some(
+    call => !/webpackIgnore:\s*true|@vite-ignore/.test(source.slice(call.start, call.end)),
+  )
 }
 
 /** Package dirs whose files read beside themselves or import computed paths. */
@@ -392,7 +412,7 @@ async function inPlacePackages(
   await Promise.all(
     installed.map(async file => {
       const source = await readFile(file, 'utf8').catch(() => '')
-      if (readsBesideItself(source)) files.add(file)
+      if (readsBesideItself(file, source)) files.add(file)
     }),
   )
   return [
@@ -411,9 +431,9 @@ async function inPlacePackages(
  */
 function sharedCommonJsBody(file: string, code: string, texts: ReadonlyMap<string, string>) {
   const wrapper = /(?:^|\n)export default (require_[\w$]+)\(\);?/.exec(code)?.[1]
+  // The chunk that defines the wrapper, from the parsed imports: `$` in its name is no regex hazard.
   const chunk =
-    wrapper &&
-    new RegExp(`import\\s*\\{[^}]*\\b${wrapper}\\b[^}]*\\}\\s*from\\s*"([^"]+)"`).exec(code)?.[1]
+    wrapper && scanFacts(file, code).imports.find(edge => edge.exports.includes(wrapper))?.specifier
   const text = chunk && texts.get(path.resolve(path.dirname(file), chunk))
   if (!text) return code
   const start = text.indexOf(`var ${wrapper} = `)
@@ -742,7 +762,12 @@ const vendorPortablePath = (config: ResolvedConfig, file: string) =>
   devSourceIdentity(file, config.workspaceRoot)
 
 function vendorArtifactFile(config: ResolvedConfig, key: string) {
-  return path.join(config.outPath, 'cache', 'server', 'vendor', `${hashBundleSpecifier(key)}.mjs`)
+  return path.join(
+    outCachePath(config.outPath),
+    'server',
+    'vendor',
+    `${hashBundleSpecifier(key)}.mjs`,
+  )
 }
 
 /**
@@ -1041,7 +1066,7 @@ function reusableVendorContent(
   loadVendorSharedEntries(config)
   const id = vendorSharedFor(config).get(entry)
   if (!id) return undefined
-  const content = vendorContentFile(path.join(config.outPath, 'cache', 'server', 'vendor'), id)
+  const content = vendorContentFile(path.join(outCachePath(config.outPath), 'server', 'vendor'), id)
   return existsSync(content) ? content : undefined
 }
 
@@ -1704,9 +1729,6 @@ function packageExportSubpaths(packageRoot: string) {
 }
 
 /** A top-level binding created by `new` or a non-PURE call: an identity each copy would duplicate. */
-const MODULE_STATE =
-  /^(?:export\s+)?(?:const|let|var)\s[^=;]*=\s*(?:(?:\/\*\s*[#@]__PURE__\s*\*\/\s*)?new\s|(?!require\s*\()[\w$.]+\s*\()/m
-
 async function statefulPackageFiles(entry: string, packageRoot: string) {
   const files = [...(await packageReach(entry, packageRoot))]
   const sources = await Promise.all(files.map(file => packageFileScan(file)))
@@ -1728,7 +1750,7 @@ function packageFileScan(file: string) {
           .scanImports(source)
           .map(({ path: specifier }) => specifier)
           .filter(specifier => specifier.startsWith('.')),
-        stateful: MODULE_STATE.test(source),
+        stateful: hasModuleState(file, source),
       }))
       .catch(() => undefined)
     packageFileScans.set(file, scan)

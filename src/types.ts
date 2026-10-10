@@ -45,9 +45,8 @@ export interface PNextConfig {
 }
 
 /**
- * What a deployment adapter packs into the server function. It ships the closure the runtime can reach, minus
- * build debris and files no runtime reads - serverless size limits are hard. These lists are the escape hatch
- * when that classification is wrong for an app: `exclude` drops more, `keep` overrides a built-in drop.
+ * What `<outDir>/standalone` ships beyond the files its server imports. `exclude` drops traced
+ * `node_modules` files; `keep` ships app files the server reads at runtime, at their root-relative paths.
  * Entries are directory names (`storybook-static`) or file suffixes (`.map`).
  */
 export interface PNextAdapterConfig {

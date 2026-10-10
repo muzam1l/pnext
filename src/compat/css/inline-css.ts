@@ -65,7 +65,7 @@ export function inlineCssStylesheets(
 ): string[] | undefined {
   if (options.dev || suppressed.getStore() === true || !inlineCssEnabled(config)) return undefined
   const assets = options.assetNames.map(asset =>
-    readCss(`${config.outPath}/public/assets/${asset}`),
+    readCss(`${config.outPath}/static/assets/${asset}`),
   )
   if (assets.some(css => css === undefined)) return undefined
   const css = [options.prependCss, ...assets].filter(Boolean).join('\n')

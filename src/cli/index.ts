@@ -168,13 +168,11 @@ declare const PNEXT_PREBUNDLE: { version: string; fingerprint: string } | undefi
 /** Whether this process's prebundle may serve `root`'s build: one made from its source and version. */
 async function prebundleServes(root = process.cwd()) {
   if (typeof PNEXT_PREBUNDLE !== 'object') return true
-  const [{ DEFAULT_OUT_DIR }, { locateRelease, readBuildIndex }] = await Promise.all([
-    import('../config'),
-    import('../runtime/production'),
-  ])
-  const outPath = locateRelease(path.resolve(root), DEFAULT_OUT_DIR)
+  const [{ DEFAULT_OUT_DIR, standaloneOutSegment }, { buildIndexFile, readBuildIndex }] =
+    await Promise.all([import('../config'), import('../runtime/production')])
+  const outPath = path.resolve(root, DEFAULT_OUT_DIR, standaloneOutSegment)
   return (
-    !outPath ||
+    !existsSync(buildIndexFile(outPath)) ||
     (readBuildIndex(outPath).framework === PNEXT_PREBUNDLE.fingerprint &&
       VERSION === PNEXT_PREBUNDLE.version)
   )

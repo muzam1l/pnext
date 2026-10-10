@@ -42,6 +42,7 @@ export function typecheckDisabled(): boolean {
 export interface TypecheckWorkerInput {
   root: string
   outPath: string
+  outRootPath: string
   compat: ResolvedConfig['compat']
   nextConfig: NextConfigObject
 }
@@ -64,6 +65,7 @@ export async function validateTypesOffThread(config: ResolvedConfig): Promise<vo
   const input: TypecheckWorkerInput = {
     root: config.root,
     outPath: config.outPath,
+    outRootPath: config.outRootPath,
     compat: config.compat,
     nextConfig: cloneable({
       typescript: next.typescript,
@@ -210,12 +212,12 @@ function appDiagnostic(file: string | undefined, config: ResolvedConfig): boolea
   if (resolved === generatedProjectPath(config)) return true
   if (!resolved.startsWith(config.root + path.sep)) return false
   if (resolved.includes(`${path.sep}node_modules${path.sep}`)) return false
-  if (resolved.startsWith(path.resolve(config.outPath) + path.sep)) return false
+  if (resolved.startsWith(path.resolve(config.outRootPath) + path.sep)) return false
   return true
 }
 
 function generatedProjectPath(config: ResolvedConfig): string {
-  return path.resolve(config.outPath, 'typecheck', 'tsconfig.json')
+  return path.resolve(config.outRootPath, 'typecheck', 'tsconfig.json')
 }
 
 /**
@@ -292,7 +294,7 @@ async function writeTypecheckProject(
   config: ResolvedConfig,
   native: string | undefined,
 ): Promise<string> {
-  const dir = path.join(config.outPath, 'typecheck')
+  const dir = path.join(config.outRootPath, 'typecheck')
   await mkdir(dir, { recursive: true })
   const reactTypes = resolveTypesDir('react', config.root)
   const hasReactTypes = reactTypes !== undefined
@@ -420,7 +422,7 @@ async function writeTypecheckProject(
 }
 
 function preactTypeShimPath(config: ResolvedConfig): string {
-  return path.join(config.outPath, 'typecheck', 'preact-compat.d.ts')
+  return path.join(config.outRootPath, 'typecheck', 'preact-compat.d.ts')
 }
 
 function preactTypeShim(preact: string, react: string): string {

@@ -3,16 +3,17 @@
  * build froze. A served request never reads, stats or hashes app source or config, and never
  * compiles; everything it imports is named here. Dev and the build itself keep their own loaders.
  */
-import { type Dirent, existsSync, readFileSync, readdirSync } from 'node:fs'
-import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
+import { type Dirent, existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
+import { rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { ResolvedConfig } from '../config'
 import type { ReleasedFont } from '../render/hooks'
 import type { StaticMetadataFile } from '../routing/metadata-files'
+import { prebundledFile, registerResolvePlugin } from './prebundle'
+import { splitResourceQuery } from '../utils/resource-query'
 
 export const BUILD_INDEX_VERSION = 1
-const LOCATOR_FILE = 'release-locator.json'
 
 /** `server` is the RSC/server layer, `client` the SSR copy of client components. */
 export type ReleaseLayer = 'server' | 'client'
@@ -91,6 +92,96 @@ export function buildIndexFile(outPath: string) {
   return path.join(outPath, 'server', 'build-index.json')
 }
 
+export function buildManifestFile(outPath: string) {
+  return path.join(outPath, 'server', 'manifest.json')
+}
+
+/** The framework copy a standalone dir ships: its compiled modules name framework files there. */
+export function releaseFrameworkRoot(outPath: string) {
+  try {
+    const { name } = JSON.parse(readFileSync(path.join(frameworkRoot, 'package.json'), 'utf8')) as {
+      name: string
+    }
+    return realpathSync(path.join(outPath, 'node_modules', name))
+  } catch {
+    return frameworkRoot
+  }
+}
+
+/**
+ * Where a release's app sources are, as its compiled modules name them: the app root the build recorded
+ * relative to its output. In place that is the real root; a copied standalone keeps the same relation.
+ */
+export function releaseSourceRoot(outPath: string, serializedOutPath: string) {
+  return path.resolve(outPath, path.relative(serializedOutPath, '.'))
+}
+
+/** Build-machine facts about a standalone dir, kept in the build cache beside it. */
+export function standaloneOriginsFile(outPath: string) {
+  return path.join(path.dirname(outPath), 'cache', 'standalone.json')
+}
+
+let shippedRelease: string | null | undefined
+
+/** The standalone dir this framework copy ships in (`<dir>/node_modules/…/<name>`), if it is one. */
+export function servingReleaseDir(): string | undefined {
+  if (shippedRelease === undefined) {
+    shippedRelease = null
+    // Isolated installs nest the copy deeper: `node_modules/.bun/<pkg>/node_modules/<name>`.
+    for (
+      let dir = path.dirname(frameworkRoot);
+      dir !== path.dirname(dir);
+      dir = path.dirname(dir)
+    ) {
+      if (path.basename(dir) === 'node_modules' && existsSync(buildIndexFile(path.dirname(dir)))) {
+        shippedRelease = path.dirname(dir)
+        break
+      }
+    }
+  }
+  return shippedRelease ?? undefined
+}
+
+const linkedReleases = new Map<string, boolean>()
+
+/**
+ * Serve `release` from this framework copy without loading the standalone one beside it: its imports
+ * of its `node_modules` copies resolve back to the files they were cloned from, so the process keeps
+ * one instance of the framework and of every package. False when this copy cannot serve it in
+ * place: the build cache naming the origins is gone, or the release moved since.
+ */
+export function linkStandaloneOrigins(release: string): boolean {
+  if (servingReleaseDir() === release) return true
+  const known = linkedReleases.get(release)
+  if (known !== undefined) return known
+  let origins: Record<string, string> | undefined
+  try {
+    const parsed = JSON.parse(readFileSync(standaloneOriginsFile(release), 'utf8')) as {
+      release: string
+      origins: Record<string, string>
+    }
+    if (parsed.release === release) origins = parsed.origins
+  } catch {
+    origins = undefined
+  }
+  linkedReleases.set(release, origins !== undefined)
+  if (!origins) return false
+  const files = origins
+  const modules = `${path.join(release, 'node_modules')}${path.sep}`
+  registerResolvePlugin({
+    name: 'pnext-standalone-origins',
+    setup(build) {
+      build.onResolve({ filter: /node_modules\// }, args => {
+        const file = path.resolve(path.dirname(args.importer), splitResourceQuery(args.path).path)
+        if (!file.startsWith(modules)) return undefined
+        const origin = files[path.relative(release, file).split(path.sep).join('/')]
+        return origin && existsSync(origin) ? { path: prebundledFile(origin) } : undefined
+      })
+    },
+  })
+  return true
+}
+
 export function releaseModuleKey(layer: ReleaseLayer, target: string, file: string) {
   return `${layer}:${target}:${file}`
 }
@@ -145,11 +236,12 @@ export function attachRelease(config: ResolvedConfig, index = readBuildIndex(con
   const existing = releases.get(config)
   if (existing) return existing
   const fromRoot = (file: string) => path.resolve(config.root, file)
+  const framework = releaseFrameworkRoot(config.outPath)
   const modules = new Map<string, string>()
   for (const [key, artifact] of Object.entries(index.modules)) {
     const second = key.indexOf(':', key.indexOf(':') + 1)
     modules.set(
-      `${key.slice(0, second + 1)}${releaseSourceFile(key.slice(second + 1), config.root, config.workspaceRoot)}`,
+      `${key.slice(0, second + 1)}${releaseSourceFile(key.slice(second + 1), config.root, config.workspaceRoot, framework)}`,
       pathToFileURL(path.resolve(config.outPath, artifact)).href,
     )
   }
@@ -272,11 +364,16 @@ export function releaseSourceKey(file: string, root: string, workspaceRoot: stri
   return `r:${toPosix(inRoot)}`
 }
 
-export function releaseSourceFile(key: string, root: string, workspaceRoot: string) {
+export function releaseSourceFile(
+  key: string,
+  root: string,
+  workspaceRoot: string,
+  framework = frameworkRoot,
+) {
   const value = key.slice(2)
   if (key.startsWith('r:')) return path.join(root, value)
   if (key.startsWith('w:')) return path.resolve(workspaceRoot, value)
-  if (key.startsWith('f:')) return path.resolve(frameworkRoot, value)
+  if (key.startsWith('f:')) return path.resolve(framework, value)
   return path.join(root, value)
 }
 
@@ -301,23 +398,6 @@ export function readBuildIndex(outPath: string): BuildIndex {
     throw new Error(`pnext: ${file} is from another pnext version. Run 'pnext build' again.`)
   }
   return index
-}
-
-/**
- * Where a built root keeps its release: the dir its locator names when the latest build wrote outside
- * the default out dir (a build into the default empties it, locator included), else the default.
- * Undefined when the root holds no build.
- */
-export function locateRelease(root: string, defaultOutDir: string): string | undefined {
-  const outPath = path.join(root, defaultOutDir)
-  try {
-    const { outDir } = JSON.parse(readFileSync(path.join(outPath, LOCATOR_FILE), 'utf8')) as {
-      outDir: string
-    }
-    return path.resolve(root, outDir)
-  } catch {
-    return existsSync(buildIndexFile(outPath)) ? outPath : undefined
-  }
 }
 
 /** The resolved config as the build saw it, with paths made relative to the root. */
@@ -367,25 +447,10 @@ export function releaseConfig(
   }
 }
 
-/** Publish the build index last, atomically, plus a locator when the out dir is not the default. */
-export async function writeBuildIndex(
-  config: ResolvedConfig,
-  index: BuildIndex,
-  defaultOutDir: string,
-) {
+/** Publish the build index last, atomically. */
+export async function writeBuildIndex(config: ResolvedConfig, index: BuildIndex) {
   const file = buildIndexFile(config.outPath)
   const temporary = `${file}.${process.pid}.tmp`
   await writeFile(temporary, JSON.stringify(index))
   await rename(temporary, file)
-  const defaultOut = path.join(config.root, defaultOutDir)
-  if (path.resolve(config.outPath) === path.resolve(defaultOut)) return
-  await mkdir(defaultOut, { recursive: true })
-  const locator = path.join(defaultOut, LOCATOR_FILE)
-  await writeFile(
-    `${locator}.${process.pid}.tmp`,
-    JSON.stringify({ outDir: path.relative(config.root, config.outPath) }),
-  )
-  await rename(`${locator}.${process.pid}.tmp`, locator)
-  // A default-out release left by an earlier build is now stale: the locator already outranks it.
-  await rm(buildIndexFile(defaultOut), { force: true })
 }

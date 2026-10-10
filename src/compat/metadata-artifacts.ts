@@ -329,7 +329,7 @@ async function writeStaticMetadataArtifacts(
   metadata: StaticFileMetadata | undefined,
 ): Promise<void> {
   if (!metadata) return
-  const source = path.join(outPath, 'public', relative)
+  const source = path.join(outPath, 'static', relative)
   const outputBase = path.join(root, 'server', 'app', toPosixPath(relative))
   await mkdir(path.dirname(outputBase), { recursive: true })
   const routeMeta = JSON.stringify(toRouteMeta(metadata))

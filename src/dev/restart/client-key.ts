@@ -23,6 +23,7 @@ import type { ResolvedConfig } from '../../config'
 import type { RouteManifestEntry } from '../../types'
 import { writeFileAtomic } from '../../utils/fs'
 import { restartCacheEnabled } from './enabled'
+import { outCachePath } from '../../out-paths'
 
 /** `[file, mtimeMs, size, contentHash]` — the same record shape the module index uses. */
 type SourceEntry = [string, number, number, string]
@@ -53,7 +54,7 @@ interface KeyCache {
 const caches = new Map<string, KeyCache>()
 
 function keyCache(config: ResolvedConfig): KeyCache {
-  const file = path.join(config.outPath, 'cache', 'client', 'keys.json')
+  const file = path.join(outCachePath(config.outPath), 'client', 'keys.json')
   const existing = caches.get(file)
   if (existing) return existing
   const created: KeyCache = { file, routes: readIndex(file), dirty: false, retries: 0 }

@@ -130,7 +130,7 @@ function collectOutputs(config: ResolvedConfig, manifest: BuildManifest): Adapte
   const prerenderedRoutes = new Set<string>()
 
   for (const [relative, metadata] of Object.entries(manifest.staticFiles ?? {})) {
-    const filePath = path.join(config.outPath, 'public', relative)
+    const filePath = path.join(config.outPath, 'static', relative)
     // The manifest also records prerenders that produced no body on disk
     // (an empty response, `_not-found` / `_global-error`). Those are not
     // deployable artifacts: leave them out, and leave the owning route as a

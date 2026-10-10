@@ -25,6 +25,7 @@ import {
   type DevGraphSource,
 } from '../../runtime/module-cache'
 import { restartCacheEnabled } from './enabled'
+import { outCachePath } from '../../out-paths'
 
 interface RecordFile {
   version: number
@@ -49,7 +50,7 @@ function enabled() {
 }
 
 function recordFile(config: ResolvedConfig, routeId: string) {
-  return path.join(config.outPath, 'cache', 'route-bundles', `${hash(routeId)}.json`)
+  return path.join(outCachePath(config.outPath), 'route-bundles', `${hash(routeId)}.json`)
 }
 
 /**

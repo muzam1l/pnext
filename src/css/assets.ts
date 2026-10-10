@@ -116,7 +116,7 @@ export async function emitFontCssStylesheet(
   baseAsset: string | undefined,
   options: { dev: boolean },
 ) {
-  const outDir = path.join(config.outPath, options.dev ? 'cache' : 'public', 'assets')
+  const outDir = path.join(config.outPath, options.dev ? 'cache' : 'static', 'assets')
   await ensureDir(outDir)
   const baseFile = baseAsset ? path.join(outDir, baseAsset) : undefined
   const baseCss = baseFile && existsSync(baseFile) ? await readFile(baseFile, 'utf8') : ''

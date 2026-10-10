@@ -6,6 +6,7 @@
  * imports them; this module never imports from `./vendor-build`.
  */
 
+import { hasModuleDirective } from '../utils/directive'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
@@ -33,6 +34,7 @@ import {
   pnextAliases,
   type CompatAliasTarget,
   type ResolvedConfig,
+  outCachePath,
 } from '../config'
 import {
   rewriteDynamicCallTargets,
@@ -175,7 +177,7 @@ export function registerServerRuntime(config: ResolvedConfig, sourceFiles: strin
     ...rootPaths(config.root),
     ...rootPaths(config.appPath),
     // A release build evaluates its compiled artifacts as the release will: natively.
-    ...(isReleaseCompile() ? [] : rootPaths(path.join(config.outPath, 'cache', 'server'))),
+    ...(isReleaseCompile() ? [] : rootPaths(path.join(outCachePath(config.outPath), 'server'))),
     // The pnext src root, so the framework's own source transforms too.
     ...rootPaths(path.join(import.meta.dirname, '..')),
     ...sourceRoots.flatMap(rootPaths),
@@ -380,7 +382,7 @@ export function nodeModuleSourceLoadsAsIs(source: string) {
 /** The relative specifiers of a file that loads as-is, or undefined when it needs the bundle. */
 function nodeModuleRelativeImports(source: string) {
   if (serverDefineOptions().define || source.includes('use cache')) return undefined
-  if (/^\s*(?:(?:\/\/[^\n]*\n|\/\*[\s\S]*?\*\/)\s*)*['"]use (?:client|server)['"]/.test(source)) {
+  if (hasModuleDirective(source, 'use client') || hasModuleDirective(source, 'use server')) {
     return undefined
   }
   try {
@@ -1140,7 +1142,7 @@ async function staticImageModuleSource(config: ResolvedConfig | undefined, file:
   const source = compat ?? coreStaticAssetModule(sourcePath, bytes, emit)
   if (config) {
     for (const asset of emitted) {
-      const target = path.join(config.outPath, 'public', ...asset.relative.split('/'))
+      const target = path.join(config.outPath, 'static', ...asset.relative.split('/'))
       await mkdir(path.dirname(target), { recursive: true })
       if (!existsSync(target)) await Bun.write(target, asset.bytes)
     }

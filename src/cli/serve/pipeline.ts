@@ -21,7 +21,12 @@ import {
 } from '../../runtime/load'
 import { abortUpstreamFetchOnDisconnect } from '../../runtime/fetch-host'
 import { applyProxyResponse, createProxyRunner, type ProxyRunnerOptions } from '../../routing/proxy'
-import { attachRelease, releaseModuleHref } from '../../runtime/production'
+import {
+  attachRelease,
+  buildManifestFile,
+  releaseFrameworkRoot,
+  releaseModuleHref,
+} from '../../runtime/production'
 import {
   isPprShellUpgradeEligible,
   renderGlobalNotFoundResponse,
@@ -91,13 +96,14 @@ export async function createRequestHandler(
   // extension registries when compat is enabled (no-op for pure-core apps).
   // A prod server answers the very next request, so it takes both tiers here.
   await bootstrapCompat(config)
-  const manifestPath = path.join(config.outPath, 'manifest.json')
+  const manifestPath = buildManifestFile(config.outPath)
   // `start` reads the manifest before binding the port (a missing build must
   // still fail there, not on the first request) and hands it over.
   const manifest = resolveManifest(
     options.manifest ?? (JSON.parse(await readFile(manifestPath, 'utf8')) as BuildManifest),
     config.outPath,
     config.root,
+    releaseFrameworkRoot(config.outPath),
   )
   // Everything a request imports comes from the build's release; each handler resolves once, here.
   const release = attachRelease(config)
@@ -671,7 +677,7 @@ export async function createRequestHandler(
           await mkdir(path.dirname(file), { recursive: true })
           await writeFile(file, new Uint8Array(await handlerResponse.clone().arrayBuffer()))
           const relative = path
-            .relative(path.join(config.outPath, 'public'), file)
+            .relative(path.join(config.outPath, 'static'), file)
             .split(path.sep)
             .join('/')
           const routeRevalidate = matched.route.segmentConfig?.revalidate
@@ -847,7 +853,7 @@ export async function createRequestHandler(
         await mkdir(path.dirname(file), { recursive: true })
         await writeFile(file, await pageResponse.clone().text())
         const relative = path
-          .relative(path.join(config.outPath, 'public'), file)
+          .relative(path.join(config.outPath, 'static'), file)
           .split(path.sep)
           .join('/')
         manifest.staticFiles ??= {}
@@ -1091,12 +1097,12 @@ async function builtFileInfo(
   exactNames?: ExactNames,
 ): Promise<BuiltFileInfo | null> {
   const file = await firstFile(
-    path.join(outPath, 'public'),
+    path.join(outPath, 'static'),
     builtFileCandidates(outPath, pathname, nextStaticFallback),
     exactNames,
   )
   if (!file) return null
-  const publicPath = path.join(outPath, 'public')
+  const publicPath = path.join(outPath, 'static')
   const fileStat = await stat(file)
   const relative = path.relative(publicPath, file).split(path.sep).join('/')
   return { file, relative, mtimeMs: fileStat.mtimeMs, metadata: staticFiles[relative] }
@@ -1110,7 +1116,7 @@ function builtFileCandidates(
   pathname: string,
   nextStaticFallback = false,
 ): string[] {
-  const publicPath = path.join(outPath, 'public')
+  const publicPath = path.join(outPath, 'static')
   const trimmed = pathname.replace(/^\/+/, '')
   if (pathname === '/') return [path.join(publicPath, 'index.html')]
   const candidates = [
@@ -1142,7 +1148,7 @@ function builtFileCandidates(
 // Where a lazily generated page for `pathname` is persisted (mirrors the
 // build's staticHtmlPath); null when the path would escape public/.
 function lazyStaticHtmlPath(outPath: string, pathname: string): string | null {
-  const publicPath = path.join(outPath, 'public')
+  const publicPath = path.join(outPath, 'static')
   const file =
     pathname === '/'
       ? path.join(publicPath, 'index.html')
@@ -1154,7 +1160,7 @@ function lazyStaticHtmlPath(outPath: string, pathname: string): string | null {
 
 function lazyStaticHandlerPath(outPath: string, pathname: string): string | null {
   if (pathname === '/') return null
-  const publicPath = path.join(outPath, 'public')
+  const publicPath = path.join(outPath, 'static')
   const file = path.join(publicPath, pathname.replace(/^\/+|\/+$/g, ''))
   const relative = path.relative(publicPath, file)
   if (relative.startsWith('..') || path.isAbsolute(relative)) return null
@@ -1224,7 +1230,7 @@ export async function maybeBuiltFile(
   const normalizedMethod = method.toUpperCase()
   if (normalizedMethod !== 'GET' && normalizedMethod !== 'HEAD') return null
 
-  const publicPath = path.join(outPath, 'public')
+  const publicPath = path.join(outPath, 'static')
   const file = await firstFile(
     publicPath,
     builtFileCandidates(outPath, pathname, nextStaticFallback),

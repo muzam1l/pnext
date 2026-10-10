@@ -26,7 +26,7 @@ import { flushDevModuleCaches } from '../runtime/module-cache'
 import { scanFactsStats } from '../resolve/scan-facts'
 import { clientEntryName } from '../client/chunk-name'
 import { compiledClientReferenceFiles } from '../client/reference'
-import { buildIndexFile } from '../runtime/production'
+import { buildIndexFile, buildManifestFile } from '../runtime/production'
 import { registerServerRuntime, serverBundleTargetForRuntime } from '../runtime/loader'
 import {
   buildGlobalCss,
@@ -94,7 +94,7 @@ import {
 import { interceptionMarkerLevels } from '../routing/slots'
 import { writeTypegen } from './typegen'
 import { lookupBuildCache, writeBuildCache } from './build/cache'
-import { emitServerEntry } from './serve/entry'
+import { startStandalone, writeStandalone } from './serve/standalone'
 import { immutableAssetPath } from './serve/immutable'
 import { createVerboseLogger, type VerboseLogger } from '../utils/verbose'
 import { bold, cyan, dim, green } from '../utils/ansi'
@@ -231,12 +231,14 @@ async function runBuild(
   const warmMode = options.adapter === 'vercel' ? 'full' : 'compile'
   const warm = startWarmChild(config, warmMode)
   lifecycle.warm = warm
+  // The framework's half of the standalone trace needs no build output; it overlaps the bundling.
+  const standalone = startStandalone(config)
   const publicFiles = await log.step('prepare output directory', async () => {
     // Build-owned outputs only: `<outRoot>/dev` belongs to a possibly-running
     // dev server and must survive.
     // Materialized pages sources too: this build's config already resolved into them.
-    await ensureEmptyDir(config.outPath, [devOutSegment, 'pnext-pages-compat'])
-    return copyPublicDir(config.publicPath, path.join(config.outPath, 'public'))
+    await ensureEmptyDir(config.outRootPath, [devOutSegment, 'pnext-pages-compat'])
+    return copyPublicDir(config.publicPath, path.join(config.outPath, 'static'))
   })
   // The document-level stylesheets run their postcss/Tailwind pass on the CSS
   // worker, so they overlap with the route scan below instead of serializing
@@ -411,7 +413,7 @@ async function runBuild(
       buildClientEntries({
         config,
         routes: clientRoutes,
-        outDir: path.join(config.outPath, 'public', 'assets'),
+        outDir: path.join(config.outPath, 'static', 'assets'),
         verbose,
         hasServerActions: actionSources.length > 0,
         pipeline: clientSources,
@@ -449,7 +451,7 @@ async function runBuild(
   // Standalone static chunks (compat: the no-module polyfills chunk) live
   // outside the esbuild entry graph, so emit them regardless of whether any
   // route produced a client bundle.
-  await emitStaticClientChunks(config, path.join(config.outPath, 'public', 'assets'))
+  await emitStaticClientChunks(config, path.join(config.outPath, 'static', 'assets'))
   // All three source consumers have run by here; the split says how much of the
   // app was read once and shared rather than read per consumer.
   if (verbose) {
@@ -787,7 +789,7 @@ async function runBuild(
               html: rendered.value.html,
               status: rendered.value.status,
             })
-            const relative = toPosixPath(path.relative(path.join(config.outPath, 'public'), file))
+            const relative = toPosixPath(path.relative(path.join(config.outPath, 'static'), file))
             const revalidateSeconds = combineRevalidate(
               segmentConfig?.revalidate,
               rendered.revalidateSeconds,
@@ -951,30 +953,25 @@ async function runBuild(
   }
   await writeBuildManifest(config.outPath, manifest)
   log.log(`wrote manifest.json (${routes.length} route${routes.length === 1 ? '' : 's'})`)
-  await log.step('server entry', () => emitServerEntry(config.outPath))
   for (const hook of getBuildExtensions().completeHooks) {
     await hook({ config, manifest, log })
   }
-  if (options.adapter === 'vercel')
-    await log.step('vercel adapter output', () =>
-      writeVercelOutput(config, manifest, { verbose, warm }),
-    )
-  // Plain build: the adapter owns the child in the branch above. Compiling the
-  // rest of the app's modules is build work, so it counts toward the build's own
+  // Compiling the rest of the app's modules is build work, so it counts toward the build's own
   // duration rather than hiding after it.
-  else {
-    await log.step('warm module cache', () =>
-      warm.finish(log, undefined, {
-        globalCss: globalCssSources(config),
-        clientReferences: [...compiledClientReferenceFiles()],
-      }),
-    )
-  }
+  await log.step('warm module cache', () =>
+    warm.finish(log, undefined, {
+      globalCss: globalCssSources(config),
+      clientReferences: [...compiledClientReferenceFiles()],
+    }),
+  )
   // The release names every module production imports; a server compile that did not finish
   // fails the build here rather than a request later.
   if (!existsSync(buildIndexFile(config.outPath))) {
     throw new Error('pnext build: the server compile did not complete (see the error above).')
   }
+  await log.step('standalone output', () => writeStandalone(config, standalone))
+  if (options.adapter === 'vercel')
+    await log.step('vercel adapter output', () => writeVercelOutput(config, manifest, { verbose }))
 
   // Also cover module loads performed by completion hooks or the warm pass.
   throwIfModuleGraphFailed()
@@ -1079,8 +1076,9 @@ function interceptionDisplayRoute(route: RouteManifestEntry, filled?: string): s
 
 async function writeBuildManifest(outPath: string, manifest: BuildManifest) {
   assertManifestServerArtifacts(outPath, manifest)
-  const file = path.join(outPath, 'manifest.json')
-  const temporary = path.join(outPath, `.manifest-${process.pid}.tmp`)
+  const file = buildManifestFile(outPath)
+  const temporary = `${file}.${process.pid}.tmp`
+  await mkdir(path.dirname(file), { recursive: true })
   await writeFile(temporary, serializeBuildManifest(manifest))
   await rename(temporary, file)
 }
@@ -1090,9 +1088,11 @@ function assertManifestServerArtifacts(outPath: string, manifest: BuildManifest)
     ...(manifest.proxyModule ? [manifest.proxyModule] : []),
     ...(manifest.actions?.map(action => action.modulePath) ?? []),
   ]
+  // Compiled artifacts still sit in the build cache beside the release until writeStandalone moves them.
+  const outRoot = path.dirname(outPath)
   for (const artifact of artifacts) {
     const file = path.resolve(outPath, artifact)
-    if (file !== outPath && !file.startsWith(`${outPath}${path.sep}`)) {
+    if (!file.startsWith(`${outRoot}${path.sep}`)) {
       throw new Error(`Build manifest server artifact escapes output directory: ${artifact}`)
     }
     if (!existsSync(file)) {
@@ -2256,7 +2256,7 @@ async function renderNotFoundDocuments({
 
   if (await shouldBuildGlobalNotFound(config)) {
     await log.step('global not-found', async () =>
-      writeText(path.join(config.outPath, 'public', '404.html'), await render()),
+      writeText(path.join(config.outPath, 'static', '404.html'), await render()),
     )
   }
   // Next always prerenders the built-in `/_not-found` document for a compat
@@ -2264,7 +2264,7 @@ async function renderNotFoundDocuments({
   // `.next/server/app/_not-found.html`). When public/404.html was written, the
   // .next artifacts are copied from it; otherwise they need a document here.
   if (!config.compat?.next) return undefined
-  if (existsSync(path.join(config.outPath, 'public', '404.html'))) return undefined
+  if (existsSync(path.join(config.outPath, 'static', '404.html'))) return undefined
   // Nothing prerenderable to render into the document: either the app authored no not-found.* at
   // all, or it authored one and declared it force-dynamic, in which case Next leaves `/_not-found`
   // dynamic and prerenders no custom 404 either. Emit the standalone default rather than boot the
@@ -2322,7 +2322,7 @@ async function emitNextNotFoundArtifacts(
   fallback404?: string,
 ) {
   if (!config.compat?.next) return
-  const source = path.join(config.outPath, 'public', '404.html')
+  const source = path.join(config.outPath, 'static', '404.html')
   const html = existsSync(source) ? readFileSync(source, 'utf8') : fallback404
   if (html === undefined) return
 
@@ -2539,7 +2539,7 @@ async function buildStaticRouteHandler(
     if (rendered.noStore && !staticRouteHandlerExplicitlyCached(route)) continue
     const body = await settleBeforeNextTask(response.clone().arrayBuffer())
     if (!body) continue
-    const relative = toPosixPath(path.relative(path.join(config.outPath, 'public'), file))
+    const relative = toPosixPath(path.relative(path.join(config.outPath, 'static'), file))
     // Descendant handlers record their manifest entry (so the synthesized
     // prerender-manifest lists them) but skip the on-disk copy that would
     // collide with the ancestor's file; they serve dynamically at runtime.
@@ -2858,7 +2858,7 @@ async function copyStaticMetadataFiles(
 }
 
 export function staticHtmlPath(outPath: string, routePath: string, flatLayout = false) {
-  if (routePath === '/') return path.join(outPath, 'public', 'index.html')
+  if (routePath === '/') return path.join(outPath, 'static', 'index.html')
   const normalized = routePath.replace(/^\/|\/$/g, '')
   // output:'export' with trailingSlash:false lays pages out flat (`/a.html`);
   // otherwise (and always for trailingSlash:true) each page gets its own dir
@@ -2957,7 +2957,7 @@ function staticRouteHandlerPath(outPath: string, routePath: string) {
  * route serves dynamically (start's static lookup only matches real files, then falls through).
  */
 function staticOutputCollision(outPath: string, file: string): string | null {
-  const publicPath = path.join(outPath, 'public')
+  const publicPath = path.join(outPath, 'static')
   if (existsSync(file) && statSync(file).isDirectory()) {
     return `${toPosixPath(path.relative(publicPath, file))} already exists as a directory`
   }
@@ -3177,7 +3177,7 @@ function realFilePath(file: string): string {
 }
 
 function safePublicPath(outPath: string, ...segments: string[]) {
-  const publicPath = path.join(outPath, 'public')
+  const publicPath = path.join(outPath, 'static')
   const file = path.join(publicPath, ...segments)
   const relative = path.relative(publicPath, file)
   if (relative.startsWith('..') || path.isAbsolute(relative)) {
@@ -3204,7 +3204,7 @@ async function copyPartytownLib(config: Awaited<ReturnType<typeof loadConfig>>) 
     )
     return
   }
-  const target = path.join(config.outPath, 'public', '_next', 'static', '~partytown')
+  const target = path.join(config.outPath, 'static', '_next', 'static', '~partytown')
   await mkdir(target, { recursive: true })
   await copyPublicDir(libDir, target)
 }

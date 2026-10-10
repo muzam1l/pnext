@@ -805,7 +805,7 @@ async function emitFontBytes(
   // Served from `/_next/static/media/` — files under the out dir's public/ map 1:1 to the URL path,
   // which is the only place dev and build both look them up.
   const mediaSegments = ['_next', 'static', 'media']
-  const outDir = path.join(context.config.outPath, 'public', ...mediaSegments)
+  const outDir = path.join(context.config.outPath, 'static', ...mediaSegments)
   const file = path.join(outDir, filename)
   const asset = {
     ext,

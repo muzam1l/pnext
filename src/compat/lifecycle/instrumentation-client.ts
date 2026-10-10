@@ -23,6 +23,7 @@ import { build } from '../../utils/esbuild'
 import type { ResolvedConfig } from '../../config'
 import { getNextConfig } from '../next/config-loader'
 import { instrumentationLookupRoots } from './instrumentation'
+import { outCachePath } from '../../out-paths'
 
 const CLIENT_BASENAMES = [
   'instrumentation-client.ts',
@@ -90,10 +91,10 @@ export async function buildInstrumentationClient(config: ResolvedConfig): Promis
   const userFile = findInstrumentationClient(config)
   if (!userFile) return
   const modules = [...injectEntries(config), userFile]
-  const workDir = path.join(config.outPath, 'cache', 'instrumentation-client')
+  const workDir = path.join(outCachePath(config.outPath), 'instrumentation-client')
   mkdirSync(workDir, { recursive: true })
   const entryFile = path.join(workDir, 'entry.ts')
-  const outfile = path.join(config.outPath, 'public', INSTRUMENTATION_CLIENT_ASSET)
+  const outfile = path.join(config.outPath, 'static', INSTRUMENTATION_CLIENT_ASSET)
   mkdirSync(path.dirname(outfile), { recursive: true })
   await Bun.write(entryFile, entrySource(modules))
   const tsconfig = path.join(config.root, 'tsconfig.json')
@@ -116,7 +117,7 @@ let bundlePresence: boolean | undefined
 
 /** Whether the built instrumentation-client bundle exists (cached). */
 function hasInstrumentationClientBundle(config: ResolvedConfig): boolean {
-  bundlePresence ??= existsSync(path.join(config.outPath, 'public', INSTRUMENTATION_CLIENT_ASSET))
+  bundlePresence ??= existsSync(path.join(config.outPath, 'static', INSTRUMENTATION_CLIENT_ASSET))
   return bundlePresence
 }
 

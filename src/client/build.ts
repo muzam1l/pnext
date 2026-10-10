@@ -1438,7 +1438,7 @@ async function staticImageModuleSource(config: ResolvedConfig, file: string) {
   const compat = await getAssetExtensions().staticAssetModule({ sourcePath, bytes, emit })
   const source = compat ?? coreStaticAssetModule(sourcePath, bytes, emit)
   for (const relative of emitted) {
-    const target = path.join(config.outPath, 'public', ...relative.split('/'))
+    const target = path.join(config.outPath, 'static', ...relative.split('/'))
     await mkdir(path.dirname(target), { recursive: true })
     if (!existsSync(target)) await copyFile(sourcePath, target)
   }

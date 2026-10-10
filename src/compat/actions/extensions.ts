@@ -70,6 +70,7 @@ import { serverActionId, tagServerAction } from './server-tag'
 import { opensWithUseServerDirective } from './detect'
 import { inlineActionModuleKey, isInlineActionId } from './rewrite'
 import { reportActionErrorToUser } from '../lifecycle/error-funnel'
+import { buildManifestFile } from '../../runtime/production'
 
 // ---------------------------------------------------------------------------
 // Build step: action discovery/bundling + server-reference manifest.
@@ -541,7 +542,7 @@ export async function ensureActionsRegistered(runtime: RequestRuntime): Promise<
 // client-action module set (normally armed by the build): render-time form/prop
 // tagging reads it to give module-level actions their stable wire ids.
 async function registerManifestActions(config: ResolvedConfig): Promise<void> {
-  const manifestPath = path.join(config.outPath, 'manifest.json')
+  const manifestPath = buildManifestFile(config.outPath)
   let manifest: BuildManifest
   try {
     manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as BuildManifest
@@ -700,7 +701,7 @@ function requestWouldMiss(config: ResolvedConfig, pathname: string): boolean {
 }
 
 function servableFile(config: ResolvedConfig, pathname: string): boolean {
-  const publicRoot = path.join(config.outPath, 'public')
+  const publicRoot = path.join(config.outPath, 'static')
   const trimmed = pathname.replace(/^\/+|\/+$/g, '')
   const file = trimmed ? path.join(publicRoot, trimmed) : publicRoot
   // Never let a traversal-shaped path claim to be servable (it is not).
