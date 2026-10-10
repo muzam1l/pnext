@@ -80,6 +80,9 @@ export function createExtensionHost(): ExtensionHost {
 }
 
 let activeHost = createExtensionHost()
+// Anchored for modules that must not import this one (api/server, shared by embedded hosts).
+const ANCHOR = Symbol.for('pnext.extensionHost')
+;(globalThis as Record<symbol, unknown>)[ANCHOR] ??= activeHost
 
 /** The host every accessor in this module reads. */
 export function getExtensionHost(): ExtensionHost {
@@ -148,6 +151,7 @@ export function withExtensionHost<T>(host: ExtensionHost, callback: () => T): T 
 }
 
 function announceHostChange() {
+  ;(globalThis as Record<symbol, unknown>)[ANCHOR] = activeHost
   for (const handler of resetHandlers) handler()
   // Consumers latch the loadable-extension set (the server load plugin's filter
   // regex); a swap changes it, so invalidate exactly as a registration would.

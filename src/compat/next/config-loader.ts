@@ -13,7 +13,15 @@
 // export / top-level await / dynamic import() and CJS+ESM authoring styles.
 // ---------------------------------------------------------------------------
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -43,6 +51,12 @@ const CONFIG_BASENAMES = [
 ]
 
 let store: NextConfigObject = {}
+let storeReleased = false
+
+/** Whether the stored config came from a production release, which no consumer may re-read from source. */
+export function nextConfigReleased(): boolean {
+  return storeReleased
+}
 
 /** The full loaded next.config object; empty until loadNextConfig runs. */
 export function getNextConfig(): NextConfigObject {
@@ -188,19 +202,104 @@ async function importConfigModule(
   return importConfigBundle(outfile, cjs)
 }
 
+/**
+ * Compile the app's next.config into `outDir`, plus the cache handlers it names, so a production server
+ * imports neither from source. Names carry a content hash: a rebuilt release never reuses the previous
+ * generation's module instance. Paths are relative to the bundle, so the release can move.
+ */
+export async function emitNextConfigBundle(root: string, outDir: string) {
+  const configPath = findConfigPath(root)
+  if (!configPath) return undefined
+  const cjs = cjsConfigFormat(configPath, root)
+  const [file, ...handlerFiles] = await Promise.all([
+    hashedOutput(outDir, 'next.config', cjs ? '.cjs' : '.mjs', outfile =>
+      bundleConfig({ configPath, root, outDir, outfile, cjs, relocatable: true }),
+    ),
+    ...cacheHandlerFiles(store).map(([name, source]) =>
+      hashedOutput(outDir, name, '.cjs', outfile =>
+        build({
+          entryPoints: [source],
+          outfile,
+          bundle: true,
+          platform: 'node',
+          format: 'cjs',
+          target: 'esnext',
+          packages: 'external',
+          logLevel: 'silent',
+        }),
+      ).then(output => [name, output] as const),
+    ),
+  ])
+  return { file, handlers: Object.fromEntries(handlerFiles as [string, string][]) }
+}
+
+/** Write through `emit` to a temporary name, then publish as `<name>.<content hash><ext>`. */
+async function hashedOutput(
+  outDir: string,
+  name: string,
+  ext: string,
+  emit: (outfile: string) => Promise<unknown>,
+) {
+  const temporary = path.join(outDir, `${name}.${process.pid}.tmp${ext}`)
+  await emit(temporary)
+  const hash = bun.hash(readFileSync(temporary)).toString(36)
+  const outfile = path.join(outDir, `${name}.${hash}${ext}`)
+  renameSync(temporary, outfile)
+  return outfile
+}
+
+/** The configured cache handler sources, by the name their release bundle takes. */
+function cacheHandlerFiles(config: NextConfigObject): [string, string][] {
+  const handlers = config.cacheHandlers as Record<string, unknown> | undefined
+  return [
+    ['cache-handler', config.cacheHandler],
+    [
+      'cache-handler-default',
+      handlers && typeof handlers === 'object' ? handlers.default : undefined,
+    ],
+  ].filter(
+    (entry): entry is [string, string] =>
+      typeof entry[1] === 'string' && path.isAbsolute(entry[1]) && existsSync(entry[1]),
+  )
+}
+
+/** Point a released config's cache handlers at the bundles its build emitted. */
+function releasedCacheHandlers(
+  config: NextConfigObject,
+  handlers: Record<string, string>,
+): NextConfigObject {
+  const handler = handlers['cache-handler']
+  const fallback = handlers['cache-handler-default']
+  return {
+    ...config,
+    ...(handler ? { cacheHandler: handler } : {}),
+    ...(fallback
+      ? { cacheHandlers: { ...(config.cacheHandlers as object), default: fallback } }
+      : {}),
+  }
+}
+
+const toPosix = (file: string) => file.split(path.sep).join('/')
+
 function bundleConfig({
   configPath,
   root,
   outDir,
   outfile,
   cjs,
+  relocatable = false,
 }: {
   configPath: string
   root: string
   outDir: string
   outfile: string
   cjs: boolean
+  /** A release bundle: locate the config from the bundle itself, never from the build machine's paths. */
+  relocatable?: boolean
 }) {
+  const configUrl = relocatable
+    ? `new URL(${JSON.stringify(toPosix(path.relative(outDir, configPath)))}, ${cjs ? '__pnextNodeRequire("node:url").pathToFileURL(__filename)' : 'import.meta.url'}).href`
+    : JSON.stringify(pathToFileURL(configPath).href)
   return build({
     entryPoints: [configPath],
     outfile,
@@ -220,12 +319,20 @@ function bundleConfig({
       ? {
           js:
             'var __pnextNodeRequire = module.require.bind(module);\n' +
-            `var require = __pnextNodeRequire("node:module").createRequire(${JSON.stringify(pathToFileURL(configPath).href)});`,
+            `var __pnextConfigUrl = ${configUrl};\n` +
+            'var __pnextConfigFile = __pnextNodeRequire("node:url").fileURLToPath(__pnextConfigUrl);\n' +
+            'var __pnextConfigDir = __pnextNodeRequire("node:path").dirname(__pnextConfigFile);\n' +
+            'var require = __pnextNodeRequire("node:module").createRequire(__pnextConfigUrl);',
         }
       : {
           js:
             'import { createRequire as __pnextCreateRequire } from "node:module";\n' +
-            `const require = __pnextCreateRequire(${JSON.stringify(pathToFileURL(configPath).href)});`,
+            'import { fileURLToPath as __pnextFileURLToPath } from "node:url";\n' +
+            'import { dirname as __pnextDirname } from "node:path";\n' +
+            `const __pnextConfigUrl = ${configUrl};\n` +
+            'const __pnextConfigFile = __pnextFileURLToPath(__pnextConfigUrl);\n' +
+            'const __pnextConfigDir = __pnextDirname(__pnextConfigFile);\n' +
+            'const require = __pnextCreateRequire(__pnextConfigUrl);',
         },
     // Relative/absolute imports (incl. .ts/.cts/.mts/.cjs/.mjs and tsconfig
     // `paths` aliases) are bundled in. esbuild reads `paths`/`extends` and
@@ -235,9 +342,9 @@ function bundleConfig({
     // import.meta.url in ESM configs (node-api-esm) must point at the config's
     // original location, not the emitted file under .pnext/config.
     define: {
-      __dirname: JSON.stringify(path.dirname(configPath)),
-      __filename: JSON.stringify(configPath),
-      'import.meta.url': JSON.stringify(pathToFileURL(configPath).href),
+      __dirname: '__pnextConfigDir',
+      __filename: '__pnextConfigFile',
+      'import.meta.url': '__pnextConfigUrl',
     },
     logLevel: 'silent',
     sourcemap: false,
@@ -647,20 +754,36 @@ function validateDevIndicatorPosition(config: NextConfigObject): void {
  */
 export async function loadNextConfig(
   root: string,
-  options: { dev?: boolean; serve?: boolean; warnings?: boolean } = {},
+  options: {
+    dev?: boolean
+    serve?: boolean
+    warnings?: boolean
+    bundle?: string | null
+    handlers?: Record<string, string>
+  } = {},
 ): Promise<LoadNextConfigResult> {
-  const configPath = findConfigPath(root)
+  // A production server names its compiled config, or null when the app had none.
+  storeReleased = options.bundle !== undefined
+  const configPath = options.bundle === undefined ? findConfigPath(root) : options.bundle
   if (!configPath) {
     setNextConfig({})
     emitSessionStartedTelemetry({})
     return { config: {}, overrides: {} }
   }
+  if (options.bundle && !existsSync(options.bundle)) {
+    // The release names this file; serving defaults in its place would drop headers, redirects and more.
+    throw new Error(
+      `pnext: the build's compiled next.config (${options.bundle}) is missing. Run 'pnext build' again.`,
+    )
+  }
   let exported: NextConfigExport
   try {
-    exported = await importConfigModule(configPath, root, {
-      dev: Boolean(options.dev),
-      serve: Boolean(options.serve),
-    })
+    exported = options.bundle
+      ? await importConfigBundle(options.bundle, options.bundle.endsWith('.cjs'))
+      : await importConfigModule(configPath, root, {
+          dev: Boolean(options.dev),
+          serve: Boolean(options.serve),
+        })
   } catch (error) {
     // A next.config that pulls in an optional wrapper dependency not installed
     // in this app (e.g. @next/mdx when deps are declared but not installed)
@@ -677,10 +800,11 @@ export async function loadNextConfig(
     }
     throw error
   }
-  const config = normalizeCacheHandlerPath(
+  const resolved = normalizeCacheHandlerPath(
     await resolveConfigExport(exported, Boolean(options.dev)),
     root,
   )
+  const config = options.bundle ? releasedCacheHandlers(resolved, options.handlers ?? {}) : resolved
   // Internal build workers need the resolved config but must not surface a
   // second copy of CLI warnings already emitted by the owning build process.
   validateConfig(config, configPath, options.warnings !== false)

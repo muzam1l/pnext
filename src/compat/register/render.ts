@@ -32,7 +32,7 @@ import {
   setStreamRouteExtensions,
   setSuspenseExtensions,
 } from '../../render/hooks'
-import { withAssetPrefix } from '../../css/build'
+import { withAssetPrefix } from '../../css/assets'
 import { polyfillsChunkPath } from '../bundler/polyfill'
 import { nextRouterShimScript } from '../react/router-shim'
 import { renderPartytownHeadScripts } from '../next/script'
@@ -43,6 +43,7 @@ import {
   fontPreloadDomScript,
   fontSizeAdjustMeta,
   prewarmFonts,
+  releaseFonts,
   runWithFontScope,
 } from '../next/font/runtime'
 import {
@@ -117,6 +118,7 @@ export function registerRenderExtensions(config: ResolvedConfig): void {
       runWithFontScope,
       collectFontAssets: fontAssets,
       prewarmFontAssets: prewarmFonts,
+      releaseFonts,
     })
     setDocumentScriptExtensions({
       documentBodyScripts: cfg =>

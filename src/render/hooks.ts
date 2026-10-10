@@ -66,12 +66,25 @@ export interface FontExtensions {
    * the same memo the render reads. Default: none.
    */
   prewarmFontAssets: (config: ResolvedConfig, options: { dev?: boolean }) => Promise<void>
+
+  /** Resolve every declared font for a release, keyed like the render looks them up. Default: none. */
+  releaseFonts: (config: ResolvedConfig) => Promise<Record<string, ReleasedFont>>
+}
+
+/** A font resolution as a release stores it; production serves it instead of resolving. */
+export interface ReleasedFont {
+  css: string
+  sizeAdjust: boolean
+  preloads: import('../types').MetadataLink[]
+  usesFonts: boolean
+  files: string[]
 }
 
 const fontExtensions: FontExtensions = {
   runWithFontScope: callback => callback(),
   collectFontAssets: () => Promise.resolve({ css: '', preloads: [] }),
   prewarmFontAssets: () => Promise.resolve(),
+  releaseFonts: () => Promise.resolve({}),
 }
 
 export function getFontExtensions(): FontExtensions {

@@ -26,27 +26,45 @@ import { resolveManifest } from '../../utils/fs'
  * go-ahead to finish the rest once the manifest is written.
  */
 import { existsSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { loadConfig, pathToFileHref, type ResolvedConfig } from '../../config'
+import { DEFAULT_OUT_DIR, loadConfig, pathToFileHref, type ResolvedConfig } from '../../config'
 import { bootstrapCompat } from '../../compat-bootstrap'
 import { compiledClientReferenceFiles, ssrClientReference } from '../../client/reference'
+import { hasUseClientDirective } from '../../client/reference-stub'
+import { globalCssSources } from '../../css/build'
 import {
   devClientModuleHref,
+  devModuleGraph,
   devServerModuleHref,
   setEmitCompiledSpecifiersManifest,
+  setReleaseCompile,
 } from '../../runtime/modules'
 import { getCompatModeExtensions } from '../../extensions'
-import { getFontExtensions } from '../../render/hooks'
+import { getFontExtensions, type ReleasedFont } from '../../render/hooks'
+import { beginSourceScope, readSourceSync } from '../../resolve/source-text'
+import { releasedProxy } from '../../routing/proxy-config'
 import { findConventionFiles, findLayouts } from '../../routing/routes'
 import {
-  prewarmServerTransforms,
+  pagesApiBundleTargetForRuntime,
   registerServerRuntime,
   serverBundleTargetForRuntime,
+  type ServerBundleTarget,
 } from '../../runtime/loader'
-import { cacheRoot } from '../../runtime/module-cache'
-import { listFiles } from '../../utils/fs'
+import {
+  BUILD_INDEX_VERSION,
+  type CompatRelease,
+  type ReleaseLayer,
+  captureConventions,
+  releaseModuleKey,
+  releaseSourceKey,
+  serializeReleaseConfig,
+  writeBuildIndex,
+} from '../../runtime/production'
+import { frameworkFingerprint } from '../../runtime/fingerprint'
+import { releaseDependencyLog } from '../../runtime/vendor-build'
+import { linkReleaseLayer, pruneReleaseVendor } from '../../runtime/release-graph'
 import { namedBunBinary } from '../boot/named-bin'
 import type { VerboseLogger } from '../../utils/verbose'
 import type { BuildManifest } from '../../types'
@@ -69,6 +87,11 @@ const COMPILED_MARKER = 'pnext-warm-compiled'
 interface WarmRequest {
   /** Files a previous attempt already finished — or died on. */
   skip: string[]
+  /** Release modules a previous attempt compiled, so the release this attempt writes is whole. */
+  compiled: Record<string, string>
+  /** Facts the parent already holds: the root layout's stylesheet closure and its own compiled client references. */
+  globalCss?: string[]
+  clientReferences: string[]
 }
 interface PrewarmRequest {
   /** Page route sources, known from the route scan long before the manifest. */
@@ -106,7 +129,11 @@ export interface WarmChild {
    * which is already the final set: the caller can start tracing the node_modules closure while the
    * child runs handlers concurrently.
    */
-  finish(log: VerboseLogger, onCompiled?: (modules: string[]) => void): Promise<string[]>
+  finish(
+    log: VerboseLogger,
+    onCompiled?: (modules: string[]) => void,
+    facts?: Pick<WarmRequest, 'globalCss' | 'clientReferences'>,
+  ): Promise<string[]>
   /** Stop every attempt owned by this build. Safe to call after `finish` or more than once. */
   kill(): void
 }
@@ -150,8 +177,8 @@ export function startWarmChild(config: ResolvedConfig, mode: WarmMode = 'full'):
         // broken pipe: the child is gone; `finish` reports why
       }
     },
-    finish: (log, onCompiled) =>
-      warmWithRestarts(first, spawn, mode, log, onCompiled).finally(kill),
+    finish: (log, onCompiled, facts = { clientReferences: [] }) =>
+      warmWithRestarts(first, spawn, mode, log, facts, onCompiled).finally(kill),
     kill,
   }
 }
@@ -191,10 +218,11 @@ async function warmWithRestarts(
   spawn: () => WarmProcess | undefined,
   mode: WarmMode,
   log: VerboseLogger,
+  facts: Pick<WarmRequest, 'globalCss' | 'clientReferences'>,
   onCompiled?: (modules: string[]) => void,
 ) {
-  // Source file -> compiled artifact. Handlers map to nothing but still count as
-  // finished, so a restart does not import them a second time.
+  // Release module key (or a handler's source file) -> compiled artifact. Handlers map to nothing
+  // but still count as finished, so a restart does not import them a second time.
   const finished = new Map<string, string | undefined>()
   const compiled = () => [...finished.values()].filter((file): file is string => Boolean(file))
   // The marker can only mean "compiled set final" the first time it fires —
@@ -212,7 +240,13 @@ async function warmWithRestarts(
     const before = finished.size
     const failure = await runAttempt(
       child,
-      { skip: [...finished.keys()] },
+      {
+        skip: [...finished.keys()],
+        compiled: Object.fromEntries(
+          [...finished].filter((entry): entry is [string, string] => Boolean(entry[1])),
+        ),
+        ...facts,
+      },
       finished,
       fireOnCompiled,
     )
@@ -317,8 +351,87 @@ function pageServerFiles(config: ResolvedConfig, routeFiles: Iterable<string>) {
   return files
 }
 
-const compileServer = (config: ResolvedConfig, file: string) =>
-  devServerModuleHref(config, file, 'build').then(href => report(file, fileURLToPath(href)))
+interface ReleaseEntry {
+  layer: ReleaseLayer
+  target: ServerBundleTarget
+  file: string
+}
+
+/** Compile one release module, reporting it under its release key. */
+async function compileEntry(
+  config: ResolvedConfig,
+  entry: ReleaseEntry,
+  compiled: Map<string, string>,
+) {
+  const href =
+    entry.layer === 'client'
+      ? await devClientModuleHref(config, entry.file, 'build', entry.target)
+      : await devServerModuleHref(config, entry.file, 'build', { conditionTarget: entry.target })
+  const key = releaseModuleKey(entry.layer, entry.target, entry.file)
+  compiled.set(key, fileURLToPath(href))
+  report(key, fileURLToPath(href))
+}
+
+/**
+ * Every module a production server can import, by layer and target: each convention file of the app
+ * tree, each handler, and each client reference the render marks or SSRs.
+ */
+function releaseEntries(
+  config: ResolvedConfig,
+  routes: BuildManifest['routes'],
+  conventionFiles: string[],
+  clientReferences: Iterable<string>,
+) {
+  const compat = getCompatModeExtensions().reactEnabled(config)
+  const entries = new Map<string, ReleaseEntry>()
+  const add = (layer: ReleaseLayer, target: ServerBundleTarget, file: string) =>
+    entries.set(releaseModuleKey(layer, target, file), { layer, target, file })
+  const addConvention = (target: ServerBundleTarget, file: string) => {
+    add('server', target, file)
+    if (compat && hasUseClientDirective(readSourceSync(file))) add('client', target, file)
+  }
+  const pageFiles = conventionFiles.filter(file => !path.basename(file).startsWith('route.'))
+  for (const file of pageFiles) addConvention('server', file)
+  const targets = new Set<ServerBundleTarget>(['server'])
+  for (const route of routes) {
+    const target = serverBundleTargetForRuntime(route.segmentConfig?.runtime)
+    targets.add(target)
+    if (route.kind === 'handler') {
+      add('server', target, route.file)
+      continue
+    }
+    if (target !== 'server') {
+      const dirs = [path.dirname(route.file), ...(route.slotDirs ?? [])]
+      for (const file of pageFiles) {
+        const dir = path.dirname(file)
+        if (dirs.some(owner => isInsideDir(dir, owner) || isInsideDir(owner, dir))) {
+          addConvention(target, file)
+        }
+      }
+    }
+    if (compat && route.client && existsSync(route.file)) add('client', target, route.file)
+    // Inline actions recover cold by importing their owning module by source key, helpers included.
+    if (compat) {
+      for (const file of route.sourceFiles) {
+        if (/\.[cm]?[jt]sx?$/.test(file) && readSourceSync(file).includes('use server')) {
+          add('server', 'server', file)
+          add('server', target, file)
+        }
+      }
+    }
+    for (const reference of route.clientReferences) {
+      if (ssrClientReference(reference)) add(compat ? 'client' : 'server', target, reference.file)
+    }
+  }
+  if (compat) {
+    for (const file of clientReferences) for (const target of targets) add('client', target, file)
+  }
+  return [...entries.values()]
+}
+
+function isInsideDir(dir: string, file: string) {
+  return file === dir || file.startsWith(`${dir}${path.sep}`)
+}
 
 /**
  * Compile the page routes' server modules from the build's route scan, long before the manifest
@@ -326,29 +439,49 @@ const compileServer = (config: ResolvedConfig, file: string) =>
  * pass below - the point is to spend this CPU under the build's client stage. Nothing here runs app
  * code, so it is safe to overlap (see the handler note below).
  */
-export async function prewarmPageModules(config: ResolvedConfig, routeFiles: string[]) {
-  if (!getCompatModeExtensions().reactEnabled(config)) return
+export async function prewarmPageModules(
+  config: ResolvedConfig,
+  routeFiles: string[],
+  compiled = new Map<string, string>(),
+) {
+  const { files } = captureConventions(config.root, config.appPath)
+  const entries = [
+    ...new Set([...files.filter(file => !path.basename(file).startsWith('route.')), ...routeFiles]),
+  ].filter(file => existsSync(file))
+  const compile = (layer: ReleaseLayer, file: string) =>
+    compileEntry(config, { layer, target: 'server', file }, compiled).catch(() => undefined)
+  await Promise.all(entries.map(file => compile('server', file)))
+  // The client components those entries reach are core's client references: publish them now, under
+  // the build, rather than after the manifest. Compat's client layer stays after the build's own
+  // prerender, whose vendor plan it must share.
+  if (getCompatModeExtensions().reactEnabled(config)) return
+  const graph = devModuleGraph(config)
+  const sources = await graph.graphSources(entries).catch(() => [])
   await Promise.all(
-    [...pageServerFiles(config, routeFiles)].map(file =>
-      compileServer(config, file).catch(() => undefined),
-    ),
+    sources.map(async ([file]) => {
+      if (/\.[cm]?[jt]sx?$/.test(file) && (await graph.isClientSource(file))) {
+        await compile('server', file)
+      }
+    }),
   )
 }
 
 /**
- * The warm pass itself, in the child. Reports every file it finishes as it
- * lands, so a parent restart can step over one that takes the process down.
+ * The warm pass itself, in the child. Compiles every release module, reporting each as it lands so a
+ * parent restart can step over one that takes the process down, then publishes the build index.
  */
 export async function warmRouteModules(
   config: ResolvedConfig,
   manifest: BuildManifest,
-  skip: ReadonlySet<string> = new Set(),
+  request: Pick<WarmRequest, 'skip' | 'compiled' | 'globalCss' | 'clientReferences'>,
   mode: WarmMode = 'full',
+  compiled = new Map<string, string>(),
 ) {
+  const skip = new Set(request.skip)
+  for (const [key, artifact] of Object.entries(request.compiled)) compiled.set(key, artifact)
   const clientFiles = new Set<string>()
   const handlers: BuildManifest['routes'] = []
   const pages: BuildManifest['routes'] = []
-  const pageRoutes: string[] = []
 
   for (const route of manifest.routes) {
     if (route.kind === 'handler') {
@@ -356,7 +489,6 @@ export async function warmRouteModules(
       continue
     }
     pages.push(route)
-    pageRoutes.push(route.file)
     for (const reference of route.clientReferences) {
       if (ssrClientReference(reference) && existsSync(reference.file)) {
         clientFiles.add(reference.file)
@@ -364,41 +496,61 @@ export async function warmRouteModules(
     }
   }
 
-  // Without react compat the runtime imports page sources directly (Bun
-  // transforms in memory); the compiled build cache is only used with compat.
-  if (getCompatModeExtensions().reactEnabled(config)) {
-    await Promise.all([
-      ...[...pageServerFiles(config, pageRoutes)]
-        .filter(file => !skip.has(file))
-        .map(file => compileServer(config, file)),
-      ...[...clientFiles]
-        .filter(file => !skip.has(file))
-        .map(file =>
-          devClientModuleHref(config, file, 'build').then(href =>
-            report(file, fileURLToPath(href)),
-          ),
-        ),
-      // Handler artifacts are otherwise only written by the import below, which
-      // `compile` mode does not run: compiling them here is what keeps a handler
-      // route's first served request off the compile pipeline too.
-      ...(mode === 'compile'
-        ? handlers.map(async route => {
-            registerServerRuntime(config, route.sourceFiles)
-            report(route.file, fileURLToPath(await handlerModuleHref(config, route)))
-          })
-        : []),
-    ])
+  const { conventions, files } = captureConventions(config.root, config.appPath)
+  const serverDir = path.join(config.outPath, 'server')
+  await mkdir(serverDir, { recursive: true })
+  // Compat's release facts (compiled config, handlers, instrumentation) build beside the module compile.
+  const compat = config.compat?.next
+    ? import('../../compat/release').then(release => release.compatReleaseFacts(config, serverDir))
+    : Promise.resolve(undefined)
+  compat.catch(() => undefined)
+  const compileAll = (entries: ReleaseEntry[]) =>
+    Promise.all(
+      entries
+        .filter(entry => !compiled.has(releaseModuleKey(entry.layer, entry.target, entry.file)))
+        .map(entry => compileEntry(config, entry, compiled)),
+    )
+  await compileAll(releaseEntries(config, manifest.routes, files, request.clientReferences))
+  // Client references only a server compile discovers (a 'use client' module inside a package).
+  await compileAll(releaseEntries(config, manifest.routes, files, compiledClientReferenceFiles()))
+  const compatFacts = await compat
+  await compileAll(
+    Object.entries(compatFacts?.compat?.pagesApi ?? {}).map(([file, runtime]) => ({
+      layer: 'server',
+      target: pagesApiBundleTargetForRuntime(runtime),
+      file: path.resolve(config.root, file),
+    })),
+  )
+  const fonts = await releaseFonts(config, manifest.routes, compiled)
+  // One graph per App Router layer for the server dependencies the release imports.
+  const layerSources = new Map<string, string>()
+  const rsc = await linkReleaseLayer(config, 'server:server', [...compiled.values()], layerSources)
+  // The server graph can reach a package's 'use client' file no compile saw.
+  await compileAll(releaseEntries(config, manifest.routes, files, compiledClientReferenceFiles()))
+  const ssr = await linkReleaseLayer(config, 'client:client', [...compiled.values()], layerSources)
+  for (const [key, artifact] of compiled) {
+    const layer = key.startsWith('server:server:')
+      ? rsc
+      : key.startsWith('client:server:')
+        ? ssr
+        : undefined
+    const moved = layer?.moved.get(artifact)
+    if (moved) compiled.set(key, moved)
   }
+  if (rsc || ssr) await pruneReleaseVendor(config, layerSources)
+  await rm(releaseDependencyLog(config), { force: true })
+  await writeRelease(
+    config,
+    compiled,
+    conventions,
+    files,
+    compatFacts ?? {},
+    fonts,
+    [...(rsc?.files ?? []), ...(ssr?.files ?? [])],
+    request.globalCss,
+  )
   console.log(COMPILED_MARKER)
-  if (mode === 'compile') {
-    // Transform is the tail of the compile pipeline: an artifact is transformed when it is first
-    // imported, so a server that skipped every compile would still start esbuild for this alone.
-    // The import pass below covers it in `full` mode; here it runs standalone, without app code.
-    for (const route of [...pages, ...handlers]) registerServerRuntime(config, route.sourceFiles)
-    const modules = cacheRoot(config.outPath)
-    await prewarmServerTransforms(modules, await listFiles(modules))
-    return
-  }
+  if (mode === 'compile') return
   // Everything below runs the app's own code to capture what only an import
   // writes (vendor bundles, next/font bytes). A normal build serves from a
   // writable disk and creates those on demand; only a read-only deployment
@@ -507,10 +659,100 @@ async function importPageModules(
 }
 
 /**
+ * Resolve the app's next/font declarations for the release. A declaration only exists once its module
+ * evaluates, so the modules that call a font loader are imported here, as `next build` does.
+ */
+async function releaseFonts(
+  config: ResolvedConfig,
+  routes: BuildManifest['routes'],
+  compiled: Map<string, string>,
+) {
+  if (!config.compat?.next) return undefined
+  const files = new Set(
+    routes
+      .flatMap(route => route.sourceFiles)
+      .filter(file => /\.(?:[cm]?[jt]sx?|mdx?)$/.test(file))
+      .filter(file => readSourceSync(file).includes('next/font/')),
+  )
+  if (files.size === 0) return undefined
+  for (const file of files) {
+    const entry = { layer: 'server', target: 'server', file } as const
+    await compileEntry(config, entry, compiled)
+    try {
+      await import(pathToFileHref(compiled.get(releaseModuleKey('server', 'server', file))!))
+    } catch (error) {
+      console.warn(`pnext build: importing ${file} for its fonts failed:`, error)
+    }
+  }
+  const fonts = await getFontExtensions().releaseFonts(config)
+  return Object.fromEntries(
+    Object.entries(fonts).map(([key, font]) => [
+      key,
+      { ...font, files: font.files.map(file => path.relative(config.outPath, file)) },
+    ]),
+  )
+}
+
+/** Publish the build index: every compiled module plus the source facts production reads instead of source. */
+async function writeRelease(
+  config: ResolvedConfig,
+  compiled: ReadonlyMap<string, string>,
+  conventions: Record<string, string[]>,
+  conventionFiles: string[],
+  compat: CompatRelease,
+  fonts: Record<string, ReleasedFont> | undefined,
+  dependencies: string[],
+  globalCss = globalCssSources(config),
+) {
+  const toPosix = (file: string) => file.split(path.sep).join('/')
+  const fromRoot = (file: string) => toPosix(path.relative(config.root, file))
+  const modules: Record<string, string> = {}
+  // Sorted: compiles land in completion order, and an unchanged build must publish identical bytes.
+  for (const [key, artifact] of [...compiled].sort(([a], [b]) => (a < b ? -1 : 1))) {
+    const match = /^((?:server|client):[^:]+:)(.*)$/s.exec(key)
+    if (!match) continue
+    modules[`${match[1]}${releaseSourceKey(match[2]!, config.root, config.workspaceRoot)}`] =
+      toPosix(path.relative(config.outPath, artifact))
+  }
+  const source = (file: string) => readSourceSync(file)
+  const proxy = releasedProxy(config)
+  await writeBuildIndex(
+    config,
+    {
+      version: BUILD_INDEX_VERSION,
+      framework: frameworkFingerprint(),
+      config: serializeReleaseConfig(config),
+      ...compat,
+      modules,
+      conventions,
+      clientConventions: conventionFiles
+        .filter(file => hasUseClientDirective(source(file)))
+        .map(fromRoot),
+      documentLayouts: conventionFiles
+        .filter(
+          file =>
+            path.basename(file).startsWith('layout.') && /\bexport\s+default\b/.test(source(file)),
+        )
+        .map(fromRoot),
+      globalCss: globalCss.map(fromRoot),
+      ...(proxy ? { proxy: { ...proxy, file: fromRoot(proxy.file) } } : {}),
+      ...(fonts ? { fonts } : {}),
+      ...(dependencies.length > 0
+        ? { dependencies: dependencies.map(file => toPosix(path.relative(config.outPath, file))) }
+        : {}),
+    },
+    DEFAULT_OUT_DIR,
+  )
+}
+
+/**
  * Read the parent's line-delimited requests until the `skip` message, running
  * each prewarm batch as it arrives. Returns the final request.
  */
-async function readWarmRequests(config: ResolvedConfig): Promise<Partial<WarmRequest>> {
+async function readWarmRequests(
+  config: ResolvedConfig,
+  prewarmed: Map<string, string>,
+): Promise<Partial<WarmRequest>> {
   let buffer = ''
   const decoder = new TextDecoder()
   const reader = Bun.stdin.stream().getReader()
@@ -525,7 +767,7 @@ async function readWarmRequests(config: ResolvedConfig): Promise<Partial<WarmReq
       if (!line) continue
       const message = JSON.parse(line) as Partial<WarmRequest & PrewarmRequest>
       if (message.skip) return message
-      if (message.prewarm) await prewarmPageModules(config, message.prewarm)
+      if (message.prewarm) await prewarmPageModules(config, message.prewarm, prewarmed)
     }
   }
   const rest = buffer.trim()
@@ -542,9 +784,15 @@ if (import.meta.main) {
   // Only the vercel adapter reads the specifier manifests back (its trace step);
   // a plain build would write them for nothing.
   setEmitCompiledSpecifiersManifest(mode === 'full')
+  setReleaseCompile(true)
+  // Idle until the route scan arrives: read the framework generation every compile keys on now.
+  frameworkFingerprint()
+  // One read per source for the child's life: its release facts re-read what the compile read.
+  beginSourceScope()
   // Blocks until the parent sends the go-ahead, i.e. until the manifest is
   // written; a prewarm batch may arrive and run before that.
-  const request = await readWarmRequests(config)
+  const prewarmed = new Map<string, string>()
+  const request = await readWarmRequests(config, prewarmed)
   // A build that fails closes stdin without a go-ahead and never writes the manifest. There is
   // nothing to warm and nothing to report: exiting quietly keeps the failed build's own error the
   // only thing on stderr.
@@ -555,7 +803,13 @@ if (import.meta.main) {
     config.outPath,
     config.root,
   )
-  await warmRouteModules(config, manifest, new Set(request.skip ?? []), mode)
+  await warmRouteModules(
+    config,
+    manifest,
+    { skip: [], compiled: {}, clientReferences: [], ...request },
+    mode,
+    prewarmed,
+  )
   // App code reached through a route handler can leave the loop alive (a db
   // pool, a stray interval); the warm pass is done either way.
   process.exit(0)

@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { nextCompatEnabled } from '../compat/aliases'
+import { productionRelease } from '../runtime/production'
 import type { ResolvedConfig } from '../config'
 import type { ResponseFinalizer, ResponseFinalizerContext } from '../extensions'
 import { getNextConfig } from './next/config-loader'
@@ -31,7 +32,7 @@ export function cacheControlFinalizers(config: ResolvedConfig): ResponseFinalize
     rules ??= loadCompatHeaders(config.root)
     applyConfigHeaders(ctx, await rules, config.basePath)
     applyPoweredByHeader(ctx)
-    pagesRevalidateRules ??= loadPagesRevalidateRules(config.root)
+    pagesRevalidateRules ??= loadPagesRevalidateRules(config)
     applyDefaultIsrHeader(ctx, pagesRevalidateRules)
   }
   return [finalizer]
@@ -139,20 +140,27 @@ function isBrowserCacheable(value: string): boolean {
   return !/\bno-store\b|\bno-cache\b/i.test(value)
 }
 
-function loadPagesRevalidateRules(root: string): RevalidateRule[] {
+function loadPagesRevalidateRules(config: ResolvedConfig): RevalidateRule[] {
+  const facts =
+    productionRelease(config)?.compat?.pagesRevalidate ?? pagesRevalidateFacts(config.root)
+  return facts.flatMap(([relative, revalidateSeconds]) => {
+    const regex = pagesRouteRegex(relative)
+    return regex ? [{ regex, revalidateSeconds }] : []
+  })
+}
+
+/** Pages with a `getStaticProps` revalidate window: `[pages-relative file, seconds]`. */
+export function pagesRevalidateFacts(root: string): [string, number][] {
   const pagesDir = path.join(root, 'pages')
   if (!existsSync(pagesDir)) return []
-  const rules: RevalidateRule[] = []
+  const facts: [string, number][] = []
   for (const file of walkFiles(pagesDir)) {
     const source = readFileSync(file, 'utf8')
     if (!/\bgetStaticProps\b/.test(source)) continue
     const match = /\brevalidate\s*:\s*(\d+)/.exec(source)
-    if (!match?.[1]) continue
-    const regex = pagesRouteRegex(path.relative(pagesDir, file))
-    if (!regex) continue
-    rules.push({ regex, revalidateSeconds: Number(match[1]) })
+    if (match?.[1]) facts.push([path.relative(pagesDir, file), Number(match[1])])
   }
-  return rules
+  return facts
 }
 
 function walkFiles(dir: string): string[] {

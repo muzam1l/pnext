@@ -25,13 +25,15 @@ import { beginSourceScope, endSourceScope, sourceCacheStats } from '../resolve/s
 import { flushDevModuleCaches } from '../runtime/module-cache'
 import { scanFactsStats } from '../resolve/scan-facts'
 import { clientEntryName } from '../client/chunk-name'
+import { compiledClientReferenceFiles } from '../client/reference'
+import { buildIndexFile } from '../runtime/production'
 import { registerServerRuntime, serverBundleTargetForRuntime } from '../runtime/loader'
 import {
-  buildClientReferenceCss,
   buildGlobalCss,
   buildNotFoundCss,
-  buildRouteCss,
+  buildRouteStylesheets,
   emittedAssetNames,
+  globalCssSources,
   prepareRouteCssChunks,
   registerCssRuntime,
   warmCssPipeline,
@@ -72,6 +74,7 @@ import {
   devServerModuleHref,
   resetModuleGraphFailure,
   setEmitCompiledSpecifiersManifest,
+  setReleaseCompile,
   throwIfModuleGraphFailed,
 } from '../runtime/modules'
 import {
@@ -92,6 +95,7 @@ import { interceptionMarkerLevels } from '../routing/slots'
 import { writeTypegen } from './typegen'
 import { lookupBuildCache, writeBuildCache } from './build/cache'
 import { emitServerEntry } from './serve/entry'
+import { immutableAssetPath } from './serve/immutable'
 import { createVerboseLogger, type VerboseLogger } from '../utils/verbose'
 import { bold, cyan, dim, green } from '../utils/ansi'
 import type {
@@ -165,6 +169,7 @@ export async function buildProject(root?: string, options: BuildOptions = {}) {
   // Only the vercel adapter's trace step reads the per-artifact specifier
   // sidecars; every other build path pays nothing for them.
   const restoreSpecifiersManifest = setEmitCompiledSpecifiersManifest(options.adapter === 'vercel')
+  const restoreReleaseCompile = setReleaseCompile(true)
   const lifecycle: { warm?: WarmChild } = {}
   try {
     return await runBuild(root, options, lifecycle)
@@ -177,6 +182,7 @@ export async function buildProject(root?: string, options: BuildOptions = {}) {
     lifecycle.warm?.kill()
     endSourceScope()
     restoreSpecifiersManifest()
+    restoreReleaseCompile()
     flushDevModuleCaches()
   }
 }
@@ -225,11 +231,12 @@ async function runBuild(
   const warmMode = options.adapter === 'vercel' ? 'full' : 'compile'
   const warm = startWarmChild(config, warmMode)
   lifecycle.warm = warm
-  await log.step('prepare output directory', async () => {
+  const publicFiles = await log.step('prepare output directory', async () => {
     // Build-owned outputs only: `<outRoot>/dev` belongs to a possibly-running
     // dev server and must survive.
-    await ensureEmptyDir(config.outPath, [devOutSegment])
-    await copyPublicDir(config.publicPath, path.join(config.outPath, 'public'))
+    // Materialized pages sources too: this build's config already resolved into them.
+    await ensureEmptyDir(config.outPath, [devOutSegment, 'pnext-pages-compat'])
+    return copyPublicDir(config.publicPath, path.join(config.outPath, 'public'))
   })
   // The document-level stylesheets run their postcss/Tailwind pass on the CSS
   // worker, so they overlap with the route scan below instead of serializing
@@ -305,6 +312,14 @@ async function runBuild(
   // - those are awaited just before the first route stylesheet is emitted, which lets a Tailwind
   // pass run under the build steps and the client bundles instead of ahead of them.
   prepareRouteCssChunks(routes)
+  // Route stylesheets bundle all at once under the client stage; the loop below publishes each
+  // route's names right before its prerender, after the document ones.
+  const routeStylesheets = buildRouteStylesheets(
+    config,
+    routes.filter(route => route.kind !== 'handler' && !route.dynamicErrorApi),
+    documentCss,
+    { verbose },
+  )
   // output:'export' with trailingSlash:false lays prerendered pages out flat
   // (`/a.html` rather than `/a/index.html`). Only meaningful under compat (the
   // Next config carries `output`); pure-core apps always use the dir layout.
@@ -353,9 +368,11 @@ async function runBuild(
       )
     : undefined
   metadataWarnings?.catch(() => undefined)
-  const staticModuleMetadata = await log.step('core module metadata', () =>
+  // Imports the route modules; the client stage needs none of it, so both run at once.
+  const moduleMetadata = log.step('core module metadata', () =>
     collectStaticModuleMetadata(config, routes),
   )
+  moduleMetadata.catch(() => undefined)
 
   const actionSources = buildState.actionSources ?? buildState.actions.map(a => a.sourceKey)
   // realpath, not resolve: a hybrid app's routes are scanned through the pages-compat mirror, whose
@@ -366,13 +383,18 @@ async function runBuild(
   // A node_modules action module never lands in route.sourceFiles itself (that walk stops at the
   // package boundary), so a route reaching one only through a first-party importer is matched here.
   const actionImporters = new Set((buildState.actionImporters ?? []).map(realFilePath))
+  // Routes share most of their files; resolve each once.
+  const realFiles = new Map<string, string>()
+  const reachesAction = (file: string) => {
+    let real = realFiles.get(file)
+    if (real === undefined) realFiles.set(file, (real = realFilePath(file)))
+    return actionFiles.has(real) || actionImporters.has(real)
+  }
   for (const route of routes) {
     if (
       route.kind === 'page' &&
-      route.sourceFiles.some(file => {
-        const real = realFilePath(file)
-        return actionFiles.has(real) || actionImporters.has(real)
-      })
+      (actionFiles.size > 0 || actionImporters.size > 0) &&
+      route.sourceFiles.some(reachesAction)
     ) {
       addClientEntryReason(route, 'actions')
     }
@@ -400,14 +422,14 @@ async function runBuild(
   // other document does, and those names are only final once the client stage has
   // fingerprinted them — so this render follows the bundle rather than racing it.
   // Result is consumed after the prerender pass, where it always was.
-  const notFoundDocuments = clientBundles.then(() =>
+  const notFoundDocuments = clientBundles.then(async () =>
     renderNotFoundDocuments({
       config,
       log,
       skip: options.buildMode === 'compile',
       documentCss,
       staticMetadataFiles,
-      staticModuleMetadata,
+      staticModuleMetadata: await moduleMetadata,
     }),
   )
   notFoundDocuments.catch(() => undefined)
@@ -420,6 +442,7 @@ async function runBuild(
   ).then(() => log.step('typegen', () => writeTypegen(config, routes)))
   remainingSteps.catch(() => undefined)
   await remainingSteps
+  const staticModuleMetadata = await moduleMetadata
   await clientBundles
   const proxyModule = await proxyBuild
   await partytownLib
@@ -472,8 +495,7 @@ async function runBuild(
   const generateFailures: { route: string; omitErrorLine: boolean }[] = []
   if (isGenerate) console.log('   Collecting page data ...')
 
-  // Route stylesheets build strictly after the document ones; this is the first
-  // point that needs them, so everything above ran alongside the CSS worker.
+  // The first point that needs the stylesheets, so everything above ran alongside them.
   await documentCss
 
   for (const route of routes) {
@@ -515,10 +537,7 @@ async function runBuild(
       continue
     }
 
-    await buildRouteCss(config, route, { verbose })
-    for (const reference of route.clientReferences) {
-      await buildClientReferenceCss(config, reference, { verbose })
-    }
+    await routeStylesheets.get(route)?.()
 
     // Compile mode bundles only — every prerender/export step is generate's.
     if (isCompile) continue
@@ -906,6 +925,7 @@ async function runBuild(
   // carries its entries, so this is where it has to have landed.
   await deferredSteps
   const actions = buildState.actions
+  const publicAssets = publicFiles.filter(relative => immutableAssetPath(relative))
   const manifest: BuildManifest = {
     version: 0,
     root: config.root,
@@ -916,6 +936,7 @@ async function runBuild(
     // The serving process re-publishes these so a render resolves the same
     // content-hashed names the build emitted.
     assetNames: emittedAssetNames(config.outPath),
+    ...(publicAssets.length > 0 ? { publicAssets } : {}),
     staticMetadataFiles,
     ...(Object.keys(staticModuleMetadata).length > 0 ? { staticModuleMetadata } : {}),
     ...(!config.compat?.next
@@ -941,7 +962,19 @@ async function runBuild(
   // Plain build: the adapter owns the child in the branch above. Compiling the
   // rest of the app's modules is build work, so it counts toward the build's own
   // duration rather than hiding after it.
-  else await log.step('warm module cache', () => warm.finish(log))
+  else {
+    await log.step('warm module cache', () =>
+      warm.finish(log, undefined, {
+        globalCss: globalCssSources(config),
+        clientReferences: [...compiledClientReferenceFiles()],
+      }),
+    )
+  }
+  // The release names every module production imports; a server compile that did not finish
+  // fails the build here rather than a request later.
+  if (!existsSync(buildIndexFile(config.outPath))) {
+    throw new Error('pnext build: the server compile did not complete (see the error above).')
+  }
 
   // Also cover module loads performed by completion hooks or the warm pass.
   throwIfModuleGraphFailed()
@@ -3194,11 +3227,11 @@ function resolvePartytownLibDir(root: string): string | null {
 }
 
 async function copyPublicDir(from: string, to: string) {
-  const files = await listFiles(from)
-  for (const file of files) {
-    const relative = toPosixPath(path.relative(from, file))
+  const files = (await listFiles(from)).map(file => toPosixPath(path.relative(from, file)))
+  for (const relative of files) {
     const target = path.join(to, relative)
     await mkdir(path.dirname(target), { recursive: true })
-    await copyFile(file, target)
+    await copyFile(path.join(from, relative), target)
   }
+  return files
 }

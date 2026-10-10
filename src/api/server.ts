@@ -1,5 +1,5 @@
 import { safeDecode } from '../utils/decode'
-import { getProxyExtensions, getProxyResponseProtocol } from '../extensions'
+import type { ExtensionHost } from '../extensions'
 import { getBasePathPrefix } from '../routing/href'
 import type {
   NextRequest as NextRequestLike,
@@ -10,6 +10,24 @@ import type {
 } from '../types'
 
 const nextResponseMetaSymbol = Symbol.for('pnext.nextResponse')
+
+/** Core's proxy response headers (extensions.ts), until a host is active. */
+const coreProxyResponseProtocol = {
+  nextHeader: 'x-pnext-middleware-next',
+  rewriteHeader: 'x-pnext-middleware-rewrite',
+}
+
+// Through the host's globalThis anchor, not an import: an embedded host loads this module from
+// source, and the prebundled runtime it shares the module with carries its own registry copy.
+function proxyHost() {
+  return (globalThis as Record<symbol, Pick<ExtensionHost, 'proxy' | 'proxyResponse'> | undefined>)[
+    Symbol.for('pnext.extensionHost')
+  ]
+}
+
+function proxyResponseProtocol() {
+  return proxyHost()?.proxyResponse ?? coreProxyResponseProtocol
+}
 
 export type { NextFetchEvent } from '../types'
 
@@ -73,14 +91,14 @@ export class NextResponse extends Response {
 
   static next(init?: NextResponseInit) {
     const response = new NextResponse(null, init)
-    response.headers.set(getProxyResponseProtocol().nextHeader, '1')
+    response.headers.set(proxyResponseProtocol().nextHeader, '1')
     defineMeta(response, { kind: 'next', ...requestMeta(init) })
     return response
   }
 
   static rewrite(url: string | URL, init?: NextResponseInit) {
     const response = new NextResponse(null, init)
-    response.headers.set(getProxyResponseProtocol().rewriteHeader, String(url))
+    response.headers.set(proxyResponseProtocol().rewriteHeader, String(url))
     defineMeta(response, { kind: 'rewrite', url: String(url), ...requestMeta(init) })
     return response
   }
@@ -122,7 +140,7 @@ export function nextResponseMeta(response: Response): NextResponseMeta | undefin
   ]
   if (meta) return meta
 
-  const protocol = getProxyResponseProtocol()
+  const protocol = proxyResponseProtocol()
   const rewrite = response.headers.get(protocol.rewriteHeader)
   if (rewrite) return { kind: 'rewrite', url: rewrite }
   if (response.headers.get(protocol.nextHeader)) return { kind: 'next' }
@@ -165,7 +183,7 @@ export function forwardMiddlewareRequestHeaders(from: Response, request: Request
 }
 
 function proxyInternalHeaders() {
-  const protocol = getProxyResponseProtocol()
+  const protocol = proxyResponseProtocol()
   return new Set([protocol.nextHeader, protocol.rewriteHeader])
 }
 
@@ -222,7 +240,7 @@ function createNextUrl(url: string | URL): NextURL {
   // `req.nextUrl.basePath` reads as a falsy '' rather than the string
   // "undefined" when forwarded through a header.
   nextUrl.basePath = getBasePathPrefix()
-  nextUrl.locale = getProxyExtensions().locale(nextUrl)
+  nextUrl.locale = proxyHost()?.proxy.locale(nextUrl) ?? ''
   return nextUrl
 }
 

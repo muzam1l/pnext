@@ -30,7 +30,7 @@ import {
 } from '../../extensions'
 import { getRequestRuntime } from '../../routing/request-environment'
 import { takeCacheLifeStash } from '../cache/use-cache'
-import { matchInterception, parseNavState, selectRouteForRequest } from '../../routing/routes'
+import { matchInterception, parseNavState, selectRouteForRequest } from '../../routing/match'
 import {
   currentPprShellHtml,
   pprShellPath,

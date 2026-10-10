@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { realpathSync } from 'node:fs'
 import type { Plugin } from 'esbuild'
-import { readText } from '../../utils/fs'
+import { readText, toPosixPath } from '../../utils/fs'
 import { escapeRegex } from '../../utils/code'
 import { actionId } from './ids'
 import { moduleActionExports, moduleLevelUseCache, moduleLevelUseServer } from './detect'
@@ -125,7 +125,9 @@ export function stubSourceFromSource(file: string, source: string, root?: string
   const exports = moduleActionExports(source)
   const actionIds: Record<string, string> = {}
   for (const name of exports) actionIds[name] = canonicalActionId(file, name, root)
-  return clientStubSource({ modulePath: file, exports, actionIds })
+  // Root-relative: the stub ships in client bundles and release artifacts.
+  const modulePath = root ? toPosixPath(path.relative(root, file)) : file
+  return clientStubSource({ modulePath, exports, actionIds })
 }
 
 export async function loadClientActionSource(file: string, root?: string) {

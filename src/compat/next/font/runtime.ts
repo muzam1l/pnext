@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import type { ResolvedConfig } from '../../../config'
 import { onExtensionHostReset, registerResponseFinalizers } from '../../../extensions'
 import { getWorkUnit } from '../../../request/context'
+import { servedRelease } from '../../../runtime/production'
 import type { MetadataLink } from '../../../types'
 import { persistFont, persistedFont } from './cache'
 import { escapeRegex } from '../../../utils/code'
@@ -383,7 +384,23 @@ function registerFont(definition: FontDefinition) {
   fontStorage.getStore()?.fonts.set(definition.key, definition)
 }
 
-async function resolveFont(definition: FontDefinition, context: FontResolveContext) {
+/** Every declared font, resolved for a release (its files emitted under the out dir). */
+export async function releaseFonts(config: ResolvedConfig): Promise<Record<string, ResolvedFont>> {
+  const fonts: Record<string, ResolvedFont> = {}
+  for (const font of declaredFonts.values()) {
+    const { sources: _sources, ...resolved } = await resolveFont(font, { config })
+    fonts[font.key] = resolved
+  }
+  return fonts
+}
+
+async function resolveFont(
+  definition: FontDefinition,
+  context: FontResolveContext,
+): Promise<ResolvedFont> {
+  // A production release serves the build's resolution: font sources are not read at request time.
+  const released = servedRelease()?.fonts?.[definition.key]
+  if (released) return released
   const key = `${context.config.outPath}:${context.dev ? 'dev' : 'build'}:${definition.key}`
   let resolved = resolvedFontCache.get(key)
   if (!resolved) {
@@ -506,7 +523,10 @@ async function resolveLocalFont(
     ? false
     : true
   const preload = request.options.preload !== false
-  const sources = normalizeLocalSources(request.options, request.callerFile)
+  const sources = normalizeLocalSources(
+    request.options,
+    request.callerFile && path.resolve(context.config.root, request.callerFile),
+  )
   const emitted = await Promise.all(
     sources.map(async source => ({
       ...source,

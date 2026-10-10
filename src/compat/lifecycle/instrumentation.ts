@@ -12,7 +12,15 @@
 // separate module state) and calling its register() with NEXT_RUNTIME='edge' set for the duration.
 // Apps without edge entities never get the pass.
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
@@ -21,6 +29,7 @@ import { build } from '../../utils/esbuild'
 import type { ResolvedConfig } from '../../config'
 import { resolveExternalLoadTarget } from '../../resolve/imports'
 import { compatAliases, reactServerLayerAliases } from '../aliases'
+import { productionRelease } from '../../runtime/production'
 
 const INSTRUMENTATION_BASENAMES = [
   'instrumentation.ts',
@@ -136,36 +145,87 @@ async function importInstrumentation(
   config: ResolvedConfig,
   suffix = '',
 ): Promise<InstrumentationModule> {
-  const root = config.root
   // Under config.outPath, so a dev server's scratch bundle lives in its own
   // subtree and a concurrent build never removes it mid-import.
   const outDir = path.join(config.outPath, 'instrumentation')
   mkdirSync(outDir, { recursive: true })
   const outfile = path.join(outDir, `instrumentation.${Date.now()}${suffix}.mjs`)
-  const tsconfig = path.join(root, 'tsconfig.json')
   try {
-    await build({
-      entryPoints: [file],
-      outfile,
-      bundle: true,
-      platform: 'node',
-      format: 'esm',
-      target: 'esnext',
-      packages: 'external',
-      plugins: [instrumentationPlugin(root, config)],
-      ...(existsSync(tsconfig) ? { tsconfig } : {}),
-      define: {
-        __dirname: JSON.stringify(path.dirname(file)),
-        __filename: JSON.stringify(file),
-        'import.meta.url': JSON.stringify(pathToFileURL(file).href),
-      },
-      logLevel: 'silent',
-      sourcemap: false,
-    })
+    await bundleInstrumentation(file, config, outfile)
     return (await import(pathToFileURL(outfile).href)) as InstrumentationModule
   } finally {
     rmSync(outfile, { force: true })
   }
+}
+
+/**
+ * Bundle instrumentation for a production release: the node instance, plus a separate edge instance
+ * file when the app has edge entities. Out-relative paths, or undefined when the app has none.
+ */
+export async function emitReleaseInstrumentation(config: ResolvedConfig, outDir: string) {
+  const file = findInstrumentation(config)
+  if (!file) return undefined
+  const node = await releaseInstrumentation(file, config, outDir, 'instrumentation')
+  if (!appHasEdgeEntities(config)) return { file: path.relative(config.outPath, node) }
+  const edge = await releaseInstrumentation(file, config, outDir, 'instrumentation.edge')
+  return { file: path.relative(config.outPath, node), edge: path.relative(config.outPath, edge) }
+}
+
+/** One release instance: located relative to itself, named by its content (a new generation never reuses a module). */
+async function releaseInstrumentation(
+  file: string,
+  config: ResolvedConfig,
+  outDir: string,
+  name: string,
+) {
+  const temporary = path.join(outDir, `${name}.${process.pid}.tmp.mjs`)
+  await bundleInstrumentation(file, config, temporary, outDir)
+  const { relocateReleaseBundle } = await import('../../runtime/modules')
+  const contents = relocateReleaseBundle(config, temporary, readFileSync(temporary, 'utf8'))
+  rmSync(temporary, { force: true })
+  const outfile = path.join(outDir, `${name}.${Bun.hash(contents).toString(36)}.mjs`)
+  writeFileSync(outfile, contents)
+  return outfile
+}
+
+async function bundleInstrumentation(
+  file: string,
+  config: ResolvedConfig,
+  outfile: string,
+  releaseDir?: string,
+) {
+  const root = config.root
+  const tsconfig = path.join(root, 'tsconfig.json')
+  // A release instance finds its source relative to itself, never at the build machine's path.
+  const sourceUrl = releaseDir
+    ? `new URL(${JSON.stringify(path.relative(releaseDir, file).split(path.sep).join('/'))}, import.meta.url).href`
+    : JSON.stringify(pathToFileURL(file).href)
+  await build({
+    entryPoints: [file],
+    outfile,
+    bundle: true,
+    platform: 'node',
+    format: 'esm',
+    target: 'esnext',
+    packages: 'external',
+    plugins: [instrumentationPlugin(root, config)],
+    ...(existsSync(tsconfig) ? { tsconfig } : {}),
+    banner: {
+      js:
+        'import { fileURLToPath as __pnextFileURLToPath } from "node:url";\n' +
+        'import { dirname as __pnextDirname } from "node:path";\n' +
+        `const __pnextSourceUrl = ${sourceUrl};\n` +
+        'const __pnextSourceFile = __pnextFileURLToPath(__pnextSourceUrl);\n' +
+        'const __pnextSourceDir = __pnextDirname(__pnextSourceFile);',
+    },
+    define: {
+      __dirname: '__pnextSourceDir',
+      __filename: '__pnextSourceFile',
+      'import.meta.url': '__pnextSourceUrl',
+    },
+    logLevel: 'silent',
+    sourcemap: false,
+  })
 }
 
 /**
@@ -175,6 +235,11 @@ async function importInstrumentation(
  */
 export function loadInstrumentation(config: ResolvedConfig): void {
   if (readyGate) return
+  const released = productionRelease(config)
+  if (released) {
+    readyGate = registerReleased(released.instrumentation)
+    return
+  }
   const file = findInstrumentation(config)
   if (!file) {
     readyGate = Promise.resolve()
@@ -197,21 +262,49 @@ export function loadInstrumentation(config: ResolvedConfig): void {
   })()
 }
 
+/** A release's prebuilt instrumentation: register() on the node instance, then the edge instance. */
+async function registerReleased(instrumentation: { file?: string; edge?: string } | undefined) {
+  if (!instrumentation?.file) return
+  try {
+    // eslint-disable-next-line turbo/no-undeclared-env-vars
+    if (!process.env.NEXT_RUNTIME) process.env.NEXT_RUNTIME = 'nodejs'
+    loaded = (await import(pathToFileURL(instrumentation.file).href)) as InstrumentationModule
+    await loaded.register?.()
+    if (instrumentation.edge) {
+      await withEdgeRuntime(async () => {
+        const edgeInstance = (await import(
+          pathToFileURL(instrumentation.edge!).href
+        )) as InstrumentationModule
+        await edgeInstance.register?.()
+      }, 'instrumentation register() (edge pass) failed:')
+    }
+  } catch (error) {
+    console.error('instrumentation register() failed:', error)
+  }
+}
+
 /**
  * The edge boot pass: a fresh instrumentation instance registered with NEXT_RUNTIME='edge' for the
  * duration of the call. A double provider registration is harmless - @opentelemetry/api rejects a second
  * global registration and keeps the first.
  */
 async function runEdgeRegisterPass(file: string, config: ResolvedConfig): Promise<void> {
+  await withEdgeRuntime(async () => {
+    const edgeInstance = await importInstrumentation(file, config, '.edge')
+    await edgeInstance.register?.()
+  }, 'instrumentation register() (edge pass) failed:')
+}
+
+/** Run `task` with NEXT_RUNTIME='edge', restoring the previous value. */
+async function withEdgeRuntime(task: () => Promise<void>, failure: string): Promise<void> {
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   const previous = process.env.NEXT_RUNTIME
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   process.env.NEXT_RUNTIME = 'edge'
   try {
-    const edgeInstance = await importInstrumentation(file, config, '.edge')
-    await edgeInstance.register?.()
+    await task()
   } catch (error) {
-    console.error('instrumentation register() (edge pass) failed:', error)
+    console.error(failure, error)
   } finally {
     if (previous === undefined) {
       // eslint-disable-next-line turbo/no-undeclared-env-vars

@@ -44,6 +44,7 @@ import { esbuildEntryExportNames, isIdentifier, uniqueIdentifier } from '../util
 import { cachedExistsSync } from '../utils/fs-cache'
 import { traceEnabled, traceValue } from '../utils/trace-flags'
 import { writeFileAtomic } from '../utils/fs'
+import { setPreplanDrain } from './load'
 
 // --------------------------------------------------------------------------
 // demand scheduling
@@ -61,6 +62,8 @@ export interface VendorGroupPlan {
   key: string
   /** The demanded subpath — the only thing a group is ever allowed to compile. */
   member: VendorGroupMember
+  /** Unbuilt subpaths that must compile in the member's round: they reach a stateful file it reaches. */
+  companions?: () => Promise<VendorGroupMember[]>
   /** `external` are siblings already on disk: referenced, never re-parsed. */
   build: (
     members: VendorGroupMember[],
@@ -455,10 +458,13 @@ function vendorGroupingEnabled() {
  * may not even have installed), so compiling the published set fans one demand out into hundreds of
  * foreign builds. A later sibling therefore grows the entry set and triggers another round;
  * artifacts from earlier rounds stay valid and are referenced as externals, so a growth round costs
- * what that sibling's own build would have cost.
+ * what that sibling's own build would have cost. The exception is `companions`: subpaths sharing a
+ * stateful file with the demand compile in its round, so that file is one chunk, one instance.
  */
 async function joinVendorGroup(group: VendorGroupPlan, nested: boolean, ticket: VendorPromotable) {
   if (!vendorGroupingEnabled()) return false
+  // Resolved before joining, so the companions land in the same round's snapshot.
+  const companions = (await group.companions?.()) ?? []
   let state = vendorGroups.get(group.key)
   if (!state) {
     state = {
@@ -480,6 +486,12 @@ async function joinVendorGroup(group: VendorGroupPlan, nested: boolean, ticket: 
     return false
   }
   state.pending.set(specifier, group.member)
+  for (const companion of companions) {
+    const known = (members: Map<string, VendorGroupMember>) => members.has(companion.specifier)
+    if (!known(state.pending) && !known(state.produced) && !known(state.solo)) {
+      state.pending.set(companion.specifier, companion)
+    }
+  }
   // While this demand waits on a shared round, promoting IT has to promote the
   // round — that is the only work its result depends on.
   const groupState = state
@@ -572,6 +584,7 @@ export async function drainPreplanBuilds() {
     throw error
   }
 }
+setPreplanDrain(drainPreplanBuilds)
 
 /**
  * Forget a bundle whose artifact turned out to be gone (a `pnext build` wiping
@@ -727,9 +740,9 @@ export function emittedExportNames(code: string): Set<string> | undefined {
  * Republish a bundled CommonJS entry's named exports off its default export.
  * Applied to the bundle itself (not a separate module) for the inlined case.
  */
-export function addCommonJsNamedExports(code: string) {
+export function addCommonJsNamedExports(code: string, body = code) {
   if (hasNonDefaultExport(code)) return code
-  const names = [...new Set([...commonJsExportNames(code), ...esbuildEntryExportNames(code)])]
+  const names = [...new Set([...commonJsExportNames(body), ...esbuildEntryExportNames(body)])]
     .filter(name => name !== 'default' && name !== '__esModule')
     .sort()
   if (names.length === 0) return code

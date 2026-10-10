@@ -1,3 +1,4 @@
+import { clientReferenceId } from '../client/reference'
 import { dynamicCallFacts, rewriteFacts, type DynamicCallFact } from './scan-facts'
 
 export interface DynamicCall {
@@ -132,7 +133,8 @@ export function rewriteDynamicCallTargets(
     const args = source.slice(call.open + 1, call.close)
     const argCount = topLevelArgCount(args)
     if (argCount < 1 || argCount > 2) continue
-    const literal = JSON.stringify({ file, exportName: target.exportName })
+    const id = `c-${clientReferenceId(file, target.exportName)}`
+    const literal = JSON.stringify({ file, exportName: target.exportName, id })
     const separator = /,\s*$/.test(args) ? '' : ', '
     edits.push({
       at: call.close,

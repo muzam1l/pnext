@@ -22,6 +22,12 @@ export interface ClientReferenceModuleOptions {
    * inlined lookup is the same symbol the renderer tests for.
    */
   inlineSymbol?: boolean
+  /**
+   * For a release: the reference names its source relative to the stub (`from`), at `target` - the
+   * source itself, or its path through the app's node_modules (`real`: resolved to the installed file).
+   * A moved build then still identifies the module its release indexed.
+   */
+  portable?: { from: string; target: string; real: boolean }
 }
 
 export function clientReferenceModuleSource(
@@ -29,8 +35,17 @@ export function clientReferenceModuleSource(
   exportNames: string[],
   options: ClientReferenceModuleOptions = {},
 ) {
+  const portable = options.portable
+  const located = portable
+    ? `decodeURIComponent(new URL(${JSON.stringify(path.relative(path.dirname(portable.from), portable.target).split(path.sep).join('/'))}, import.meta.url).pathname)`
+    : undefined
+  const file = !located
+    ? JSON.stringify(sourceFile)
+    : portable?.real
+      ? `__pnextRealpath(${located})`
+      : located
   const reference = (exportName: string) =>
-    `createReference({ id: ${JSON.stringify(`c-${clientReferenceId(sourceFile, exportName)}`)}, file: ${JSON.stringify(sourceFile)}, exportName: ${JSON.stringify(exportName)} })`
+    `createReference({ id: ${JSON.stringify(`c-${clientReferenceId(sourceFile, exportName)}`)}, file: ${file}, exportName: ${JSON.stringify(exportName)} })`
   const defaultExport = exportNames.includes('default')
     ? `export default ${reference('default')};`
     : ''
@@ -41,7 +56,11 @@ export function clientReferenceModuleSource(
     ? `const clientReferenceSymbol = Symbol.for('pnext.clientReference');`
     : `import { clientReferenceSymbol } from ${JSON.stringify(pathToFileHref(clientReferenceRuntimeFile))};`
 
-  return `${symbol}
+  const realpath = portable?.real
+    ? `import { realpathSync as __pnextRealpath } from 'node:fs';\n`
+    : ''
+
+  return `${realpath}${symbol}
 
 function createReference(reference) {
   function ClientReference({ children }) {

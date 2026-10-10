@@ -10,6 +10,9 @@ import {
   tsConfigFileFor,
 } from './engine'
 import { onExtensionHostReset } from '../extensions'
+import { findWorkspaceRoot, readPackageJson, type PackageJson } from './package-json'
+
+export { findWorkspaceRoot }
 
 // `Bun` through globalThis: pnext ships TypeScript source, so app compilers without
 // bun-types typecheck this file and a bare `Bun` identifier would fail them.
@@ -45,6 +48,8 @@ export interface ExternalPackagePolicy {
    * transpile.
    */
   transpiled?: () => readonly string[]
+  /** Kept out of a release's server dependency graph beyond `external`: Next's built-in list. */
+  releaseExternal?: (packageName: string) => boolean
   /** ESM external mode for package exports interop. */
   esmExternals: () => boolean | 'loose'
 }
@@ -94,9 +99,14 @@ export function resolveExternalLoadTarget(context: ExternalLoadContext): string 
   // `#imports` resolve from the importer's OWN package, so they are not
   // shareable across a resolution root; they stay uncached.
   if (context.specifier.startsWith('#')) return externalLoadResolver(context)
-  const key = `${context.target}\0${resolutionRootForFile(context.root, context.fromFile)}\0${context.specifier}`
+  // A node_modules importer resolves from its own directory, as Node does: a version nested under
+  // its package wins over the hoisted one.
+  const resolveContext = context.fromFile.includes(`${path.sep}node_modules${path.sep}`)
+    ? { ...context, root: path.dirname(context.fromFile) }
+    : context
+  const key = `${context.target}\0${resolutionRootForFile(resolveContext.root, context.fromFile)}\0${context.specifier}`
   if (externalLoadTargets.has(key)) return externalLoadTargets.get(key)
-  const target = externalLoadResolver(context)
+  const target = externalLoadResolver(resolveContext)
   externalLoadTargets.set(key, target)
   return target
 }
@@ -141,22 +151,6 @@ export function setTsConfigPath(file: string | undefined): void {
   setEngineTsConfigPath(file)
   tsConfigCache.clear()
   clearVendorPackageResolutions()
-}
-
-interface PackageJson {
-  name?: string
-  type?: string
-  browser?: string
-  main?: string
-  module?: string
-  source?: string
-  exports?: PackageExport
-  imports?: Record<string, PackageExport>
-  dependencies?: Record<string, string>
-  devDependencies?: Record<string, string>
-  optionalDependencies?: Record<string, string>
-  peerDependencies?: Record<string, string>
-  workspaces?: string[] | { packages?: string[] }
 }
 
 // Compat (or any bundler extension) registers its bare-specifier to file aliases here (e.g. `next/form` ->
@@ -886,25 +880,6 @@ export function commonJsModuleHasDefaultExport(source: string, file: string) {
   )
 }
 
-export function findWorkspaceRoot(root: string) {
-  const key = path.resolve(root)
-  if (workspaceRootCache.has(key)) return workspaceRootCache.get(key)
-
-  let dir = key
-  while (true) {
-    if (readPackageJson(dir).workspaces || existsSync(path.join(dir, 'pnpm-workspace.yaml'))) {
-      workspaceRootCache.set(key, dir)
-      return dir
-    }
-    const parent = path.dirname(dir)
-    if (parent === dir) {
-      workspaceRootCache.set(key, undefined)
-      return undefined
-    }
-    dir = parent
-  }
-}
-
 function isInside(root: string, file: string) {
   const relative = path.relative(root, file)
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
@@ -962,8 +937,6 @@ function readPnpmWorkspacePatterns(root: string) {
 }
 
 const tsConfigCache = new Map<string, TsConfig>()
-const packageJsonCache = new Map<string, PackageJson>()
-const workspaceRootCache = new Map<string, string | undefined>()
 const workspacePackageCache = new Map<string, Map<string, string>>()
 
 function readTsConfig(root: string) {
@@ -972,14 +945,6 @@ function readTsConfig(root: string) {
   const file = tsConfigFileFor(root)
   const config = (file ? readJsonc<TsConfig>(file) : undefined) ?? {}
   tsConfigCache.set(root, config)
-  return config
-}
-
-function readPackageJson(root: string) {
-  const existing = packageJsonCache.get(root)
-  if (existing) return existing
-  const config = readJson<PackageJson>(path.join(root, 'package.json')) ?? {}
-  packageJsonCache.set(root, config)
   return config
 }
 
@@ -1025,11 +990,6 @@ export function isWorkspacePackage(root: string, name: string, boundary?: string
 
 export function workspacePackageRoots(root: string) {
   return [...workspacePackages(path.resolve(root)).values()].sort()
-}
-
-function readJson<T>(file: string) {
-  if (!existsSync(file)) return undefined
-  return JSON.parse(readFileSync(file, 'utf8')) as T
 }
 
 function readJsonc<T>(file: string) {

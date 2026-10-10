@@ -9,9 +9,18 @@
  * the alias/asset helpers this module reuses from it - lives in `./server`.
  */
 
-import { builtinModules, createRequire } from 'node:module'
-import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
-import { copyFile, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { builtinModules, createRequire, isBuiltin } from 'node:module'
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import { copyFile, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Loader, Metafile, OnLoadResult, OnResolveResult, Plugin } from 'esbuild'
@@ -33,6 +42,7 @@ import {
   noteDevArtifactWritten,
 } from './module-cache'
 import { frameworkFingerprint } from './fingerprint'
+import { isReleaseCompile } from './load'
 import {
   getExternalPackagePolicy,
   isEsmModuleEntry,
@@ -56,6 +66,7 @@ import {
 import { noteCompiledClientReference } from '../client/reference'
 import { reactCompatEnabled } from '../render/hooks'
 import { writeFileAtomic } from '../utils/fs'
+import { releaseArtifactSource } from './modules'
 import { formatDuration } from '../utils/verbose'
 import {
   addCommonJsNamedExports,
@@ -87,6 +98,9 @@ import {
   coreAliases,
   firstAliasForSpecifier,
   hashBundleSpecifier,
+  nodeModuleSourceLoadsAsIs,
+  recordNativeNodeModuleFiles,
+  statSignature,
   packageJsxLoaders,
   runtimeAliasBuildPlugin,
   serverAssetPlugin,
@@ -114,6 +128,11 @@ export function clearServerRuntimeCaches() {
   vendorReuseLoaded.clear()
   vendorReuseProbes.clear()
   vendorLayerProbeMemo.clear()
+  nativeServerEntries.clear()
+  nativeServerFiles.clear()
+  nativeVerdictStores.clear()
+  stateCompanions.clear()
+  packageFileScans.clear()
   // The marker memo tracks files under `.pnext`; a wipe takes them with it.
   esmDistPackages.clear()
   clearProvidedEntryResolutions()
@@ -130,6 +149,14 @@ export async function externalServerPackageHref(
   nested = false,
 ) {
   let plan = vendorBuildPlan(config, specifier, target, resolveDir, conditionTarget)
+  const demand = (file: string) => {
+    if (!nested) noteReleaseDependency(config, file, specifier, resolveDir, target, conditionTarget)
+    return pathToFileHref(file)
+  }
+  if (target === 'server' && conditionTarget === 'server' && isPackageSpecifier(specifier)) {
+    const native = await nativeServerEntry(config, specifier, resolveDir)
+    if (native) return demand(native)
+  }
   const aliased = await crossLayerReusePlan(
     config,
     specifier,
@@ -158,7 +185,526 @@ export async function externalServerPackageHref(
     if (plan.group) dropVendorGroup(plan.group.key)
     file = await vendorBundle(plan, nested)
   }
-  return pathToFileHref(file)
+  return demand(file)
+}
+
+// --------------------------------------------------------------------------
+// release dependency graph
+// --------------------------------------------------------------------------
+
+/**
+ * A release bundles each App Router layer's server dependencies into one graph, as Next does. The
+ * compile still vendors (or loads natively) what the build's own prerender imports, and logs each
+ * App Router demand so the release can repoint its modules at the linked graph once all compile.
+ */
+export interface ReleaseDependency {
+  /** What the compile handed out: a vendor artifact or a natively loaded file. */
+  file: string
+  layer: ReleaseDependencyLayer
+  specifier: string
+  /** The file this layer resolves `specifier` to: the graph's entry. */
+  entry?: string
+}
+
+/** The App Router node layers, `<target>:<conditionTarget>`: RSC and client components' SSR. */
+export type ReleaseDependencyLayer = 'server:server' | 'client:client'
+
+const releaseDependencyLayers = new Set<string>(['server:server', 'client:client'])
+const loggedReleaseDependencies = new Set<string>()
+
+export function releaseDependencyLog(config: ResolvedConfig) {
+  return path.join(cacheRoot(config.outPath), 'dependencies.jsonl')
+}
+
+/** @internal Each build starts from an emptied out dir. */
+export function clearReleaseDependencyLog() {
+  loggedReleaseDependencies.clear()
+}
+
+/** Appended, not held: the build and its warm child both compile. */
+function noteReleaseDependency(
+  config: ResolvedConfig,
+  file: string,
+  specifier: string,
+  resolveDir: string,
+  target: CompatAliasTarget,
+  conditionTarget: ServerBundleTarget,
+) {
+  const layer = `${target}:${conditionTarget}` as ReleaseDependencyLayer
+  if (!isReleaseCompile() || !releaseDependencyLayers.has(layer)) return
+  const entry = resolveVendorEntry(config, specifier, resolveDir, conditionTarget)
+  appendReleaseLog(config, { file, layer, specifier, entry } satisfies Partial<ReleaseDependency>)
+}
+
+/** A release module compiled for another layer than its artifact directory's (a `'use client'` file). */
+export function noteReleaseModuleLayer(
+  config: ResolvedConfig,
+  module: string,
+  target: CompatAliasTarget,
+  conditionTarget: ServerBundleTarget,
+) {
+  if (isReleaseCompile())
+    appendReleaseLog(config, { module, layer: `${target}:${conditionTarget}` })
+}
+
+function appendReleaseLog(config: ResolvedConfig, record: object) {
+  const line = JSON.stringify(record)
+  const log = releaseDependencyLog(config)
+  if (loggedReleaseDependencies.has(`${log}\0${line}`)) return
+  loggedReleaseDependencies.add(`${log}\0${line}`)
+  mkdirSync(path.dirname(log), { recursive: true })
+  appendFileSync(log, `${line}\n`)
+}
+
+/**
+ * Link one layer's dependency entries in one splitting build: each package file becomes one module and
+ * unused code drops out. `serverExternalPackages` and Next's built-in list stay external where the
+ * importer resolves them as the root does; Next bundles another copy. A package that reads files beside
+ * itself (`import.meta.url`) or imports computed paths loads in place, as in 0.1.6: Next's webpack
+ * contexts bundle computed imports instead. Returns the files written and the entries left in place.
+ */
+export async function linkReleaseDependencies(
+  config: ResolvedConfig,
+  layer: ReleaseDependencyLayer,
+  entries: readonly { in: string; out: string }[],
+  outdir: string,
+) {
+  const [target, conditionTarget] = layer.split(':') as [CompatAliasTarget, ServerBundleTarget]
+  const unresolved = new Set<string>()
+  const inPlace = new Set<string>()
+  const ordered = [...entries].sort((a, b) => (a.out < b.out ? -1 : 1))
+  let linked = ordered
+  let outputs: { path: string; text: string }[]
+  for (;;) {
+    let result
+    try {
+      result = await build({
+        entryPoints: linked.map(entry => ({
+          in:
+            getBundlerExtensions().serverBundleEntry(entry.in, path.dirname(entry.in), entry.in) ??
+            entry.in,
+          out: entry.out,
+        })),
+        absWorkingDir: config.root,
+        bundle: true,
+        splitting: true,
+        write: false,
+        metafile: true,
+        outdir,
+        chunkNames: 'chunks/[name]-[hash]',
+        format: 'esm',
+        platform: 'neutral',
+        target: 'es2022',
+        conditions: serverBundleConditions(conditionTarget),
+        mainFields: ['module', 'main'],
+        loader: packageJsxLoaders,
+        jsx: 'automatic',
+        jsxImportSource: 'preact',
+        logLevel: 'silent',
+        ...serverDefineOptions(),
+        plugins: profiledVendorPlugins([
+          serverAssetPlugin(config),
+          ...getBundlerExtensions().serverEsbuildPlugins(
+            config,
+            vendorPluginOptions(config, target, conditionTarget),
+          ),
+          runtimeAliasBuildPlugin(config, target, {
+            bundleRequireAliases: true,
+            reactServerLayer: target === 'server',
+          }),
+          releaseExternalsPlugin(config, conditionTarget, unresolved, inPlace),
+        ]),
+      })
+    } catch (error) {
+      // An import that resolves nowhere stays a bare external, as in a vendor bundle: it fails when it runs.
+      const missing = unresolvedBareImports(error).filter(specifier => !unresolved.has(specifier))
+      if (missing.length === 0) throw error
+      for (const specifier of missing) unresolved.add(specifier)
+      continue
+    }
+    const found = (await inPlacePackages(config, result)).filter(root => !inPlace.has(root))
+    if (found.length === 0) {
+      outputs = result.outputFiles
+      break
+    }
+    for (const root of found) inPlace.add(root)
+    linked = ordered.filter(entry => !inPlace.has(nearestManifestDir(path.dirname(entry.in))!))
+    if (linked.length === 0) return { files: [], inPlace: ordered.map(entry => entry.in) }
+  }
+  const entryFiles = new Set(linked.map(entry => path.join(outdir, `${entry.out}.js`)))
+  const texts = new Map(outputs.map(output => [output.path, output.text]))
+  // Written beside the graph and renamed into place, so a crash never leaves half a graph.
+  const staging = `${outdir}.${process.pid}.tmp`
+  await rm(staging, { recursive: true, force: true })
+  try {
+    await mkdir(path.join(staging, 'chunks'), { recursive: true })
+    for (const output of outputs) {
+      const code = entryFiles.has(output.path)
+        ? addCommonJsNamedExports(output.text, sharedCommonJsBody(output.path, output.text, texts))
+        : output.text
+      await writeFile(
+        path.join(staging, path.relative(outdir, output.path)),
+        releaseArtifactSource(
+          output.path,
+          target === 'server' ? applyBundledSourceTransforms(code, output.path) : code,
+        ),
+      )
+    }
+    await rm(outdir, { recursive: true, force: true })
+    await rename(staging, outdir)
+  } catch (error) {
+    await rm(staging, { recursive: true, force: true })
+    throw error
+  }
+  return {
+    files: outputs.map(output => output.path).sort(),
+    inPlace: ordered.filter(entry => !linked.includes(entry)).map(entry => entry.in),
+  }
+}
+
+// `import.meta` paths and an `import()` of a computed path resolve where the file lies; an import marked
+// `webpackIgnore`/`@vite-ignore` is meant to stay a runtime import, as Next's bundle keeps it.
+const IMPORT_META_PATH = /\bimport\.meta\.(?:url|dirname|filename|resolve)\b/
+const COMPUTED_IMPORT =
+  /(?<![.\w$])import\s*\(((?:\s|\/\*[\s\S]*?\*\/|\/\/[^\n]*\n)*)(?!['"`)\s/])/g
+
+function readsBesideItself(source: string) {
+  if (IMPORT_META_PATH.test(source)) return true
+  for (const match of source.matchAll(COMPUTED_IMPORT)) {
+    if (!/webpackIgnore:\s*true|@vite-ignore/.test(match[1]!)) return true
+  }
+  return false
+}
+
+/** Package dirs whose files read beside themselves or import computed paths. */
+async function inPlacePackages(
+  config: ResolvedConfig,
+  result: { metafile?: Metafile; warnings: { text: string; location: { file: string } | null }[] },
+) {
+  const files = new Set(
+    result.warnings
+      .filter(warning => warning.text.includes('is not a string literal') && warning.location)
+      .map(warning => path.resolve(config.root, warning.location!.file)),
+  )
+  const installed = Object.keys(result.metafile?.inputs ?? {})
+    .filter(input => !input.includes(':') && input.includes('node_modules/'))
+    .map(input => path.resolve(config.root, input))
+  await Promise.all(
+    installed.map(async file => {
+      const source = await readFile(file, 'utf8').catch(() => '')
+      if (readsBesideItself(source)) files.add(file)
+    }),
+  )
+  return [
+    ...new Set(
+      [...files]
+        .filter(file => file.includes(`${path.sep}node_modules${path.sep}`))
+        .map(file => nearestManifestDir(path.dirname(canonicalVendorEntry(file)!)))
+        .filter((root): root is string => root !== undefined),
+    ),
+  ]
+}
+
+/**
+ * Under splitting, a CommonJS entry's body can land in a shared chunk the entry only calls
+ * (`export default require_x()`): its named exports are read from that body.
+ */
+function sharedCommonJsBody(file: string, code: string, texts: ReadonlyMap<string, string>) {
+  const wrapper = /(?:^|\n)export default (require_[\w$]+)\(\);?/.exec(code)?.[1]
+  const chunk =
+    wrapper &&
+    new RegExp(`import\\s*\\{[^}]*\\b${wrapper}\\b[^}]*\\}\\s*from\\s*"([^"]+)"`).exec(code)?.[1]
+  const text = chunk && texts.get(path.resolve(path.dirname(file), chunk))
+  if (!text) return code
+  const start = text.indexOf(`var ${wrapper} = `)
+  if (start === -1) return code
+  const next = text.indexOf('\nvar require_', start + 1)
+  return text.slice(start, next === -1 ? undefined : next)
+}
+
+const frameworkPackageName = (
+  JSON.parse(readFileSync(path.resolve(import.meta.dirname, '../../package.json'), 'utf8')) as {
+    name: string
+  }
+).name
+
+function releaseExternalsPlugin(
+  config: ResolvedConfig,
+  conditionTarget: ServerBundleTarget,
+  unresolved: ReadonlySet<string>,
+  inPlace: ReadonlySet<string>,
+): Plugin {
+  const policy = getExternalPackagePolicy()
+  return {
+    name: 'pnext-release-externals',
+    setup(build) {
+      build.onResolve({ filter: /^[^./]/ }, async args => {
+        const name = packageNameFromSpecifier(args.path)
+        if (!name || args.kind === 'entry-point') return undefined
+        // Builtins, unresolvable imports and the framework (the runtime's own instance) stay external.
+        if (
+          unresolved.has(args.path) ||
+          name === frameworkPackageName ||
+          isBuiltin(args.path) ||
+          builtinModules.includes(name) ||
+          isBunBuiltin(name)
+        ) {
+          return { path: args.path, external: true }
+        }
+        const conditions =
+          args.kind === 'require-call'
+            ? serverBundleRequireConditions(conditionTarget)
+            : serverBundleConditions(conditionTarget)
+        const external = policy.external(name) || policy.releaseExternal?.(name)
+        if (!external && inPlace.size === 0) return undefined
+        const fromImporter = resolveNestedPackageFromImporter(args.importer, args.path, conditions)
+        // A package that loads in place is imported where it lies, when Bun loads it as-is.
+        const loaded = fromImporter && canonicalVendorEntry(fromImporter)!
+        if (
+          loaded &&
+          inPlace.has(nearestManifestDir(path.dirname(loaded))!) &&
+          isEsmModuleEntry(loaded) &&
+          (await nativeServerGraph(loaded))
+        ) {
+          return { path: loaded, external: true }
+        }
+        if (!external) return undefined
+        const fromRoot = resolveVendorPackageSpecifier(
+          config.root,
+          path.join(config.root, 'pnext-resolve.ts'),
+          args.path,
+          conditions,
+        )
+        return fromImporter && fromImporter === fromRoot
+          ? { path: args.path, external: true }
+          : undefined
+      })
+    },
+  }
+}
+
+function unresolvedBareImports(error: unknown) {
+  const errors = (error as { errors?: { text?: string }[] } | undefined)?.errors ?? []
+  return errors.flatMap(({ text }) => {
+    const specifier = /^Could not resolve "([^"]+)"/.exec(text ?? '')?.[1]
+    return specifier && isPackageSpecifier(specifier) ? [specifier] : []
+  })
+}
+
+// --------------------------------------------------------------------------
+// native server dependencies
+// --------------------------------------------------------------------------
+
+/**
+ * On the server a node_modules package loads natively through Bun, as Vite SSR and Node load it: one
+ * module instance per resolved file and no build. A bundle per subpath would inline its own copy of
+ * every shared internal file and split module state (better-auth's request-state slots).
+ *
+ * It is bundled only when pnext has to transform something its server graph reaches: an aliased
+ * import (react, next/*), a `'use client'`/`'use server'`/`'use cache'` file, a non-JS file, a
+ * `transpilePackages` member, or a bare import Bun resolves to a different file than the server
+ * layer's runtime conditions (`react-server`) select. `PNEXT_SERVER_NATIVE=0` bundles everything.
+ */
+// eslint-disable-next-line turbo/no-undeclared-env-vars
+const serverNativeEnabled = () => process.env.PNEXT_SERVER_NATIVE !== '0'
+
+/** The server layer's conditions minus bundler-only ones (`module`): what Node would honour. */
+const serverRuntimeConditions = (kind: string) =>
+  (kind === 'require-call'
+    ? serverBundleRequireConditions('server')
+    : serverBundleConditions('server')
+  ).filter(condition => condition !== 'module')
+
+const nativeServerEntries = new Map<string, Promise<string | undefined>>()
+
+/** The file Bun loads for `specifier` when its whole server graph needs no transform. */
+function nativeServerEntry(config: ResolvedConfig, specifier: string, resolveDir: string) {
+  const packageName = packageNameFromSpecifier(specifier)
+  if (
+    !serverNativeEnabled() ||
+    serverDefineOptions().define ||
+    (packageName && getExternalPackagePolicy().transpile(packageName))
+  ) {
+    return Promise.resolve(undefined)
+  }
+  const key = `${resolveDir}\0${specifier}`
+  let entry = nativeServerEntries.get(key)
+  if (!entry) {
+    const verdicts = nativeVerdictsFor(config)
+    const storeKey = `${vendorPortablePath(config, resolveDir)}\0${specifier}`
+    const stored = verdicts.get(storeKey)
+    const storedEntry = stored && path.resolve(config.workspaceRoot, stored.resolved)
+    if (stored && statSignature(storedEntry!) === stored.signature) {
+      entry = Promise.resolve(stored.native ? storedEntry : undefined)
+    } else {
+      entry = nativeServerEntryUncached(config, specifier, resolveDir)
+        .then(native => {
+          const resolved = nativeResolve(specifier, resolveDir)
+          const signature = resolved && statSignature(resolved)
+          if (resolved && signature) {
+            const relative = path.relative(config.workspaceRoot, resolved)
+            verdicts.set(storeKey, { resolved: relative, signature, native: Boolean(native) })
+            persistNativeVerdicts()
+          }
+          return native
+        })
+        .catch(() => undefined)
+    }
+    nativeServerEntries.set(key, entry)
+  }
+  return entry
+}
+
+/**
+ * Verdicts outlive the process, as vendor artifacts do: re-walking every native graph made a dev
+ * restart pay for all of them again. One holds while its resolved entry's stat does; the store name
+ * carries what else a verdict reads (pnext's generation, `transpilePackages`, the alias set).
+ */
+interface NativeVerdict {
+  resolved: string
+  signature: string
+  native: boolean
+}
+
+const nativeVerdictStores = new Map<
+  string,
+  { file: string; verdicts: Map<string, NativeVerdict> }
+>()
+let nativeVerdictFlushArmed = false
+
+function nativeVerdictsFor(config: ResolvedConfig) {
+  let store = nativeVerdictStores.get(config.outPath)
+  if (!store) {
+    const inputs = JSON.stringify([
+      getExternalPackagePolicy().transpiled?.() ?? null,
+      Object.keys(coreAliases(config, 'server')).sort(),
+    ])
+    const file = vendorStoreFile(config, `native.${hashBundleSpecifier(inputs)}`)
+    store = { file, verdicts: new Map() }
+    nativeVerdictStores.set(config.outPath, store)
+    try {
+      const stored = JSON.parse(readFileSync(file, 'utf8')) as Record<string, NativeVerdict>
+      for (const [key, verdict] of Object.entries(stored)) store.verdicts.set(key, verdict)
+    } catch {
+      // No store yet; verdicts are written at exit.
+    }
+  }
+  return store.verdicts
+}
+
+function persistNativeVerdicts() {
+  if (nativeVerdictFlushArmed) return
+  nativeVerdictFlushArmed = true
+  process.once('exit', () => {
+    for (const { file, verdicts } of nativeVerdictStores.values()) {
+      try {
+        // Another process (a build's warm child) may have written since this one loaded.
+        const stored = JSON.parse(readFileSync(file, 'utf8')) as Record<string, NativeVerdict>
+        for (const [key, verdict] of Object.entries(stored)) {
+          if (!verdicts.has(key)) verdicts.set(key, verdict)
+        }
+      } catch {
+        // Nothing on disk yet.
+      }
+      try {
+        mkdirSync(path.dirname(file), { recursive: true })
+        writeFileSync(file, JSON.stringify(Object.fromEntries(verdicts)))
+      } catch {
+        // A missing store only costs the walk.
+      }
+    }
+  })
+}
+
+async function nativeServerEntryUncached(
+  config: ResolvedConfig,
+  specifier: string,
+  resolveDir: string,
+) {
+  const importer = path.join(resolveDir, 'pnext-resolve.ts')
+  const entry = nativeResolve(specifier, resolveDir)
+  // A CommonJS entry keeps its vendor bundle: its importers' interop (named-export facades,
+  // `require` of the artifact) is built around one.
+  if (!entry || !isEsmModuleEntry(entry)) return undefined
+  if (nativeImportDiffers(importer, specifier, 'import-statement', entry)) return undefined
+  const graph = await nativeServerGraph(entry)
+  if (!graph) return undefined
+  recordNativeNodeModuleFiles(config, graph)
+  return entry
+}
+
+function nativeResolve(specifier: string, fromDir: string) {
+  try {
+    return canonicalVendorEntry(Bun.resolveSync(specifier, fromDir))
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Whether the server layer selects another file than Bun loaded, with or without `react-server`:
+ * every pnext process runs with that condition, but a native graph must not depend on it.
+ */
+function nativeImportDiffers(importer: string, specifier: string, kind: string, loaded: string) {
+  const conditions = serverRuntimeConditions(kind)
+  return [conditions, conditions.filter(condition => condition !== 'react-server')].some(set => {
+    const selected = resolveNestedPackageFromImporter(importer, specifier, set)
+    return selected !== undefined && canonicalVendorEntry(selected) !== loaded
+  })
+}
+
+/** Per file: what it loads natively, or undefined when it needs a transform. */
+const nativeServerFiles = new Map<string, Promise<string[] | undefined>>()
+
+function nativeServerFile(file: string) {
+  let imports = nativeServerFiles.get(file)
+  if (!imports) {
+    imports = nativeServerFileUncached(file).catch(() => undefined)
+    nativeServerFiles.set(file, imports)
+  }
+  return imports
+}
+
+const nativeImportScanner = new Bun.Transpiler({ loader: 'js' })
+
+async function nativeServerFileUncached(file: string) {
+  // An isolated store (`.pnpm`, `.bun`) is a layout the deployed function does not mirror.
+  if (!/\.[cm]?js$/.test(file) || file.includes(`${path.sep}node_modules${path.sep}.`)) {
+    return undefined
+  }
+  const source = await readFile(file, 'utf8')
+  // The runtime load plugin's own test: a file it would rewrite is not native.
+  if (!nodeModuleSourceLoadsAsIs(source)) return undefined
+  const policy = getExternalPackagePolicy()
+  const loads: string[] = []
+  for (const { path: specifier, kind } of nativeImportScanner.scanImports(source)) {
+    if (isBuiltin(specifier) || isBunBuiltin(specifier)) continue
+    const packageName = isPackageSpecifier(specifier)
+      ? packageNameFromSpecifier(specifier)
+      : undefined
+    // A serverExternalPackages import already loads natively through the runtime resolver.
+    if (packageName && policy.external(packageName)) continue
+    if (packageName && policy.transpile(packageName)) return undefined
+    // Unresolvable fails the same way bundled (a bare external), so it decides nothing.
+    const loaded = nativeResolve(specifier, path.dirname(file))
+    if (!loaded) continue
+    if (packageName && nativeImportDiffers(file, specifier, kind, loaded)) return undefined
+    loads.push(loaded)
+  }
+  return loads
+}
+
+async function nativeServerGraph(entry: string) {
+  const seen = new Set<string>()
+  let level = [entry]
+  while (level.length > 0) {
+    const fresh = [...new Set(level)].filter(file => !seen.has(file))
+    for (const file of fresh) seen.add(file)
+    const loads = await Promise.all(fresh.map(nativeServerFile))
+    if (loads.some(found => !found)) return undefined
+    level = loads.flat() as string[]
+  }
+  return seen
 }
 
 /**
@@ -295,7 +841,7 @@ function vendorBuildPlan(
 async function writeVendorArtifact(file: string, code: string) {
   const id = await publishVendorContent(file, code)
   if (id === undefined) {
-    await writeFileAtomic(file, code)
+    await writeFileAtomic(file, releaseArtifactSource(file, code))
     noteDevArtifactWritten(file)
   }
   return id
@@ -316,9 +862,17 @@ function vendorContentFile(vendorDir: string, id: string) {
 async function publishVendorContent(file: string, code: string) {
   const vendorDir = path.dirname(file)
   if (vendorContentDisabled() || path.basename(vendorDir) !== 'vendor') return undefined
+  // First writer wins (see `linkVendorArtifact`): an alias already published keeps its bytes.
+  const published = /^([0-9a-f]+)\.content\.mjs$/.exec(publishedVendorContent(file) ?? '')?.[1]
+  if (published) {
+    noteVendorContentId(file, published)
+    noteDevArtifactWritten(file)
+    return published
+  }
   const id = hashBundleSpecifier(canonicalVendorCode(code))
   const content = vendorContentFile(vendorDir, id)
-  if (!cachedExistsSync(content)) await writeFileAtomic(content, code)
+  if (!cachedExistsSync(content))
+    await writeFileAtomic(content, releaseArtifactSource(content, code))
   noteDevArtifactWritten(content)
   await linkVendorArtifact(file, content)
   noteVendorContentId(file, id)
@@ -326,15 +880,39 @@ async function publishVendorContent(file: string, code: string) {
   return id
 }
 
-/** The layer-keyed path becomes an alias to the shared bytes. */
-async function linkVendorArtifact(file: string, content: string) {
-  await rm(file, { force: true }).catch(() => undefined)
+function publishedVendorContent(file: string) {
   try {
-    await symlink(path.basename(content), file)
+    return existsSync(file) ? readlinkSync(file) : undefined
   } catch {
+    return undefined
+  }
+}
+
+/**
+ * The layer-keyed path becomes an alias to the shared bytes. The first writer wins: a build and its
+ * warm child both publish, and re-pointing a live alias hands later importers a second module
+ * instance (the loader keys on the real path). Only a dangling alias is replaced, by rename, so a
+ * reader never sees it missing.
+ */
+async function linkVendorArtifact(file: string, content: string) {
+  const link = (at: string) => symlink(path.basename(content), at)
+  try {
+    await link(file)
+    return
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST' && existsSync(file)) return
+  }
+  const temp = `${file}.${process.pid.toString(36)}.${(++vendorLinkSequence).toString(36)}.link`
+  try {
+    await link(temp)
+    await rename(temp, file)
+  } catch {
+    await rm(temp, { force: true }).catch(() => undefined)
     await copyFile(content, file)
   }
 }
+
+let vendorLinkSequence = 0
 
 /** What one layer's build of an entry saw, for the cross-layer comparison. */
 interface VendorLayerRecord {
@@ -1030,9 +1608,23 @@ function vendorGroupPlan(
   const packageName = packageNameFromSpecifier(member.specifier)
   const packageRoot = packageName && vendorPackageRoot(member.entry, packageName)
   if (!packageName || !packageRoot || !isEsmModuleEntry(member.entry)) return undefined
+  const key = `${config.outPath}\0${target}\0${conditionTarget}\0${packageRoot}`
   return {
-    key: `${config.outPath}\0${target}\0${conditionTarget}\0${packageRoot}`,
+    key,
     member,
+    companions:
+      target === 'server'
+        ? () =>
+            stateSharingCompanions(
+              config,
+              key,
+              packageName,
+              packageRoot,
+              member,
+              resolveDir,
+              conditionTarget,
+            )
+        : undefined,
     build: (members, external, nested) =>
       buildVendorGroup(
         config,
@@ -1045,6 +1637,122 @@ function vendorGroupPlan(
         nested,
       ),
   }
+}
+
+/**
+ * A package bundled on the server keeps one instance of a stateful file only if every subpath
+ * reaching it compiles in one splitting build. So the first demand pulls in the published subpaths
+ * that share a stateful file with it (better-auth's `defineRequestState(...)` slots, a React
+ * context), and nothing else: most packages load natively, and a build of every published subpath
+ * would also run code the app never imports.
+ */
+function stateSharingCompanions(
+  config: ResolvedConfig,
+  groupKey: string,
+  packageName: string,
+  packageRoot: string,
+  member: VendorGroupMember,
+  resolveDir: string,
+  conditionTarget: ServerBundleTarget,
+) {
+  const key = `${groupKey}\0${member.specifier}`
+  let companions = stateCompanions.get(key)
+  if (!companions) {
+    companions = (async () => {
+      const shared = await statefulPackageFiles(member.entry, packageRoot)
+      if (shared.length === 0) return []
+      const found: VendorGroupMember[] = []
+      for (const subpath of packageExportSubpaths(packageRoot)) {
+        const specifier = subpath === '.' ? packageName : `${packageName}${subpath.slice(1)}`
+        if (specifier === member.specifier) continue
+        const sibling = vendorBuildPlan(
+          config,
+          specifier,
+          'server',
+          resolveDir,
+          conditionTarget,
+        ).group
+        if (sibling?.key !== groupKey || existsSync(sibling.member.file)) continue
+        const reach = await packageReach(sibling.member.entry, packageRoot)
+        if (shared.some(file => reach.has(file))) found.push(sibling.member)
+      }
+      return found.length <= MAX_STATE_COMPANIONS ? found : []
+    })().catch(() => [])
+    stateCompanions.set(key, companions)
+  }
+  return companions
+}
+
+/** Past this many, the package is a hub of adapters; it keeps a build per demanded subpath. */
+const MAX_STATE_COMPANIONS = 16
+const stateCompanions = new Map<string, Promise<VendorGroupMember[]>>()
+
+function packageExportSubpaths(packageRoot: string) {
+  try {
+    const { exports } = JSON.parse(
+      readFileSync(path.join(packageRoot, 'package.json'), 'utf8'),
+    ) as {
+      exports?: unknown
+    }
+    if (!exports || typeof exports !== 'object' || Array.isArray(exports)) return []
+    return Object.keys(exports).filter(
+      subpath => subpath.startsWith('.') && !subpath.includes('*') && !subpath.endsWith('.json'),
+    )
+  } catch {
+    return []
+  }
+}
+
+/** A top-level binding created by `new` or a non-PURE call: an identity each copy would duplicate. */
+const MODULE_STATE =
+  /^(?:export\s+)?(?:const|let|var)\s[^=;]*=\s*(?:(?:\/\*\s*[#@]__PURE__\s*\*\/\s*)?new\s|(?!require\s*\()[\w$.]+\s*\()/m
+
+async function statefulPackageFiles(entry: string, packageRoot: string) {
+  const files = [...(await packageReach(entry, packageRoot))]
+  const sources = await Promise.all(files.map(file => packageFileScan(file)))
+  return files.filter((_, index) => sources[index]?.stateful)
+}
+
+const packageFileScans = new Map<
+  string,
+  Promise<{ imports: string[]; stateful: boolean } | undefined>
+>()
+const packageScanner = new Bun.Transpiler({ loader: 'js' })
+
+function packageFileScan(file: string) {
+  let scan = packageFileScans.get(file)
+  if (!scan) {
+    scan = readFile(file, 'utf8')
+      .then(source => ({
+        imports: packageScanner
+          .scanImports(source)
+          .map(({ path: specifier }) => specifier)
+          .filter(specifier => specifier.startsWith('.')),
+        stateful: MODULE_STATE.test(source),
+      }))
+      .catch(() => undefined)
+    packageFileScans.set(file, scan)
+  }
+  return scan
+}
+
+/** The package's own files `entry` reaches through relative imports. */
+async function packageReach(entry: string, packageRoot: string) {
+  const seen = new Set<string>()
+  let level = [entry]
+  while (level.length > 0) {
+    const fresh = [...new Set(level)].filter(
+      file => !seen.has(file) && file.startsWith(packageRoot + path.sep) && /\.[cm]?js$/.test(file),
+    )
+    for (const file of fresh) seen.add(file)
+    const scans = await Promise.all(fresh.map(packageFileScan))
+    level = scans.flatMap((scan, index) =>
+      (scan?.imports ?? []).flatMap(
+        specifier => nativeResolve(specifier, path.dirname(fresh[index]!)) ?? [],
+      ),
+    )
+  }
+  return seen
 }
 
 /**
@@ -2666,9 +3374,12 @@ function externalBuiltinBuildPlugin(): Plugin {
     setup(build) {
       build.onResolve({ filter: /^[^./].*/ }, args => {
         const packageName = packageNameFromSpecifier(args.path)
-        if (!packageName || (!builtinModules.includes(packageName) && !isBunBuiltin(packageName))) {
-          return undefined
-        }
+        // `isBuiltin` also knows the `node:`-only ones (`node:sqlite`, `node:test`).
+        const builtin =
+          isBuiltin(args.path) ||
+          builtinModules.includes(packageName ?? '') ||
+          isBunBuiltin(packageName ?? '')
+        if (!packageName || !builtin) return undefined
         return { path: args.path, external: true }
       })
     },

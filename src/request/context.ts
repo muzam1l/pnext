@@ -8,6 +8,7 @@ import {
   PostponeError,
 } from '../render/ppr'
 import type { NextRequest, RouteParamValue } from '../types'
+import type { Release } from '../runtime/production'
 
 // Request work-unit store (CORE seam for compat after()/onRequestError).
 //
@@ -46,6 +47,8 @@ export interface WorkUnit {
    * grows no dependency on compat.
    */
   compat?: Record<symbol, unknown>
+  /** The production release this request serves from; dev and build leave it unset. */
+  release?: Release
 }
 
 // Anchored on globalThis (like requestStorage below) so compiled compat
@@ -65,6 +68,12 @@ export function runWithWorkUnit<T>(phase: WorkUnitPhase, callback: () => T): T {
 /** The active request work unit, or undefined outside a request scope. */
 export function getWorkUnit(): WorkUnit | undefined {
   return workUnitStorage.getStore()
+}
+
+/** Mark the current work unit as serving `release` (production reads its app facts from it). */
+export function setWorkUnitRelease(release: Release): void {
+  const unit = workUnitStorage.getStore()
+  if (unit) unit.release = release
 }
 
 /** Set the current work-unit phase (compat toggles render/action/handler/...). */

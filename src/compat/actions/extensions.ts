@@ -21,8 +21,7 @@ import {
 import { getRequestRuntime, type RequestRuntime } from '../../routing/request-environment'
 import { toPosixPath } from '../../utils/fs'
 import type { ActionManifestEntry, BuildManifest, RouteManifestEntry } from '../../types'
-import { devServerModuleHref } from '../../runtime/modules'
-import { serverBundleTargetForRuntime } from '../../runtime/loader'
+import { devServerModuleHref, serverBundleTargetForRuntime } from '../../runtime/load'
 import {
   renderActionReturnElement,
   renderGlobalNotFoundResponse,
@@ -31,7 +30,7 @@ import {
   renderPageResponse,
 } from '../../render/renderer'
 import { routeParamsFromPath } from '../../routing/handler'
-import { selectRouteForRequest } from '../../routing/routes'
+import { selectRouteForRequest } from '../../routing/match'
 import { discoverActions, registerDiscoveredActions } from './discovery'
 import { clearActions, lookupActionSource, registerActionModule } from './registry'
 import {

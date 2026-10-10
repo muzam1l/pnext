@@ -50,8 +50,8 @@ markBoot('cli:entry')
 namedBunBinary(commandBinaryName(command))
 
 // Before any command lazily imports esbuild, which captures the binary path on
-// module load.
-nameEsbuildProcess()
+// module load. `start` serves a finished build and never loads it.
+if (command !== 'start') nameEsbuildProcess()
 markBoot('cli:naming')
 
 try {
@@ -90,7 +90,10 @@ try {
   } else if (command === 'start') {
     warnUnknownFlags(command, args)
     const root = positionalRoot(args)
-    const { start } = await import('./start')
+    // A build of other source than this prebundle's is served from that source.
+    const { start } = (await prebundleServes(root))
+      ? await import('./start')
+      : ((await import(new URL('./start.ts', import.meta.url).href)) as typeof import('./start'))
     await start({
       root,
       port: optionNumber(args, '--port'),
@@ -158,6 +161,23 @@ function formatCliError(error: unknown) {
     message: message.slice(0, traceStart),
     trace: message.slice(traceStart + 1),
   }
+}
+
+declare const PNEXT_PREBUNDLE: { version: string; fingerprint: string } | undefined
+
+/** Whether this process's prebundle may serve `root`'s build: one made from its source and version. */
+async function prebundleServes(root = process.cwd()) {
+  if (typeof PNEXT_PREBUNDLE !== 'object') return true
+  const [{ DEFAULT_OUT_DIR }, { locateRelease, readBuildIndex }] = await Promise.all([
+    import('../config'),
+    import('../runtime/production'),
+  ])
+  const outPath = locateRelease(path.resolve(root), DEFAULT_OUT_DIR)
+  return (
+    !outPath ||
+    (readBuildIndex(outPath).framework === PNEXT_PREBUNDLE.fingerprint &&
+      VERSION === PNEXT_PREBUNDLE.version)
+  )
 }
 
 function positionalRoot(args: string[]) {

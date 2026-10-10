@@ -581,6 +581,71 @@ function child(node: AstNode | undefined, key: string): AstNode | undefined {
   return isNode(value) ? value : undefined
 }
 
+/**
+ * Drop `type: "json"` attributes from the import declarations and `import()` calls whose target
+ * `compiled` claims: the target is JS, which a native load would parse as JSON.
+ */
+export function stripJsonImportAttributes(
+  source: string,
+  file: string,
+  compiled: (specifier: string) => boolean,
+) {
+  const result = parseSync(file, source, { lang: 'js', sourceType: 'module' })
+  if (result.errors.length > 0) return source
+  const edits: { start: number; end: number; value: string }[] = []
+  const visit = (node: AstNode) => {
+    const target = child(node, 'source')
+    const specifier = stringValue(target)
+    if (target && specifier !== undefined && compiled(specifier)) {
+      const attributes = node.attributes as AstNode[] | undefined
+      const options = child(node, 'options')
+      if (attributes?.length && attributes.every(jsonTypeAttribute)) {
+        const end = source.indexOf('}', attributes.at(-1)!.end) + 1
+        edits.push({ start: target.end, end, value: '' })
+      } else if (node.type === 'ImportExpression' && options && jsonImportOptions(options)) {
+        edits.push({ start: target.end, end: options.end, value: '' })
+      }
+    }
+    for (const value of Object.values(node)) {
+      if (isNode(value)) visit(value)
+      else if (Array.isArray(value)) for (const item of value) if (isNode(item)) visit(item)
+    }
+  }
+  visit(result.program as unknown as AstNode)
+  return edits.length > 0 ? spliceSource(source, edits) : source
+}
+
+function propertyName(node: AstNode | undefined) {
+  if (!node) return undefined
+  return node.type === 'Identifier' ? (node.name as string) : stringValue(node)
+}
+
+function jsonTypeAttribute(node: AstNode) {
+  return (
+    !node.computed &&
+    propertyName(child(node, 'key')) === 'type' &&
+    stringValue(child(node, 'value')) === 'json'
+  )
+}
+
+/** `{ with: { type: 'json' } }` (or `assert`) and nothing else. */
+function jsonImportOptions(options: AstNode) {
+  const [property, ...rest] = (options.properties as AstNode[] | undefined) ?? []
+  const attributes = child(property, 'value')
+  const entries = attributes?.properties as AstNode[] | undefined
+  return (
+    options.type === 'ObjectExpression' &&
+    !!property &&
+    rest.length === 0 &&
+    property.type === 'Property' &&
+    !property.computed &&
+    ['with', 'assert'].includes(propertyName(child(property, 'key')) ?? '') &&
+    attributes?.type === 'ObjectExpression' &&
+    !!entries?.length &&
+    entries.every(entry => entry.type === 'Property' && jsonTypeAttribute(entry))
+  )
+}
+
 function collectDynamicCalls(program: AstNode): DynamicCallFact[] {
   const calls: DynamicCallFact[] = []
   const visit = (value: unknown) => {

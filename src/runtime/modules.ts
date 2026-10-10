@@ -1,7 +1,7 @@
 import { builtinModules } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
-import { existsSync, readFileSync, type Dirent } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync, type Dirent } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { copyFile, mkdir, readdir, readlink, rm, symlink, writeFile } from 'node:fs/promises'
 import type { OnResolveResult, Plugin } from 'esbuild'
@@ -23,7 +23,13 @@ import {
   serverBundleRequireConditions,
   type ServerBundleTarget,
 } from './loader'
-import { externalServerPackageHref, runtimeServerImportTarget } from '../runtime/vendor-build'
+import {
+  clearReleaseDependencyLog,
+  externalServerPackageHref,
+  noteReleaseModuleLayer,
+  runtimeServerImportTarget,
+  type ReleaseDependencyLayer,
+} from '../runtime/vendor-build'
 import { writeFileAtomic } from '../utils/fs'
 import { traceEnabled, traceValue } from '../utils/trace-flags'
 import { createHash } from 'node:crypto'
@@ -58,6 +64,7 @@ import {
   importSpecifiers,
   moduleSpecifierEdges,
   rewriteSpecifierLiterals,
+  stripJsonImportAttributes,
 } from '../resolve/scan-facts'
 import {
   cacheRoot,
@@ -76,7 +83,20 @@ import {
   transformServerModule,
   type SpecifierKind,
 } from './module-transform'
+import { splitResourceQuery } from '../resolve/engine'
 import { findShakeableDynamicImports } from '../resolve/tree-shake'
+import { productionRelease, releaseModuleHref } from './production'
+import {
+  clearModuleGraphFailure,
+  forgetModuleEvalError,
+  importModuleOnce,
+  isReleaseCompile,
+  noteModuleGraphFailure,
+  setReleaseCompileFlag,
+  throwIfModuleEvalFailed,
+} from './load'
+
+export { importModuleOnce, isReleaseCompile, throwIfModuleGraphFailed } from './load'
 import type { RouteManifestEntry } from '../types'
 import { uniqueIdentifier } from '../utils/code'
 import { formatDuration } from '../utils/verbose'
@@ -114,35 +134,11 @@ const routeBundleBuilds = new Map<string, Promise<string>>()
 // present during an earlier check. This avoids repeated reads/parses without
 // turning one observation into a permanent claim that the closure still exists.
 const completeArtifactClosures = new Map<string, readonly string[]>()
-let moduleGraphFailure: Error | undefined
 
 /** Reset build-only graph state before starting another build in this process. */
 export function resetModuleGraphFailure(): void {
-  moduleGraphFailure = undefined
+  clearModuleGraphFailure()
   completeArtifactClosures.clear()
-}
-
-/**
- * Fail a build even when its renderer converted a module-resolution exception
- * into a 500 response. Rendering may recover from user-code errors, but a
- * missing content-addressed artifact means the build output itself is broken.
- */
-export function throwIfModuleGraphFailed(): void {
-  if (moduleGraphFailure !== undefined) throw moduleGraphFailure
-}
-
-function noteModuleGraphFailure(error: unknown): void {
-  moduleGraphFailure ??= error instanceof Error ? error : new Error(String(error))
-}
-
-function isCompiledModuleResolutionError(error: unknown, href: string): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  if (!message.includes('Cannot find module')) return false
-  return (
-    href.includes('/cache/server/') ||
-    /[/\\]cache[/\\]server[/\\]/.test(message) ||
-    message.includes('/cache/server/')
-  )
 }
 
 // PNEXT_TRACE=server: attribute every per-module compile to its profile,
@@ -222,34 +218,9 @@ function reportModuleStats() {
 }
 const routeModuleLoaders = new Map<string, Promise<DevRouteModuleLoaders>>()
 
-// A module that throws while evaluating stays failed in Bun's registry for the process lifetime, and
-// re-importing it surfaces downstream symptoms (a missing bundle entry, TDZ on an export) instead of
-// the original error. Record the first failure per compiled href and re-throw THAT on every later
-// request. Compiled hrefs are content-addressed, so a save that fixes the module yields a new href
-// and the entry is never consulted again.
-const moduleEvalErrors = new Map<string, unknown>()
 const warmRetryHrefs = new Map<string, Promise<string>>()
 const warmImports = new Map<string, Promise<void>>()
 let warmRetryGeneration = 0
-
-/**
- * Import a compiled module, re-throwing its first evaluation error on later imports.
- *
- * Production needs this as much as dev: a re-import resolves with a half-evaluated namespace whose
- * `export const` bindings are still in TDZ, so the render's next read (`module.metadata`) throws
- * `Cannot access 'metadata' before initialization` and that replaces the real error in the response.
- * Prod hrefs are content-addressed too, so the entry keys the same way dev's does.
- */
-export async function importModuleOnce<T>(href: string): Promise<T> {
-  if (moduleEvalErrors.has(href)) throw moduleEvalErrors.get(href)
-  try {
-    return (await import(href)) as T
-  } catch (error) {
-    if (isCompiledModuleResolutionError(error, href)) noteModuleGraphFailure(error)
-    moduleEvalErrors.set(href, error)
-    throw error
-  }
-}
 
 interface ImportDevModuleOptions {
   /** A speculative import whose evaluation failure must not become render state. */
@@ -298,7 +269,7 @@ export async function importDevModule<T>(
   let attemptedEvaluation = false
   try {
     importHref = (await warmRetryHrefs.get(href)) ?? href
-    if (moduleEvalErrors.has(importHref)) throw moduleEvalErrors.get(importHref)
+    throwIfModuleEvalFailed(importHref)
     // Pre-planned vendor builds are enqueued without an awaiter; nothing
     // evaluates until they all settle (no-op when the pipeline is empty).
     await drainPreplanBuilds()
@@ -312,7 +283,7 @@ export async function importDevModule<T>(
       // the real render a fresh module identity, so speculative work can never poison the request.
       const retryHref = nextWarmRetryHref(href)
       warmRetryHrefs.set(href, retryHref)
-      if (moduleEvalErrors.get(importHref) === error) moduleEvalErrors.delete(importHref)
+      forgetModuleEvalError(importHref, error)
       await retryHref
     }
     throw error
@@ -338,6 +309,7 @@ const moduleCaches = new WeakMap<ResolvedConfig, DevModuleCache>()
 export function devModuleGraph(config: ResolvedConfig): DevModuleCache {
   const existing = moduleCaches.get(config)
   if (existing) return existing
+  if (isReleaseCompile()) releaseAnchors.set(cacheRoot(config.outPath), portableAnchors(config))
   const cache = devModuleCache(config, {
     compileKey: devCompileKey(config),
     edges: (file, source) => graphEdges(config, file, source),
@@ -429,6 +401,14 @@ function devAliasKeys(config: ResolvedConfig) {
   return keys
 }
 
+/** The out dir is compiled output, save the pages sources a build materializes into it. */
+function isCompiledOutput(config: ResolvedConfig, file: string) {
+  return (
+    isInside(config.outPath, file) &&
+    !isInside(path.join(config.outRootPath, 'pnext-pages-compat'), file)
+  )
+}
+
 /**
  * Source edges the graph hash follows. A superset of the compiled graph is safe - it only widens what
  * a save invalidates - but a subset would leave a dependent holding a name that no longer describes
@@ -444,7 +424,7 @@ function graphEdges(config: ResolvedConfig, file: string, source: string) {
     const resolved = resolveLocalImport(config, file, sourcePath.replace(/\?.*$/, ''))
     const isLocalSource = sourcePath.startsWith('.') || path.isAbsolute(sourcePath)
     // Compiled output is never a source of the graph that produced it.
-    if (resolved && isInside(config.outPath, resolved)) continue
+    if (resolved && isCompiledOutput(config, resolved)) continue
     if (resolved && (isLocalSource || isInside(config.workspaceRoot, resolved))) {
       imports.push(path.resolve(resolved))
       continue
@@ -547,6 +527,9 @@ export async function devServerModuleHref(
   _version?: string,
   moduleOptions: DevServerModuleOptions = {},
 ) {
+  const served = productionRelease(config)
+  if (served)
+    return releaseModuleHref(served, 'server', moduleOptions.conditionTarget ?? 'server', file)
   const conditionTarget = pagesLayerConditionTarget(
     config,
     file,
@@ -585,6 +568,8 @@ export async function devClientModuleHref(
   _version?: string,
   serverTarget?: ServerBundleTarget,
 ) {
+  const served = productionRelease(config)
+  if (served) return releaseModuleHref(served, 'client', serverTarget ?? 'server', file)
   const conditionTarget = clientLayerConditionTarget(config, file, serverTarget ?? 'server')
   const throughPackage = await packageClientModuleHref(config, file, conditionTarget)
   if (throughPackage) return throughPackage
@@ -1414,30 +1399,252 @@ export function setEmitCompiledSpecifiersManifest(enabled: boolean) {
   }
 }
 
+// A production build compiles for its release: `.js` artifact names, one asset-context link per
+// directory, core CSS module class maps. Dev keeps its own compile.
+// A build's sources do not change under it, so each directory's asset context links once; dev relinks.
+const linkedAssetContexts = new Map<string, Promise<void>>()
+
+/** @internal The build sets this for its own duration. Returns a restore function. */
+export function setReleaseCompile(enabled: boolean) {
+  const previous = isReleaseCompile()
+  setReleaseCompileFlag(enabled)
+  // Each build starts from an emptied out dir, so nothing linked or stubbed before still stands.
+  linkedAssetContexts.clear()
+  assetStubs.clear()
+  releaseAnchors.clear()
+  packageCandidates.clear()
+  packageSpecifiers.clear()
+  clearReleaseDependencyLog()
+  return () => setReleaseCompileFlag(previous)
+}
+
 /** Sidecar suffix for a compiled artifact's recorded specifiers. */
 export const compiledSpecifiersManifestSuffix = '.pnext-specifiers.json'
 
 const compiledScriptFilePattern = /\.(?:m?js|cjs|jsx|tsx?)$/
 
+/** Where a release may move with its app: the root, its node_modules links, the workspace. */
+interface PortableAnchors {
+  roots: string[]
+  /** Real directory -> the logical path the app's node_modules names it by. */
+  links: Map<string, string>
+}
+
+const releaseAnchors = new Map<string, PortableAnchors>()
+
+function portableAnchors(config: ResolvedConfig): PortableAnchors {
+  const links = new Map<string, string>()
+  const link = (logical: string) => {
+    try {
+      const real = realpathSync(logical)
+      if (real !== logical && !links.has(real)) links.set(real, logical)
+    } catch {
+      // A dangling entry links nothing.
+    }
+  }
+  const nodeModules = path.join(config.root, 'node_modules')
+  link(nodeModules)
+  for (const name of listDirectory(nodeModules)) {
+    const entry = path.join(nodeModules, name)
+    if (name.startsWith('@'))
+      for (const scoped of listDirectory(entry)) link(path.join(entry, scoped))
+    else link(entry)
+  }
+  return { roots: [config.root, config.workspaceRoot], links }
+}
+
+function listDirectory(dir: string) {
+  try {
+    return readdirSync(dir)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Rewrite `file://` URLs in compiled output relative to `file`: import specifiers become relative
+ * specifiers, and (for a release) inlined URL literals become `new URL(<relative>, import.meta.url)`.
+ * `locate` maps an absolute target to the path to link, or undefined to leave it. A release names an
+ * installed package file by the bare specifier that resolves back to it, so the serving install wins.
+ */
+function relocateSource(
+  file: string,
+  contents: string,
+  locate: (absolute: string) => string | undefined,
+  installed: (absolute: string) => boolean = () => false,
+) {
+  const relativeTo = (target: string) => {
+    const relative = toPosixPath(path.relative(path.dirname(file), target))
+    return relative.startsWith('.') ? relative : `./${relative}`
+  }
+  const edits: { start: number; end: number; value: string }[] = []
+  for (const found of outputSpecifiers(contents)) {
+    const { sourcePath, hash } = splitHash(found.value)
+    const url = sourcePath.startsWith('file://')
+    // A release also re-links plain absolute specifiers (a bundled `require('/abs/path')`).
+    if (!url && !(isReleaseCompile() && path.isAbsolute(sourcePath))) continue
+    const absolute = url ? fileURLToPath(sourcePath) : sourcePath
+    const target = locate(absolute)
+    const bare = isReleaseCompile() && installed(absolute) && packageSpecifier(file, absolute)
+    const value = bare || (target && relativeTo(target))
+    if (!value) continue
+    const query = url ? new URL(sourcePath).search : ''
+    edits.push({
+      start: found.start,
+      end: found.end,
+      value: JSON.stringify(`${value}${query}${hash}`),
+    })
+  }
+  const specifiers = spliceSource(contents, edits)
+  if (!isReleaseCompile()) return specifiers
+  // Path literals (client-reference targets, module URLs) resolve beside the artifact at runtime.
+  return specifiers.replace(
+    /(?<!\\)"((?:file:\/\/)?\/[^"\\\n]+)"(\s*:)?/g,
+    (literal, value: string, key: string | undefined) => {
+      const url = value.startsWith('file:')
+      const target = locate(url ? fileURLToPath(value) : value)
+      if (!target) return literal
+      const href = `new URL(${JSON.stringify(relativeTo(target))}, import.meta.url)`
+      const expression = url ? `${href}.href` : `decodeURIComponent(${href}.pathname)`
+      return key ? `[${expression}]${key}` : expression
+    },
+  )
+}
+
+const isInstalled = (file: string) => file.includes(`${path.sep}node_modules${path.sep}`)
+const packageCandidates = new Map<string, string | null>()
+const packageSpecifiers = new Map<string, boolean>()
+
+/** The bare specifier that resolves from `from` back to installed `file`, if one does. */
+function packageSpecifier(from: string, file: string) {
+  const candidate = packageCandidate(file)
+  // One miss settles it: the fallback path is always correct, only less portable.
+  if (!candidate || packageSpecifiers.get(candidate) === false) return undefined
+  const key = `${path.dirname(from)}\0${candidate}`
+  let resolves = packageSpecifiers.get(key)
+  if (resolves === undefined) {
+    try {
+      resolves = realpathSync(Bun.resolveSync(candidate, path.dirname(from))) === realpathSync(file)
+    } catch {
+      resolves = false
+    }
+    packageSpecifiers.set(key, resolves)
+    if (!resolves) packageSpecifiers.set(candidate, false)
+  }
+  return resolves ? candidate : undefined
+}
+
+/** How installed `file` is named bare: the exports subpath that targets it, else its deep path. */
+function packageCandidate(file: string) {
+  let candidate = packageCandidates.get(file)
+  if (candidate !== undefined) return candidate
+  candidate = null
+  const packageDir = nodeModulesPackageDir(file)
+  const name = packageDir && packageNameOfDirectory(packageDir)
+  if (packageDir && name) {
+    const subpath = `./${toPosixPath(path.relative(packageDir, file))}`
+    const exports = packageExportsMap(packageDir)
+    if (!exports) candidate = `${name}/${subpath.slice(2)}`
+    for (const [key, value] of Object.entries(exports ?? {})) {
+      if (key.includes('*') || !exportTargets(value).includes(subpath)) continue
+      candidate = key === '.' ? name : `${name}/${key.slice(2)}`
+      break
+    }
+  }
+  packageCandidates.set(file, candidate)
+  return candidate
+}
+
+/** A package's exports as a subpath map (`"."` for a bare entry), or undefined when it has none. */
+function packageExportsMap(packageDir: string): Record<string, unknown> | undefined {
+  try {
+    const { exports } = JSON.parse(readFileSync(path.join(packageDir, 'package.json'), 'utf8')) as {
+      exports?: unknown
+    }
+    if (exports === undefined || exports === null) return undefined
+    if (typeof exports !== 'object' || Array.isArray(exports)) return { '.': exports }
+    return Object.keys(exports).some(key => key.startsWith('.'))
+      ? (exports as Record<string, unknown>)
+      : { '.': exports }
+  } catch {
+    return undefined
+  }
+}
+
+function exportTargets(value: unknown): string[] {
+  if (typeof value === 'string') return [value]
+  if (Array.isArray(value)) return value.flatMap(exportTargets)
+  return value && typeof value === 'object' ? Object.values(value).flatMap(exportTargets) : []
+}
+
+/** A release bundle emitted outside the module graph, rewritten to reach its targets relatively. */
+export function relocateReleaseBundle(config: ResolvedConfig, file: string, contents: string) {
+  const anchors = portableAnchors(config)
+  return relocateSource(file, contents, absolute => portableTarget(anchors, absolute), isInstalled)
+}
+
+/** A release artifact written outside writeCompiledFile (vendor bundles), re-linked like one. */
+export function releaseArtifactSource(file: string, contents: string) {
+  if (!isReleaseCompile()) return contents
+  const cacheRoot = [...releaseAnchors.keys()].find(root => isInside(root, file))
+  const anchors = cacheRoot && releaseAnchors.get(cacheRoot)
+  if (!cacheRoot || !anchors) return contents
+  return relocateSource(
+    file,
+    releaseInputComments(contents),
+    absolute => (isInside(cacheRoot, absolute) ? absolute : portableTarget(anchors, absolute)),
+    absolute => !isInside(cacheRoot, absolute) && isInstalled(absolute),
+  )
+}
+
+/**
+ * esbuild's per-input `// <path>` comments, cut to the file name (or its `node_modules/` path, which
+ * names a vendored font caller): their paths walk the build machine.
+ */
+function releaseInputComments(contents: string) {
+  return contents.replace(/^\/\/ (?:[\w-]+:)?\.{0,2}\/[^\s]*$/gm, comment => {
+    const installed = comment.indexOf('node_modules/')
+    return `// ${installed === -1 ? path.basename(comment) : comment.slice(installed)}`
+  })
+}
+
+/** `target` as a path a moved release still reaches: through the app's own tree, never the machine's. */
+function portableTarget(anchors: PortableAnchors, target: string) {
+  if (anchors.roots.some(root => isInside(root, target))) return target
+  // Nearest linked ancestor first, so a package link wins over the node_modules link that holds it.
+  for (let dir = path.dirname(target); dir !== path.dirname(dir); dir = path.dirname(dir)) {
+    const logical = anchors.links.get(dir)
+    if (logical) return path.join(logical, path.relative(dir, target))
+  }
+  return undefined
+}
+
+const compiledJsonModule = /\.json\.js(?:[?#]|$)/
+
 async function writeCompiledFile(file: string, contents: string) {
   const profileRoot = compiledArtifactProfileRoot(file)
-  if (profileRoot && contents.includes('file://')) {
+  const anchors =
+    profileRoot && isReleaseCompile() ? releaseAnchors.get(path.dirname(profileRoot)) : undefined
+  if (
+    profileRoot &&
+    (anchors
+      ? /["'](?:file:\/\/)?\/|^\/\/ (?:[\w-]+:)?\.{0,2}\//m.test(contents)
+      : contents.includes('file://'))
+  ) {
     const cacheRoot = path.dirname(profileRoot)
-    const edits: { start: number; end: number; value: string }[] = []
-    for (const found of outputSpecifiers(contents)) {
-      const { sourcePath, hash } = splitHash(found.value)
-      if (!sourcePath.startsWith('file://')) continue
-      const target = fileURLToPath(sourcePath)
-      if (!isInside(cacheRoot, target)) continue
-      const relative = toPosixPath(path.relative(path.dirname(file), target))
-      edits.push({
-        start: found.start,
-        end: found.end,
-        value: JSON.stringify(`${relative.startsWith('.') ? relative : `./${relative}`}${hash}`),
-      })
-    }
-    contents = spliceSource(contents, edits)
+    contents = relocateSource(
+      file,
+      anchors ? releaseInputComments(contents) : contents,
+      absolute =>
+        isInside(cacheRoot, absolute) ? absolute : anchors && portableTarget(anchors, absolute),
+      absolute => !isInside(cacheRoot, absolute) && isInstalled(absolute),
+    )
   }
+  // A compiled `.json.js` is JS: a release loads it natively, where `type: "json"` would parse it as JSON.
+  if (anchors && contents.includes('.json.js'))
+    contents = stripJsonImportAttributes(contents, file, specifier =>
+      compiledJsonModule.test(specifier),
+    )
   await writeFileAtomic(file, contents)
   noteDevArtifactWritten(file)
   if (emitCompiledSpecifiersManifest && compiledScriptFilePattern.test(file)) {
@@ -1497,7 +1704,7 @@ function missingCompiledArtifact(entry: string): string | undefined {
       try {
         target = sourcePath.startsWith('file://')
           ? fileURLToPath(sourcePath)
-          : path.resolve(path.dirname(file), sourcePath)
+          : path.resolve(path.dirname(file), splitResourceQuery(sourcePath).path)
       } catch {
         return sourcePath
       }
@@ -1668,6 +1875,9 @@ async function writeDevModuleUncached(
           clientLayerConditionTarget(config, file, options.conditionTarget),
         )
       : options
+  if (effectiveOptions !== options) {
+    noteReleaseModuleLayer(config, outFile, 'client', effectiveOptions.conditionTarget)
+  }
   // The asset-context link walk is pure I/O against directories nothing below
   // reads, so it overlaps the shaking/scan/child-compile work and is only
   // awaited before the write.
@@ -2212,7 +2422,7 @@ async function assetStubModule(config: ResolvedConfig, resolved: string, profile
   if (existing) return existing
   const next = (async () => {
     const contents =
-      getCssExtensions().loadCssModuleForClient(resolved) ??
+      (await serverCssModuleSource(config, resolved)) ??
       (isCssFile(base)
         ? ''
         : isStaticImageFile(base)
@@ -2309,7 +2519,7 @@ function serverAssetPlugin(config: ResolvedConfig): Plugin {
       build.onLoad({ filter: /.*/, namespace: serverAssetNamespace }, async args => {
         // Registry-provided CSS modules (e.g. *.module.scss) export their class
         // map on the server instead of the empty-asset stub.
-        const cssModule = getCssExtensions().loadCssModuleForClient(args.path)
+        const cssModule = await serverCssModuleSource(config, args.path)
         return {
           contents:
             cssModule ??
@@ -2347,7 +2557,7 @@ async function resolveDevModuleSpecifier(
     if (
       options.stubClientImports &&
       !isCssFile(target) &&
-      !isInside(config.outPath, target) &&
+      !isCompiledOutput(config, target) &&
       existsSync(target) &&
       (await fileHasUseClientDirective(target))
     ) {
@@ -2373,6 +2583,23 @@ async function resolveDevModuleSpecifier(
   if (ruleModule) return { path: pathToFileHref(ruleModule), external: true }
 
   const { sourcePath, hash } = splitHash(specifier)
+
+  // A release compiles an unclaimed `?query` import's base module; the query keeps its own instance.
+  const queried = splitResourceQuery(sourcePath)
+  if (
+    isReleaseCompile() &&
+    queried.query &&
+    sourcePath.startsWith('.') &&
+    compiledScriptFilePattern.test(queried.path)
+  ) {
+    const from = importer && !importer.startsWith('<') ? importer : file
+    const base = resolveImport(config.root, from, queried.path, config.workspaceRoot)
+    if (base && isInside(config.workspaceRoot, base)) {
+      await writeDevModule(config, base, visited, options)
+      const href = pathToFileHref(await devModulePath(config, base, options))
+      return { path: `${href}${queried.query}${hash}`, external: true }
+    }
+  }
 
   const compatAlias =
     pagesCompatSourceAlias(config, specifier, importer, options) ?? options.aliases[specifier]
@@ -2893,7 +3120,7 @@ function localImportTargets(
     // vendor bundle) are already compiled modules Bun imports directly. Feeding one back through the
     // pipeline compiles it a SECOND time, splitting module identity and pulling artifact names into the
     // source graph, where every boot's fresh names look like edits.
-    if (resolved && !isInside(config.outPath, resolved)) {
+    if (resolved && !isCompiledOutput(config, resolved)) {
       targets.push({
         target: resolved,
         isLocalSource: sourcePath.startsWith('.') || path.isAbsolute(sourcePath),
@@ -2941,9 +3168,20 @@ async function writeClientReferenceModules(
   return { specifiers, files }
 }
 
+/** How a release's stub names its source portably (see ClientReferenceModuleOptions.portable). */
+function portableReference(file: string, sourceFile: string) {
+  const profileRoot = compiledArtifactProfileRoot(file)
+  const anchors = isReleaseCompile() && profileRoot && releaseAnchors.get(path.dirname(profileRoot))
+  const target = anchors && portableTarget(anchors, sourceFile)
+  return target ? { portable: { from: file, target, real: target !== sourceFile } } : {}
+}
+
 async function writeClientReferenceModule(file: string, sourceFile: string, exportNames: string[]) {
   await mkdir(path.dirname(file), { recursive: true })
-  await writeCompiledFile(file, clientReferenceModuleSource(sourceFile, exportNames))
+  await writeCompiledFile(
+    file,
+    clientReferenceModuleSource(sourceFile, exportNames, portableReference(file, sourceFile)),
+  )
 }
 
 async function fileHasUseClientDirective(file: string) {
@@ -2962,6 +3200,20 @@ function splitHash(specifier: string) {
 function isInside(root: string, file: string) {
   const relative = path.relative(root, file)
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
+}
+
+/** Where an App Router layer's release modules compile to. */
+export function releaseLayerArtifactDir(config: ResolvedConfig, layer: ReleaseDependencyLayer) {
+  const profile =
+    layer === 'client:client'
+      ? devModuleProfile(clientLayerOptions(config))
+      : devModuleProfile({
+          profile: 'compat',
+          conditionTarget: 'server',
+          externalLoadTarget: externalLoadTargetForConditionTarget('server'),
+          reactServerLayer: true,
+        } as DevModuleOptions)
+  return path.join(cacheRoot(config.outPath), `modules-${profile}`)
 }
 
 function devModuleProfile(options: DevModuleOptions) {
@@ -2989,7 +3241,13 @@ function devServerPath(config: ResolvedConfig, file: string, profile: string, ha
   // A compiled `.json` module is JS (esbuild's json loader wraps it in exports),
   // so it must not keep the `.json` name — the runtime would parse the artifact
   // as JSON. Keeping the source name in front of `.js` keeps it collision-free.
-  const outExt = ext === '.json' ? '.json.js' : ext
+  // Build output names compiled scripts `.js`, so production imports them without a TS/MDX loader.
+  const outExt =
+    ext === '.json'
+      ? '.json.js'
+      : isReleaseCompile() && /\.(?:[jt]sx?|mdx?)$/.test(ext)
+        ? '.js'
+        : ext
   return path.join(
     cacheRoot(config.outPath),
     profile === 'server' ? 'modules' : `modules-${profile}`,
@@ -3082,6 +3340,15 @@ function isCssFile(file: string) {
   return file.endsWith('.css')
 }
 
+/** A CSS module's class map as a build's server output imports it; core's plain CSS modules map here. */
+async function serverCssModuleSource(config: ResolvedConfig, file: string) {
+  const registered = getCssExtensions().loadCssModuleForClient(file)
+  const coreBuild = isReleaseCompile() && !reactCompatEnabled(config)
+  if (registered !== undefined || !coreBuild || !file.endsWith('.module.css')) return registered
+  const { cssModuleMapping } = await import('../css/build')
+  return `export default ${JSON.stringify(await cssModuleMapping(file))};`
+}
+
 function isStaticImageFile(file: string) {
   return /\.(?:png|jpe?g|gif|webp|avif|svg|ico|bmp)(?:$|[?#])/.test(file)
 }
@@ -3133,9 +3400,20 @@ function resolveLocalImport(config: ResolvedConfig, fromFile: string, specifier:
 
 async function linkAssetContext(config: ResolvedConfig, file: string, profile: string) {
   if (!isInside(config.root, file)) return
-  const sourceDirs = ancestorDirs(config.root, path.dirname(file))
+  const sourceDirs = ancestorDirs(config.root, path.dirname(file)).filter(
+    dir => !isCompiledOutput(config, dir),
+  )
   await Promise.all(
-    sourceDirs.map(sourceDir => linkDirectoryAssetContext(config, sourceDir, profile)),
+    sourceDirs.map(sourceDir => {
+      if (!isReleaseCompile()) return linkDirectoryAssetContext(config, sourceDir, profile)
+      const key = `${config.outPath}\0${profile}\0${sourceDir}`
+      let linked = linkedAssetContexts.get(key)
+      if (!linked) {
+        linked = linkDirectoryAssetContext(config, sourceDir, profile)
+        linkedAssetContexts.set(key, linked)
+      }
+      return linked
+    }),
   )
 }
 
@@ -3168,6 +3446,14 @@ async function linkDirectoryAssetContext(
       if (!assetContextEntry(config, sourceDir, entry.name, entry.isDirectory())) return
       const source = path.join(sourceDir, entry.name)
       const target = path.join(targetDir, entry.name)
+      // A linked directory below the root (pages-compat's `source-pages`) compiles on its own path:
+      // staging the link would write its artifacts through it, into the source tree.
+      if (
+        entry.isSymbolicLink() &&
+        sourceDir !== config.root &&
+        statSync(source, { throwIfNoEntry: false })?.isDirectory()
+      )
+        return
       // Root-level sibling asset directories are mirrored, not symlinked wholesale: a `dir` symlink
       // would make every path beneath it - including code modules that must be compiled through the
       // alias transform - resolve straight back to raw source, shadowing the staged compile.
@@ -3208,9 +3494,11 @@ async function stagedManifestSource(file: string) {
 async function linkOrCopyAsset(source: string, target: string) {
   const resolvedSource = path.resolve(source)
   // Concurrent walkers keep a repaired link and remove only the stale target.
+  // A release links relatively: moved with its app, it names no build-machine path.
+  const linkTarget = isReleaseCompile() ? path.relative(path.dirname(target), source) : source
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
-      await symlink(source, target, 'file')
+      await symlink(linkTarget, target, 'file')
       return
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') break
@@ -3266,7 +3554,8 @@ function assetContextEntry(
     'pages',
     'public',
     'node_modules',
-    path.basename(config.outRootPath),
+    // The out dir's top segment (`dist` for `dist/build`): mirroring it would recurse into its own output.
+    path.relative(config.root, config.outRootPath).split(path.sep)[0],
   ]).has(name)
 }
 

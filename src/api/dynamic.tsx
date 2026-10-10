@@ -9,6 +9,8 @@ export const dynamicReferenceSymbol = Symbol.for('pnext.dynamic')
 export interface DynamicTarget {
   file: string
   exportName: string
+  /** The client-reference id the build derived, so a moved build matches without the path. */
+  id?: string
 }
 
 export interface DynamicReference<Props extends object = object> {

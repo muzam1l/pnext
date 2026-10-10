@@ -52,7 +52,7 @@ import {
   staticMetadataCacheControl,
 } from '../routing/metadata-files'
 import { handleRouteModule, type RouteHandlerModule } from '../routing/handler'
-import { malformedUrlResponse, trailingSlashRedirect } from '../routing/href'
+import { malformedUrlResponse, repeatedSlashRedirect, trailingSlashRedirect } from '../routing/href'
 import { type PeerAddressSource, withForwardedHeaders } from '../routing/forwarded'
 import {
   assertNoServerActionsWithoutCompat,
@@ -87,7 +87,14 @@ import {
   setWorkUnitRoute,
 } from '../request/context'
 import { setRequestRuntime } from '../routing/request-environment'
-import { ensureDir, listFiles, writeText } from '../utils/fs'
+import {
+  ensureDir,
+  exactNameIndex,
+  type ExactNames,
+  hasExactName,
+  listFiles,
+  writeText,
+} from '../utils/fs'
 import { contentType } from '../utils/content-type'
 import { traceEnabled } from '../utils/trace-flags'
 import {
@@ -290,6 +297,7 @@ export async function startDevServer(options: DevServerOptions) {
   markBoot('boot:scanRoutes')
   await validateProxyFiles(config)
   let proxyRunner = createProxyRunner(config)
+  const exactNames = exactNameIndex(config.root)
   markBoot('boot:proxy')
   let devImportVersion = String(Date.now())
   // The proxy runs serially in front of every request, so its compile+import is
@@ -436,6 +444,8 @@ export async function startDevServer(options: DevServerOptions) {
     if (badRequest) return badRequest
     request = withForwardedHeaders(request, server)
     let url = new URL(request.url)
+    const slashRedirect = repeatedSlashRedirect(url)
+    if (slashRedirect) return slashRedirect
     const profile = devRequestProfile(request, url)
     if (profile) logDevProfile(profile, 'prologue (bootstrap/headers/url)', prologueStart)
     let pageLog = startDevPageStallTimer(pendingDevPageLoadLog(routes, request, url))
@@ -475,6 +485,10 @@ export async function startDevServer(options: DevServerOptions) {
     }
 
     try {
+      // Before the proxy, for every method, as in Next: the proxy only ever sees canonical paths.
+      const canonicalRedirect = trailingSlashRedirect(config, url)
+      if (canonicalRedirect) return finish(canonicalRedirect)
+
       const initialPrefetchResponse = maybeDevPagePrefetchResponse(routes, url.pathname, request)
       if (initialPrefetchResponse) return finish(initialPrefetchResponse)
 
@@ -570,7 +584,7 @@ export async function startDevServer(options: DevServerOptions) {
       }
 
       const staticResponse = await profileDevStep(profile, 'static lookup', () =>
-        maybeStaticFile(config.publicPath, url.pathname),
+        maybeStaticFile(config.publicPath, url.pathname, exactNames),
       )
       if (staticResponse) {
         setWorkUnitRoute('static-asset', 'static')
@@ -582,7 +596,11 @@ export async function startDevServer(options: DevServerOptions) {
           .staticAssetPublicPrefixes()
           .some(prefix => url.pathname.startsWith(prefix))
       ) {
-        const emitted = await maybeStaticFile(path.join(config.outPath, 'public'), url.pathname)
+        const emitted = await maybeStaticFile(
+          path.join(config.outPath, 'public'),
+          url.pathname,
+          exactNames,
+        )
         if (emitted) {
           setWorkUnitRoute('static-asset', 'static')
           return finish(applyProxyResponse(emitted, proxyResponse))
@@ -597,6 +615,7 @@ export async function startDevServer(options: DevServerOptions) {
         const outPublicStatic = await maybeStaticFile(
           path.join(config.outPath, 'public'),
           staticAssetPathname,
+          exactNames,
         )
         if (outPublicStatic) {
           setWorkUnitRoute('static-asset', 'static')
@@ -646,9 +665,6 @@ export async function startDevServer(options: DevServerOptions) {
           url = new URL(request.url)
         }
       }
-
-      const canonicalRedirect = trailingSlashRedirect(config, url, request.method.toUpperCase())
-      if (canonicalRedirect) return finish(applyProxyResponse(canonicalRedirect, proxyResponse))
 
       const nav = parseNavState(request)
       const matched = profileDevSyncStep(profile, 'match route', () =>
@@ -1402,9 +1418,12 @@ async function maybeStaticMetadataFile(config: ResolvedConfig, url: URL) {
   })
 }
 
-async function maybeStaticFile(publicPath: string, pathname: string) {
+async function maybeStaticFile(publicPath: string, pathname: string, exactNames: ExactNames) {
   const filePath = path.join(publicPath, pathname.replace(/^\/+/, ''))
   if (!isInside(publicPath, filePath) || !existsSync(filePath)) return null
+  if (exactNames && !hasExactName(exactNames, publicPath, path.relative(publicPath, filePath))) {
+    return null
+  }
   const fileStat = await stat(filePath)
   if (!fileStat.isFile()) return null
   return devResponse(await readFile(filePath), contentType(filePath))

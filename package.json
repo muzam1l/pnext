@@ -1,6 +1,6 @@
 {
   "name": "@wular/pnext",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "A fast little framework for server-first React apps, fully compatible with Next.js",
   "type": "module",
   "bin": {
@@ -26,6 +26,7 @@
   "files": [
     "bin",
     "config",
+    "dist",
     "src",
     "tsconfig.json",
     "reference"
@@ -53,6 +54,8 @@
     "bench": "bun bench/run.ts",
     "clean": "rm -rf .turbo .pnext node_modules",
     "prepublishOnly": "bun run lint",
+    "prepack": "NODE_ENV=production bun scripts/prebundle.ts",
+    "postpack": "rm -rf dist",
     "version-bump:patch": "bun scripts/bump.mjs patch",
     "version-bump:minor": "bun scripts/bump.mjs minor",
     "version-bump:major": "bun scripts/bump.mjs major"

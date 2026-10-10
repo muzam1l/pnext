@@ -14,6 +14,7 @@
 // lazy-static MISS responses. Emitting it for pure static HITs needs the route's cacheLife persisted in
 // the build manifest and read by the static-serve path in src/cli/start.ts.
 
+import { productionRelease } from '../../runtime/production'
 import type { ResolvedConfig } from '../../config'
 import { nextCompatEnabled } from '../../compat/aliases'
 import {
@@ -84,7 +85,8 @@ export function registerUseCacheExtensions(config: ResolvedConfig): void {
   // Seed the root-param NAME set for cache-key participation (Stage B-3): a
   // `use cache` entry's conservative first-call key may only discriminate by
   // root params, so the runtime needs the scanned names at build AND serve.
-  setUseCacheRootParamNames(scanRootParams(config.appPath))
+  const released = productionRelease(config)?.compat?.rootParams
+  setUseCacheRootParamNames(released ? new Set(released) : scanRootParams(config.appPath))
 
   // Arm `use cache` build-time validation for this build's prerender pass.
   // Registered as a build STEP so it runs before any page is prerendered; the

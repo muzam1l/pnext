@@ -134,12 +134,12 @@ async function renderWithSatori(
   element: unknown,
   options: ImageResponseOptions,
 ): Promise<Uint8Array | undefined> {
+  // Fonts first: without one satori cannot lay out text, so loading it would be wasted work.
+  const fonts = normalizeFonts(options.fonts)
+  if (fonts.length === 0) return undefined
   const satori = await loadOptional<SatoriModule>('satori')
   const resvg = await loadOptional<ResvgModule>('@resvg/resvg-js')
   if (!satori || !resvg) return undefined
-
-  const fonts = normalizeFonts(options.fonts)
-  if (fonts.length === 0) return undefined
 
   const width = dimension(options.width, DEFAULT_WIDTH, 'width')
   const height = dimension(options.height, DEFAULT_HEIGHT, 'height')

@@ -13,6 +13,7 @@ import { getBuildExtensions } from '../extensions'
 import { drainWorkUnits } from '../request/context'
 import { markErrorLogged } from '../utils/error-log'
 import { isPostpone } from '../render/postpone'
+import { registerPrebundleResolve } from '../runtime/prebundle'
 import { browserHost, ensurePortFree, openBrowser, printServerReady } from './serve/ui'
 import type { BuildManifest } from '../types'
 import type { PeerAddressSource } from '../routing/forwarded'
@@ -33,6 +34,7 @@ type RequestHandler = (request: Request, server?: PeerAddressSource) => Promise<
 export async function createRequestHandler(
   options: { root?: string; config?: ResolvedConfig; manifest?: BuildManifest } = {},
 ): Promise<RequestHandler> {
+  registerPrebundleResolve()
   const { createRequestHandler: create } = await import('./serve/pipeline')
   return create(options)
 }

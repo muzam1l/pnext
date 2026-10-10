@@ -7,6 +7,12 @@ import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, type Dir
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+declare const PNEXT_PREBUNDLE: { fingerprint: string } | undefined
+
+// Read off the prebundle's define, not imported: compat compiles this module into app graphs.
+const prebundleFingerprint =
+  typeof PNEXT_PREBUNDLE === 'object' ? PNEXT_PREBUNDLE.fingerprint : undefined
+
 /**
  * Exactly what the package publishes and the vercel adapter ships: source extensions only, never
  * declarations (both drop them) and never machine-local files like `.DS_Store`. The same tree must
@@ -101,6 +107,9 @@ function writeRecord(dir: string, record: Record) {
 }
 
 let fingerprint: string | undefined
+let fingerprintStats: string | undefined
+// Set once this process has hashed the tree's content: only that answer may serve another app.
+let scanned = false
 const recorded = new Set<string>()
 
 /**
@@ -109,24 +118,30 @@ const recorded = new Set<string>()
  *
  * `recordDir` (a cache root) buys the O(1) stat path across restarts; without it the tree is read.
  * `PNEXT_FRAMEWORK_FINGERPRINT` pins the value outright — the bisect seam, and how a deployment can
- * replay its build's generation without walking the tree at all.
+ * replay its build's generation without walking the tree at all. The prebundle pins its publish-time value.
  */
 export function frameworkFingerprint(recordDir?: string) {
   // eslint-disable-next-line turbo/no-undeclared-env-vars
-  const pinned = process.env.PNEXT_FRAMEWORK_FINGERPRINT
+  const pinned = process.env.PNEXT_FRAMEWORK_FINGERPRINT ?? prebundleFingerprint
   if (pinned) return pinned
   // Memoized, but a second app in the same process still gets its own record - without one its next
   // boot pays the full read for a fingerprint this process already knows.
   if (fingerprint !== undefined && (!recordDir || recorded.has(recordDir))) return fingerprint
-  const files = sourceFiles(frameworkSrc)
-  const stats = statSignature(files, frameworkSrc)
   const previous = recordDir ? readRecord(recordDir) : undefined
-  fingerprint =
-    previous?.stats === stats ? previous.fingerprint : contentFingerprint(files, frameworkSrc)
+  // One content scan per process; after it a later record dir only needs its record written. A
+  // stat-only answer from an app's record serves that app, never another app's fresh cache.
+  if (!scanned || fingerprint === undefined || fingerprintStats === undefined) {
+    const files = sourceFiles(frameworkSrc)
+    fingerprintStats = statSignature(files, frameworkSrc)
+    const recordedFingerprint =
+      previous?.stats === fingerprintStats ? previous.fingerprint : undefined
+    scanned = recordedFingerprint === undefined
+    fingerprint = recordedFingerprint ?? contentFingerprint(files, frameworkSrc)
+  }
   if (recordDir) {
     recorded.add(recordDir)
-    if (previous?.stats !== stats)
-      writeRecord(recordDir, { version: RECORD_VERSION, stats, fingerprint })
+    if (previous?.stats !== fingerprintStats)
+      writeRecord(recordDir, { version: RECORD_VERSION, stats: fingerprintStats, fingerprint })
   }
   return fingerprint
 }

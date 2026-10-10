@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { frameworkFingerprint } from '../../runtime/fingerprint'
+import { readPrebundleStamp } from '../../runtime/prebundle'
 
 const frameworkRoot = path.resolve(import.meta.dirname, '..', '..', '..')
 
@@ -31,15 +32,21 @@ export function serverEntryDir(outPath: string): string {
   return path.join(outPath, 'server', `bundle-${frameworkVersion()}-${generation}`)
 }
 
-/** Write `<outPath>/server/bundle-<version>-<fingerprint>/entry.js`, re-exporting src/cli/start.ts. */
+/**
+ * Write `<outPath>/server/bundle-<version>-<fingerprint>/entry.js`, re-exporting the published
+ * prebundle's cli/start.js when it was built from this source, else src/cli/start.ts.
+ */
 export async function emitServerEntry(outPath: string): Promise<void> {
   const start = await Bun.file(path.join(import.meta.dirname, '..', 'start.ts')).text()
   const names = new Bun.Transpiler({ loader: 'ts' }).scan(start).exports
   const dir = serverEntryDir(outPath)
+  const target = readPrebundleStamp(frameworkRoot, frameworkFingerprint())
+    ? '../dist/server/cli/start.js'
+    : './cli/start.ts'
   await mkdir(dir, { recursive: true })
   await writeFile(
     path.join(dir, 'entry.js'),
-    `const pnext = await import(new URL('./cli/start.ts', import.meta.resolve('@wular/pnext')).href)\n` +
+    `const pnext = await import(new URL('${target}', import.meta.resolve('@wular/pnext')).href)\n` +
       `export const { ${names.join(', ')} } = pnext\n`,
   )
 }

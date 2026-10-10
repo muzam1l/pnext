@@ -3,7 +3,6 @@ import { stat, unlink, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, relative, sep } from 'node:path'
 import { createHash } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { drainPreplanBuilds } from '../runtime/vendor'
 import {
   Component,
   Fragment,
@@ -29,10 +28,13 @@ import { markErrorLogged } from '../utils/error-log'
 import {
   devClientModuleHref,
   devServerModuleHref,
+  drainPreplanBuilds,
   importDevModule,
   importModuleOnce,
-} from '../runtime/modules'
-import { serverBundleTargetForRuntime } from '../runtime/loader'
+  registerServerRuntime,
+  serverBundleTargetForRuntime,
+} from '../runtime/load'
+import { conventionFileExists, productionRelease, servedConventions } from '../runtime/production'
 import {
   getActionModuleExtensions,
   getActiveMetadataExtensions,
@@ -63,7 +65,7 @@ import {
   routeCssAssetNames,
   routeCssHref,
   withAssetPrefix,
-} from '../css/build'
+} from '../css/assets'
 import { dynamicReferenceSymbol, type DynamicReference } from '../api/dynamic'
 import {
   isForbiddenError,
@@ -98,13 +100,11 @@ import {
   trackPrerenderDynamic,
 } from './ppr'
 import {
-  collectFileCss,
-  collectNotFoundCss,
   findConventionFiles,
   findGlobalError,
   findLayouts,
   serverActionsUnsupportedMessage,
-} from '../routing/routes'
+} from '../routing/match'
 import { matchSegments, pathnameSegments, slotDirectoriesIn } from '../routing/slots'
 import { getRequestRuntime } from '../routing/request-environment'
 import { toNextRequest } from '../api/server'
@@ -121,7 +121,6 @@ import {
   ISLAND_BOUNDARY_ERROR_MESSAGE_ATTRIBUTE,
 } from './boundary-error'
 import { captureCacheScope, runWithCacheScope } from '../request/cache'
-import { registerServerRuntime } from '../runtime/loader'
 import { readText } from '../utils/fs'
 import { traceEnabled } from '../utils/trace-flags'
 import {
@@ -804,7 +803,7 @@ function moduleHref(file: string, options: ModuleLoadOptions) {
     ? devServerModuleHref(options.config, file, options.devImportVersion ?? String(Date.now()), {
         conditionTarget,
       })
-    : reactCompatEnabled(options.config)
+    : reactCompatEnabled(options.config) || productionRelease(options.config)
       ? devServerModuleHref(options.config, file, 'build', { conditionTarget })
       : pathToFileHref(file)
 }
@@ -849,6 +848,17 @@ async function importClientModule(file: string, options: ModuleLoadOptions) {
   if (options.dev) return importDevModule<Record<string, unknown>>(href)
   await drainPreplanBuilds()
   return importModuleOnce<Record<string, unknown>>(href)
+}
+
+/** A synthetic route's CSS: in a release, the stylesheet its build emitted; else a source scan. */
+async function syntheticRouteCss(
+  config: ResolvedConfig,
+  id: string,
+  scan: (routes: typeof import('../routing/routes')) => Promise<string[]>,
+) {
+  if (!productionRelease(config)) return scan(await import('../routing/routes'))
+  const name = `${id}.css`
+  return emittedAssetName(config, name) === name ? [] : [name]
 }
 
 function clientScriptPath(route: RouteManifestEntry, dev?: boolean) {
@@ -1530,7 +1540,7 @@ async function serializablePageProps(props: PageProps, omitSearchParams = false)
 
 export async function staticParamsFor(config: ResolvedConfig, route: RouteManifestEntry) {
   const moduleFiles = [
-    ...findLayouts(config.appPath, route.file).filter(file => existsSync(file)),
+    ...findLayouts(config.appPath, route.file).filter(conventionFileExists),
     route.file,
   ]
   let paramSets: Record<string, RouteParamValue>[] = [{}]
@@ -1615,7 +1625,7 @@ export async function renderPage(options: RenderOptions) {
 export async function renderPageWithStatus(
   options: RenderOptions,
 ): Promise<{ html: string; status: number; location?: string }> {
-  registerServerRuntime(options.config, options.route.sourceFiles)
+  await registerServerRuntime(options.config, options.route.sourceFiles)
   await seedPrerenderSidecar(options)
   const request = renderScopeRequest(options)
   return runWithRequest(
@@ -1648,7 +1658,7 @@ export async function renderPageWithStatus(
 }
 
 export async function renderPageStream(options: RenderOptions) {
-  registerServerRuntime(options.config, options.route.sourceFiles)
+  await registerServerRuntime(options.config, options.route.sourceFiles)
   await seedPrerenderSidecar(options)
 
   const request = renderScopeRequest(options)
@@ -1666,7 +1676,7 @@ export async function renderPageStream(options: RenderOptions) {
 }
 
 export async function renderPageResponse(options: RenderOptions) {
-  registerServerRuntime(options.config, options.route.sourceFiles)
+  await registerServerRuntime(options.config, options.route.sourceFiles)
   const method = options.request?.method.toUpperCase() ?? 'GET'
   if (method !== 'GET' && method !== 'HEAD') {
     return new Response('Method Not Allowed', {
@@ -1871,7 +1881,7 @@ const rejectedPprShellUpgrades = new Set<string>()
  * when dynamic data escapes every boundary - the route must then be served fully dynamically.
  */
 export async function renderPartialShell(options: RenderOptions): Promise<PrebuiltShell | null> {
-  registerServerRuntime(options.config, options.route.sourceFiles)
+  await registerServerRuntime(options.config, options.route.sourceFiles)
   const sidecar = getRenderExtensions().prerenderSidecar
   const sidecarContext = prerenderSidecarContext(options)
   await sidecar.begin(sidecarContext)
@@ -1960,7 +1970,7 @@ export async function renderPartialShell(options: RenderOptions): Promise<Prebui
 export async function renderRuntimePrefetchDocument(
   options: RenderOptions,
 ): Promise<{ html: string; postponed: boolean } | null> {
-  registerServerRuntime(options.config, options.route.sourceFiles)
+  await registerServerRuntime(options.config, options.route.sourceFiles)
   // Seed (read-only) the resume-data sidecar so 'use cache' scopes resolve
   // their build-time fills; unlike renderPartialShell nothing is collected or
   // persisted back.
@@ -2512,7 +2522,7 @@ function hasParamFreeRootLayout(config: ResolvedConfig): boolean {
   const cached = paramFreeRootLayoutCache.get(config.appPath)
   if (cached !== undefined) return cached
   const found = ['tsx', 'jsx', 'ts', 'js'].some(ext =>
-    existsSync(join(config.appPath, `layout.${ext}`)),
+    conventionFileExists(join(config.appPath, `layout.${ext}`)),
   )
   paramFreeRootLayoutCache.set(config.appPath, found)
   return found
@@ -2636,7 +2646,7 @@ export async function renderGlobalNotFoundResponse(
 ) {
   const globalFile = ['tsx', 'ts', 'jsx', 'js']
     .map(ext => `${options.config.appPath}/global-not-found.${ext}`)
-    .find(candidate => existsSync(candidate))
+    .find(conventionFileExists)
   // Render as GET regardless of the original method: the 404 page is what a
   // browser should see for a stray POST too (Next's MPA fallback), not a 405.
   const notFoundRequest = options.request
@@ -2664,9 +2674,9 @@ export async function renderGlobalNotFoundResponse(
       // Include CSS shared with the root layout: this document replaces the
       // whole page (no root layout render), so the global sheet isn't linked
       // and anything it covered must ship in this route's own chunk.
-      cssImports: await collectFileCss(options.config.appPath, [globalFile], {
-        includeGlobalCss: true,
-      }),
+      cssImports: await syntheticRouteCss(options.config, 'global-not-found', routes =>
+        routes.collectFileCss(options.config.appPath, [globalFile], { includeGlobalCss: true }),
+      ),
       sourceFiles: [globalFile],
       synthetic: true,
     }
@@ -2706,7 +2716,9 @@ export async function renderGlobalNotFoundResponse(
       clientReferences: rootRoute?.clientReferences ?? [],
       // Root not-found ships its own CSS (`/assets/not-found.css`) alongside the
       // root-layout global sheet (`/assets/global.css`, emitted via globalCssHref).
-      cssImports: await collectNotFoundCss(options.config.appPath),
+      cssImports: await syntheticRouteCss(options.config, 'not-found', routes =>
+        routes.collectNotFoundCss(options.config.appPath),
+      ),
       sourceFiles: rootRoute?.sourceFiles ?? [anchor],
       ...(rootRoute?.needsRouterEntry ? { needsRouterEntry: true } : {}),
       // Serve the ROOT route's built client entry: the synthetic id has no
@@ -2863,6 +2875,8 @@ const documentLayoutDefaults = new Map<string, { mtimeMs: number; hasDefault: bo
 async function routeHasDocumentLayout(layoutFiles: string[]) {
   const rootLayout = layoutFiles[0]
   if (!rootLayout) return false
+  const served = servedConventions()
+  if (served) return served.documentLayouts.has(rootLayout)
   let mtimeMs: number
   try {
     mtimeMs = statSync(rootLayout).mtimeMs
@@ -2923,7 +2937,7 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
       // Drop the non-existent anchor file so we don't try to import it; the
       // layout's `children` is supplied by the `@children` slot instead (see
       // childrenFromSlots).
-      if (pageFile && !existsSync(pageFile)) pageFile = undefined
+      if (pageFile && !conventionFileExists(pageFile)) pageFile = undefined
     }
     const props = profileRenderSyncStep(profile, 'create page props', () =>
       createPageProps(options),
@@ -3254,7 +3268,7 @@ async function renderAuthInterruptPage(
   const fallbackTree = httpAccessFallbackTree(status, message)
   const file = nearestConventionFile(options, `${kind}.tsx`)
   const boundaryOptions = optionsForNotFoundBoundary(options, file)
-  if (!file || !existsSync(file)) {
+  if (!file || !conventionFileExists(file)) {
     return renderTreeOrFallback(
       boundaryOptions,
       fallbackTree,
@@ -3322,7 +3336,7 @@ async function renderGlobalErrorPage(
     // global-error.js is a client component ('use client'): import it through
     // the client module loader and SSR it to a full document. Server components
     // (no directive) load through the server loader.
-    const clientDirective = hasUseClientDirective(await readText(file))
+    const clientDirective = await conventionUsesClient(file)
     const module = (
       clientDirective ? await importClientModule(file, options) : await importModule(file, options)
     ) as ErrorModule
@@ -3956,7 +3970,7 @@ async function renderTreeInFrame(
     // global-not-found replaces the document without the root layout, so the
     // root layout's global sheet must not load (its CSS ships in the route's
     // own chunk, built with includeGlobalCss).
-    options.route.id === 'global-not-found' ? undefined : globalCssHref(options.config)
+    options.route.id === 'global-not-found' ? undefined : await globalCssHref(options.config)
   let routeStylesheet = routeCssHref(options.route, options.config)
   // File names, not logical ones: the inline path READS these off disk, so it has
   // to spell them the way the build emitted them (content-hashed in production).
@@ -4378,7 +4392,7 @@ async function buildLoadingBoundaries(
     options.route.file,
     'loading.tsx',
   )) {
-    if (!existsSync(loadingFile)) continue
+    if (!conventionFileExists(loadingFile)) continue
     const fallback = await buildLoadingFallback(options, loadingFile)
     if (fallback) fallbackByDir.set(dirname(loadingFile), fallback)
   }
@@ -4485,7 +4499,7 @@ async function renderNotFoundPage(
   // A `'use client'` not-found.js with a discovered client reference renders as an island (same as
   // error.js) so it HYDRATES - its hooks must work on the 404 document. Server-rendering it would
   // serialize child event-handler props as dead action stubs.
-  const clientDirective = hasUseClientDirective(await readText(file))
+  const clientDirective = await conventionUsesClient(file)
   const clientReference = clientDirective
     ? conventionDefaultReference(notFoundOptions, file)
     : undefined
@@ -4598,7 +4612,7 @@ async function renderErrorPage(options: RenderOptions, error: unknown, stream: b
   if (!file) return renderGenericErrorPage(options, resolvedError, stream)
 
   try {
-    const clientDirective = hasUseClientDirective(await readText(file))
+    const clientDirective = await conventionUsesClient(file)
     const module = (
       clientDirective ? await importClientModule(file, options) : await importModule(file, options)
     ) as ErrorModule
@@ -4867,10 +4881,16 @@ function generatedFallbackPage(
   }
 }
 
+/** Whether a convention file is `'use client'`: the frozen fact in production, its source otherwise. */
+async function conventionUsesClient(file: string) {
+  const served = servedConventions()
+  return served ? served.client.has(file) : hasUseClientDirective(await readText(file))
+}
+
 function nearestConventionFile(options: RenderOptions, name: string) {
   return [...findConventionFiles(options.config.appPath, options.route.file, name)]
     .reverse()
-    .find(file => existsSync(file))
+    .find(conventionFileExists)
 }
 
 /**
@@ -6541,7 +6561,7 @@ function dynamicTargetReference(
   const target = dynamicReference.target
   if (!target) return undefined
   const stored = state.clientReferences.get(
-    `c-${clientReferenceId(target.file, target.exportName)}`,
+    target.id ?? `c-${clientReferenceId(target.file, target.exportName)}`,
   )
   if (stored) return stored
   for (const reference of state.clientReferences.values()) {
@@ -7616,7 +7636,7 @@ async function applyLayouts(
   await profileRenderStep(profile, 'import layouts', async () => {
     for (const layoutPath of options.layoutFiles ??
       findLayouts(options.config.appPath, options.route.file)) {
-      if (!options.moduleLoader && !existsSync(layoutPath)) continue
+      if (!options.moduleLoader && !conventionFileExists(layoutPath)) continue
       const layoutModule = (await importModule(layoutPath, options)) as LayoutModule
       markServerReference(layoutModule.default)
       // Cheap leaf span for the segment-module resolution (nested under the
@@ -8025,7 +8045,7 @@ function fullSegmentPrefetchSkipsSharedLayout(options: RenderOptions): boolean {
     options.config.appPath,
     options.route.file,
     'layout.tsx',
-  ).filter(file => existsSync(file))
+  ).filter(conventionFileExists)
   const documentDir = layoutFiles[0] ? dirname(layoutFiles[0]) : undefined
   return layoutFiles
     .slice(1)

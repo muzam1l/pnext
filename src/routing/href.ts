@@ -198,7 +198,16 @@ export function canonicalTrailingSlashPath(pathname: string, trailingSlash: bool
   if (/\.[^/]+$/.test(pathname)) return pathname
   const slashed = pathname.endsWith('/')
   if (trailingSlash ? slashed : !slashed) return pathname
-  return trailingSlash ? `${pathname.replace(/\/+$/, '')}/` : pathname.replace(/\/+$/, '') || '/'
+  // Collapsed, so a rewritten path can never read as protocol-relative (`//host`).
+  const bare = pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '')
+  return trailingSlash ? `${bare}/` : bare || '/'
+}
+
+/** Next 308s a path with repeated slashes to its collapsed form, for every method, before anything else. */
+export function repeatedSlashRedirect(url: URL): Response | null {
+  if (!url.pathname.includes('//')) return null
+  const target = `${url.pathname.replace(/\/{2,}/g, '/')}${url.search}`
+  return new Response(target, { status: 308, headers: { location: target } })
 }
 
 /**
@@ -210,13 +219,11 @@ export function canonicalTrailingSlashPath(pathname: string, trailingSlash: bool
 export function trailingSlashRedirect(
   config: { trailingSlash?: boolean; skipTrailingSlashRedirect?: boolean },
   url: URL,
-  method: string,
 ): Response | null {
   // skipTrailingSlashRedirect: the app serves both slashed and unslashed URLs
   // as-is, so no canonical redirect is ever emitted (route matching already
   // tolerates a trailing slash via normalizePathname).
   if (config.skipTrailingSlashRedirect) return null
-  if (method !== 'GET' && method !== 'HEAD') return null
   const pathname = url.pathname
   if (pathname === '/' || pathname === '') return null
   if (pathname.startsWith('/__pnext') || isBuildAssetPathname(pathname)) return null

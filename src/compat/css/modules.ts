@@ -4,10 +4,10 @@ import path from 'node:path'
 import type { Plugin } from 'esbuild'
 import type { ResolvedConfig } from '../../config'
 import { resolveImport } from '../../resolve/imports'
-import { hoistCssImports } from '../../css/build'
 import { maybeLightningcssTransform } from './lightningcss'
 import { escapeRegex } from '../../utils/code'
 import { cssModuleScopePath } from '../../utils/fs'
+import { productionRelease } from '../../runtime/production'
 
 interface ComposeRef {
   names: string[]
@@ -23,31 +23,44 @@ interface CssModuleInfo {
 const pagesCompatIgnoredSourceEntries = new Set(['.next', '.pnext', 'app', 'node_modules', 'pages'])
 
 export function materializeNextCssSources(config: ResolvedConfig) {
+  // A production release already compiled everything these links would let resolve.
+  if (productionRelease(config)) return
   const generatedRoot = path.dirname(config.appPath)
   if (path.basename(path.dirname(generatedRoot)) !== 'pnext-pages-compat') return
 
+  const outTop = path.relative(config.root, config.outRootPath).split(path.sep)[0]
+  // Inside the app (a build's output) links stay relative, naming no build-machine path.
+  const inApp = !path.relative(config.root, generatedRoot).startsWith('..')
   for (const entry of readdirSync(config.root)) {
-    if (pagesCompatIgnoredSourceEntries.has(entry)) continue
+    if (pagesCompatIgnoredSourceEntries.has(entry) || entry === outTop) continue
     const source = path.join(config.root, entry)
     const target = path.join(generatedRoot, entry)
     if (existsSync(target)) continue
     try {
-      symlinkSync(source, target, lstatSync(source).isDirectory() ? 'dir' : 'file')
+      symlinkSync(
+        inApp ? path.relative(generatedRoot, source) : source,
+        target,
+        lstatSync(source).isDirectory() ? 'dir' : 'file',
+      )
     } catch {
       // A concurrent materialization may have linked the same source already.
     }
   }
 }
 
+let cssBuild: Promise<typeof import('../../css/build')> | undefined
+
 export function nextCssModuleChunkPlugin(config: ResolvedConfig): Plugin {
   return {
     name: 'pnext-compat-css-modules',
     setup(build) {
-      build.onLoad({ filter: /\.css$/ }, ({ path: file }) => {
+      build.onLoad({ filter: /\.css$/ }, async ({ path: file }) => {
         const source = nextCssSource(file, config.root)
         // This onLoad claims every `.css`, so core's directive-order plugin
         // (registered after it) never sees a compat app's stylesheet — hoist here.
-        const raw = hoistCssImports(readFileSync(source, 'utf8'))
+        const raw = (await (cssBuild ??= import('../../css/build'))).hoistCssImports(
+          readFileSync(source, 'utf8'),
+        )
         const contents = file.endsWith('.module.css')
           ? transformCssModule(raw, source, config.root)
           : rewriteTransparentBodyChildren(raw)

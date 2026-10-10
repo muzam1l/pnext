@@ -3,6 +3,7 @@ import { createRequire } from 'node:module'
 import path from 'node:path'
 import { pathToFileHref } from '../../config'
 import { DEFAULT_BODY_LIMIT_BYTES } from './endpoint'
+import { getNextConfig, nextConfigReleased } from '../next/config-loader'
 
 /**
  * Server-actions options read from the app's next.config in compat mode:
@@ -39,7 +40,7 @@ export async function loadServerActionsConfig(root: string): Promise<ServerActio
 }
 
 export async function loadResolvedNextConfig(root: string): Promise<NextConfigShape | undefined> {
-  return (await loadNextConfigFromStore()) ?? (await loadNextConfig(root))
+  return loadNextConfigFromStore() ?? (await loadNextConfig(root))
 }
 
 /**
@@ -50,9 +51,8 @@ export async function loadResolvedNextConfig(root: string): Promise<NextConfigSh
  * silently dropped the configured bodySizeLimit. Returns undefined when the store is empty so the
  * caller falls back to a direct file read.
  */
-async function loadNextConfigFromStore(): Promise<NextConfigShape | undefined> {
+function loadNextConfigFromStore(): NextConfigShape | undefined {
   try {
-    const { getNextConfig } = await import('../next/config-loader')
     const store: NextConfigShape = getNextConfig()
     return store && Object.keys(store).length > 0 ? store : undefined
   } catch {
@@ -61,6 +61,7 @@ async function loadNextConfigFromStore(): Promise<NextConfigShape | undefined> {
 }
 
 export async function loadNextConfig(root: string): Promise<NextConfigShape | undefined> {
+  if (nextConfigReleased()) return getNextConfig()
   for (const name of ['next.config.js', 'next.config.mjs', 'next.config.cjs']) {
     const file = path.join(root, name)
     if (!existsSync(file)) continue
@@ -109,9 +110,9 @@ export async function loadNextConfig(root: string): Promise<NextConfigShape | un
  * skipped here - the lazy per-request path still validates.
  */
 export function validateServerActionsConfigSync(root: string): void {
-  let config: NextConfigShape | undefined
+  let config: NextConfigShape | undefined = nextConfigReleased() ? getNextConfig() : undefined
   const requireFrom = createRequire(path.join(root, 'noop.js'))
-  for (const name of ['next.config.js', 'next.config.cjs']) {
+  for (const name of config ? [] : ['next.config.js', 'next.config.cjs']) {
     const file = path.join(root, name)
     if (!existsSync(file)) continue
     try {

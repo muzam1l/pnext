@@ -13,6 +13,7 @@ import type {
 } from '../types'
 import { escapeHtml, stringifyHtmlValue } from '../utils/html'
 import { toPosixPath } from '../utils/fs'
+import { servedAppFiles, servedRelease } from '../runtime/production'
 
 export type StaticMetadataKind =
   | 'favicon'
@@ -65,6 +66,8 @@ export function clearMetadataFileCaches() {
 }
 
 export function discoverStaticMetadataFiles(appPath: string): StaticMetadataFile[] {
+  const served = servedRelease()
+  if (served) return served.staticMetadataFiles ?? []
   const cached = staticMetadataFiles.get(appPath)
   if (cached) return cached
   const files = existsSync(appPath)
@@ -343,15 +346,26 @@ function metadataAppliesToRoute(file: StaticMetadataFile, routeDir: string) {
   return routeDir === dir || routeDir.startsWith(`${dir}/`)
 }
 
+// A release's tree is immutable: its inventory is derived once per release.
+const releasedDynamicMetadataFiles = new WeakMap<object, DynamicMetadataFile[]>()
+
 function discoverDynamicMetadataFiles(appPath: string): DynamicMetadataFile[] {
-  const cached = dynamicMetadataFiles.get(appPath)
+  const served = servedRelease()?.conventions
+  const cached = served
+    ? releasedDynamicMetadataFiles.get(served)
+    : dynamicMetadataFiles.get(appPath)
   if (cached) return cached
-  const files = existsSync(appPath)
-    ? listFilesSync(appPath)
+  const files = served
+    ? servedAppFiles(served)
         .flatMap(file => dynamicMetadataFile(appPath, file) ?? [])
         .sort((a, b) => a.relative.localeCompare(b.relative))
-    : []
-  dynamicMetadataFiles.set(appPath, files)
+    : existsSync(appPath)
+      ? listFilesSync(appPath)
+          .flatMap(file => dynamicMetadataFile(appPath, file) ?? [])
+          .sort((a, b) => a.relative.localeCompare(b.relative))
+      : []
+  if (served) releasedDynamicMetadataFiles.set(served, files)
+  else dynamicMetadataFiles.set(appPath, files)
   return files
 }
 

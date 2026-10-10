@@ -46,7 +46,7 @@ import {
   setResolveExtensions,
   setTsConfigPath,
 } from '../../resolve/imports'
-import { setServerBundleConditions } from '../../runtime/loader'
+import { setServerBundleConditions } from '../../runtime/load'
 import { escapeRegex, specifierSniffTokens } from '../../utils/code'
 import {
   cacheComponentsEnabled,
@@ -59,6 +59,7 @@ import {
   relayCompilerConfig,
   removeConsoleTargets,
   resolveExtensions,
+  builtInServerExternalPackages,
   serverExternalPackages,
   swcEnvUsageMode,
   tsconfigPath,
@@ -160,6 +161,7 @@ export function registerBundlerExtensions(config: ResolvedConfig): void {
     // Linked workspace packages are deliberately absent: esbuild resolves their
     // symlinks to real paths, so they never reach a filter as node_modules.
     transpiled: () => [...transpile].filter(name => !externals.has(name)),
+    releaseExternal: name => builtInServerExternalPackages().has(name) && !transpile.has(name),
     esmExternals,
   })
   setExternalLoadResolver(({ root, fromFile, specifier, target }) => {

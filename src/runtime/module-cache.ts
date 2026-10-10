@@ -706,6 +706,19 @@ interface IndexFile {
 /** Bumped whenever a record's shape changes; an older index is simply ignored. */
 const INDEX_VERSION = 4
 
+/** The persisted compile graph: each source's local import targets, absolute. */
+export function compiledSourceGraph(outPath: string, workspaceRoot: string) {
+  const graph = new Map<string, string[]>()
+  const parsed = readIndexFile(path.join(cacheRoot(outPath), 'graph.json'))
+  for (const [source, entry] of Object.entries(parsed?.files ?? {})) {
+    graph.set(
+      absoluteSourcePath(source, workspaceRoot),
+      entry[3].map(file => absoluteSourcePath(file, workspaceRoot)),
+    )
+  }
+  return graph
+}
+
 function readIndexFile(file: string): IndexFile | undefined {
   try {
     return JSON.parse(readFileSync(file, 'utf8')) as IndexFile

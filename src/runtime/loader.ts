@@ -8,7 +8,7 @@
 
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { existsSync, realpathSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -41,39 +41,28 @@ import {
 } from '../resolve/dynamic'
 import { cacheRoot } from './module-cache'
 import { frameworkFingerprint } from './fingerprint'
+import { prebundledFile } from './prebundle'
 import { readNodeModuleBundle, writeNodeModuleBundle } from '../dev/restart/node-modules'
-import { setBasePathPrefix, setDefaultPrefetchMode, setTrailingSlashUrls } from '../routing/href'
 import { resolveExternalLoadTarget, resolveImport, workspacePackageRoots } from '../resolve/imports'
 import { escapeRegex } from '../utils/code'
 import { traceEnabled } from '../utils/trace-flags'
 import { writeFileAtomic } from '../utils/fs'
+import { productionRelease } from './production'
+import {
+  applyServerHrefConfig,
+  isReleaseCompile,
+  serverBundleExtraConditions,
+  type ServerBundleTarget,
+} from './load'
+
+export {
+  pagesApiBundleTargetForRuntime,
+  serverBundleTargetForRuntime,
+  setServerBundleConditions,
+  type ServerBundleTarget,
+} from './load'
 
 const require = createRequire(import.meta.url)
-
-// B4/B5: extra esbuild resolve conditions layered onto the server (RSC) vendor
-// bundle. Core always applies `react-server` (the server graph IS the RSC
-// layer). Compat can add `next-js` (only when cacheComponents is on) via the
-// setter. Kept as a module-level seam so core carries no static edge into
-// compat's config reader.
-export type ServerBundleTarget =
-  CompatAliasTarget | 'edge' | 'pages-api' | 'pages-api-edge' | 'pages' | 'pages-edge'
-
-let extraServerBundleConditions: (target: ServerBundleTarget) => string[] = () => []
-
-/** Install compat-driven extra vendor-bundle conditions (B5 `next-js`). */
-export function setServerBundleConditions(
-  factory: ((target: ServerBundleTarget) => string[]) | undefined,
-): void {
-  extraServerBundleConditions = factory ?? (() => [])
-}
-
-export function serverBundleTargetForRuntime(runtime: string | undefined): ServerBundleTarget {
-  return runtime === 'edge' || runtime === 'experimental-edge' ? 'edge' : 'server'
-}
-
-export function pagesApiBundleTargetForRuntime(runtime: string | undefined): ServerBundleTarget {
-  return runtime === 'edge' || runtime === 'experimental-edge' ? 'pages-api-edge' : 'pages-api'
-}
 
 /**
  * Pages-router PAGE SSR layer: Next compiles it in the server bundle with `node` (or
@@ -102,7 +91,7 @@ export function serverBundleConditions(target: ServerBundleTarget): string[] {
               : target === 'pages'
                 ? ['node', 'module', 'import']
                 : ['react-server', 'node', 'module', 'import']
-  return [...new Set([...extraServerBundleConditions(target), ...base])]
+  return [...new Set([...serverBundleExtraConditions(target), ...base])]
 }
 
 export function serverBundleRequireConditions(target: ServerBundleTarget): string[] {
@@ -120,7 +109,7 @@ export function serverBundleRequireConditions(target: ServerBundleTarget): strin
               : target === 'pages'
                 ? ['node', 'module', 'require']
                 : ['react-server', 'node', 'module', 'require']
-  return [...new Set([...extraServerBundleConditions(target), ...base])]
+  return [...new Set([...serverBundleExtraConditions(target), ...base])]
 }
 
 const runtimeConfigs = new Map<string, RuntimeConfig>()
@@ -167,14 +156,10 @@ interface TransformCacheEntry {
 }
 
 export function registerServerRuntime(config: ResolvedConfig, sourceFiles: string[] = []) {
-  // Server-rendered Links emit canonical (slashed) hrefs under trailingSlash.
-  setTrailingSlashUrls(Boolean(config.trailingSlash))
-  // File-convention metadata asset hrefs (og-image, manifest) carry the
-  // basePath prefix; core render reads it through the href seam.
-  setBasePathPrefix(typeof config.basePath === 'string' ? config.basePath : '')
-  // Server-rendered Links bake the configured default into `data-prefetch`.
-  setDefaultPrefetchMode(config.prefetch)
-  if (typeof Bun === 'undefined') return
+  applyServerHrefConfig(config)
+  // A release imports compiled artifacts natively: no resolve or transform plugins.
+  if (typeof Bun === 'undefined' || productionRelease(config)) return
+  nativeStoreFor(config)
   const sourceRoots = [...new Set(sourceFiles.map(file => sourceRootForFile(config, file)))].sort()
   const signature = sourceRoots.join('\0')
   let registered = registeredSignatures.get(config)
@@ -189,7 +174,8 @@ export function registerServerRuntime(config: ResolvedConfig, sourceFiles: strin
   const roots = [
     ...rootPaths(config.root),
     ...rootPaths(config.appPath),
-    ...rootPaths(path.join(config.outPath, 'cache', 'server')),
+    // A release build evaluates its compiled artifacts as the release will: natively.
+    ...(isReleaseCompile() ? [] : rootPaths(path.join(config.outPath, 'cache', 'server'))),
     // The pnext src root, so the framework's own source transforms too.
     ...rootPaths(path.join(import.meta.dirname, '..')),
     ...sourceRoots.flatMap(rootPaths),
@@ -286,7 +272,7 @@ function registerResolvePlugin() {
         const runtime = runtimeConfigForFile(args.importer)
         const resolved = runtime?.aliases.get(args.path) ?? firstAliasForSpecifier(args.path)
         const target = resolved ? serverRequireAlias(args.path, resolved, args.kind) : undefined
-        if (target) return { path: target }
+        if (target) return { path: prebundledFile(target) }
         const message = (runtime ?? firstRuntimeConfig())?.missingImportError(args.path)
         if (message) throw new Error(message)
         return undefined
@@ -302,7 +288,7 @@ function registerResolvePlugin() {
             target: 'server',
           })
         if (!target) return undefined
-        return { path: target }
+        return { path: prebundledFile(target) }
       })
     },
   })
@@ -368,13 +354,199 @@ function registerNodeModulesLoadPlugin() {
           filter:
             /\/node_modules\/.*(?:\.mjs|\.esm\.js|\/(?:es|esm|dist\/esm|build\/modern)\/.*\.js)$/,
         },
-        async ({ path: file }) => {
-          const code = await transformNodeModuleSource(file)
-          return { contents: code, loader: 'js' }
+        ({ path: file }) => {
+          if (isRecordedNativeFile(file) || nodeModuleGraphLoadsAsIs(file)) {
+            return { contents: takeNodeModuleSource(file), loader: 'js' }
+          }
+          return transformNodeModuleSource(file).then(code => ({ contents: code, loader: 'js' }))
         },
       )
     },
   })
+}
+
+const nodeModuleImportScanner = new Bun.Transpiler({ loader: 'js' })
+
+/**
+ * Whether a node_modules ESM file loads exactly as written: one module per file, as Node loads it.
+ * Bundling it with its relative imports inlined gave every entry file of a package its own copy of
+ * the files they share, and of their module state. Only an aliased import, a directive, a non-JS
+ * import or a configured `define` still needs the bundle.
+ */
+export function nodeModuleSourceLoadsAsIs(source: string) {
+  return nodeModuleRelativeImports(source) !== undefined
+}
+
+/** The relative specifiers of a file that loads as-is, or undefined when it needs the bundle. */
+function nodeModuleRelativeImports(source: string) {
+  if (serverDefineOptions().define || source.includes('use cache')) return undefined
+  if (/^\s*(?:(?:\/\/[^\n]*\n|\/\*[\s\S]*?\*\/)\s*)*['"]use (?:client|server)['"]/.test(source)) {
+    return undefined
+  }
+  try {
+    const relative: string[] = []
+    for (const { path: specifier } of nodeModuleImportScanner.scanImports(source)) {
+      if (specifier.startsWith('.') || specifier.startsWith('/')) {
+        if (!/(?:\.[cm]?js|\.json|\/[^./]+)$/.test(specifier)) return undefined
+        if (specifier.startsWith('.')) relative.push(specifier)
+      } else if (aliasSpecifierFilter.test(specifier) || firstAliasForSpecifier(specifier)) {
+        return undefined
+      }
+    }
+    return relative
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Files the server's native verdict (vendor-build) proved load as-is. Recorded with the build, so a
+ * started server answers from this set instead of re-scanning every file of every native package.
+ */
+const nativeNodeModuleFiles = new Map<string, string>()
+const nativeNodeModuleStores = new Map<
+  string,
+  { config: ResolvedConfig; files: Map<string, string> }
+>()
+let nativeStoreFlushArmed = false
+
+// Not keyed on pnext's fingerprint: a started server never computes it, and walking pnext's tree for
+// it cost more than the scans this store saves. Bump the version when the as-is rule changes.
+const NATIVE_STORE_VERSION = 1
+const nativeNodeModuleStore = (config: ResolvedConfig) =>
+  path.join(cacheRoot(config.outPath), 'native-files.json')
+
+/** A file's stat signature: a reinstalled package must be scanned again. */
+export function statSignature(file: string) {
+  try {
+    const { mtimeMs, size } = statSync(file)
+    return `${mtimeMs}:${size}`
+  } catch {
+    return undefined
+  }
+}
+
+function nativeStoreFor(config: ResolvedConfig) {
+  let stored = nativeNodeModuleStores.get(config.outPath)?.files
+  if (!stored) {
+    stored = new Map()
+    nativeNodeModuleStores.set(config.outPath, { config, files: stored })
+    for (const [file, signature] of Object.entries(readNativeStore(config))) {
+      stored.set(file, signature)
+      nativeNodeModuleFiles.set(path.resolve(config.workspaceRoot, file), signature)
+    }
+  }
+  return stored
+}
+
+function readNativeStore(config: ResolvedConfig): Record<string, string> {
+  try {
+    const store = JSON.parse(readFileSync(nativeNodeModuleStore(config), 'utf8')) as {
+      version: number
+      files: Record<string, string>
+    }
+    return store.version === NATIVE_STORE_VERSION ? store.files : {}
+  } catch {
+    // No store yet: the plugin scans until the verdicts are recorded.
+    return {}
+  }
+}
+
+function isRecordedNativeFile(file: string) {
+  const signature = nativeNodeModuleFiles.get(file)
+  return signature !== undefined && signature === statSignature(file)
+}
+
+export function recordNativeNodeModuleFiles(config: ResolvedConfig, files: Iterable<string>) {
+  const stored = nativeStoreFor(config)
+  let added = false
+  for (const file of files) {
+    if (nativeNodeModuleFiles.has(file)) continue
+    const signature = statSignature(file)
+    if (!signature) continue
+    nativeNodeModuleFiles.set(file, signature)
+    stored.set(path.relative(config.workspaceRoot, file), signature)
+    added = true
+  }
+  if (!added || nativeStoreFlushArmed) return
+  nativeStoreFlushArmed = true
+  // Written once, at exit: a build records hundreds of native entries.
+  process.once('exit', () => {
+    for (const { config: owner, files } of nativeNodeModuleStores.values()) {
+      try {
+        // Another process (a build's warm child) may have written since this one loaded.
+        for (const [file, signature] of Object.entries(readNativeStore(owner))) {
+          if (!files.has(file)) files.set(file, signature)
+        }
+        writeFileSync(
+          nativeNodeModuleStore(owner),
+          JSON.stringify({ version: NATIVE_STORE_VERSION, files: Object.fromEntries(files) }),
+        )
+      } catch {
+        // A missing store only costs the scan.
+      }
+    }
+  })
+}
+
+/** Per file: its source and relative imports when it loads as-is, or null. Sources are dropped once loaded. */
+const nodeModuleScans = new Map<string, { source?: string; imports: string[] } | null>()
+const nodeModuleGraphVerdicts = new Map<string, boolean>()
+
+function nodeModuleScan(file: string) {
+  let scan = nodeModuleScans.get(file)
+  if (scan === undefined) {
+    try {
+      const source = readFileSync(file, 'utf8')
+      const relative = nodeModuleRelativeImports(source)
+      const dir = path.dirname(file)
+      scan = relative
+        ? {
+            source,
+            imports: relative.map(specifier =>
+              /\.[cm]?js$/.test(specifier)
+                ? path.resolve(dir, specifier)
+                : Bun.resolveSync(specifier, dir),
+            ),
+          }
+        : null
+    } catch {
+      scan = null
+    }
+    nodeModuleScans.set(file, scan)
+  }
+  return scan
+}
+
+/**
+ * Whether `file` and everything it reaches by relative import load as-is. A raw file importing one
+ * that is bundled would meet a second, inlined copy of the files that bundle shares with it.
+ */
+function nodeModuleGraphLoadsAsIs(file: string) {
+  const known = nodeModuleGraphVerdicts.get(file)
+  if (known !== undefined) return known
+  const seen = new Set<string>()
+  const stack = [file]
+  let verdict = true
+  while (stack.length > 0 && verdict) {
+    const next = stack.pop()!
+    if (seen.has(next) || nodeModuleGraphVerdicts.get(next) === true) continue
+    seen.add(next)
+    const scan = nodeModuleScan(next)
+    if (!scan) verdict = false
+    else stack.push(...scan.imports)
+  }
+  if (verdict) for (const covered of seen) nodeModuleGraphVerdicts.set(covered, true)
+  else nodeModuleGraphVerdicts.set(file, false)
+  return verdict
+}
+
+/** The source Bun loads for an as-is file, read once. */
+function takeNodeModuleSource(file: string) {
+  const scan = nodeModuleScans.get(file)
+  const source = scan?.source ?? readFileSync(file, 'utf8')
+  if (scan) scan.source = undefined
+  return source
 }
 
 function runtimeConfigForFile(file: string | undefined) {

@@ -10,7 +10,7 @@
 
 import { getWorkUnit } from '../../request/context'
 import { getRequestRuntime } from '../../routing/request-environment'
-import { selectRouteForRequest } from '../../routing/routes'
+import { selectRouteForRequest } from '../../routing/match'
 import path from 'node:path'
 import type { RouteManifestEntry } from '../../types'
 import type { RequestErrorContext, RequestErrorInfo } from '../../extensions'

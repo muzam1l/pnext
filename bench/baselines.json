@@ -37,7 +37,7 @@
       "js-gzip": 6.64,
       "js-deferred-gzip": 32.92,
       "js-files": 3,
-      "install": 6,
+      "install": 6.2,
       "zero-island": 15.19
     }
   },
@@ -81,7 +81,7 @@
       "js-gzip": 13.19,
       "js-deferred-gzip": 32.81,
       "js-files": 4,
-      "install": 6,
+      "install": 6.2,
       "zero-island": 15.82
     }
   },
@@ -102,7 +102,7 @@
       "js-gzip": 26.09,
       "js-deferred-gzip": 36.01,
       "js-files": 6,
-      "install": 6
+      "install": 6.2
     }
   },
   "visible": {
@@ -122,7 +122,7 @@
       "js-gzip": 2.8,
       "js-deferred-gzip": 6.41,
       "js-files": 1,
-      "install": 6
+      "install": 6.2
     }
   }
 }

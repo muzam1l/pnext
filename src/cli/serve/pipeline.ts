@@ -1,4 +1,4 @@
-import { resolveManifest } from '../../utils/fs'
+import { type ExactNames, exactNameIndex, hasExactName, resolveManifest } from '../../utils/fs'
 /**
  * The production request pipeline. Split out of `start.ts` so the prebundled
  * server entry parses only what listening needs: this module (renderer,
@@ -14,10 +14,14 @@ import { Readable } from 'node:stream'
 import { loadConfig, pathToFileHref } from '../../config'
 import type { ResolvedConfig } from '../../config'
 import { bootstrapCompat } from '../../compat-bootstrap'
-import { registerServerRuntime, serverBundleTargetForRuntime } from '../../runtime/loader'
-import { importModuleOnce } from '../../runtime/modules'
+import {
+  importModuleOnce,
+  registerServerRuntime,
+  serverBundleTargetForRuntime,
+} from '../../runtime/load'
 import { abortUpstreamFetchOnDisconnect } from '../../runtime/fetch-host'
-import { applyProxyResponse, createProxyRunner } from '../../routing/proxy'
+import { applyProxyResponse, createProxyRunner, type ProxyRunnerOptions } from '../../routing/proxy'
+import { attachRelease, releaseModuleHref } from '../../runtime/production'
 import {
   isPprShellUpgradeEligible,
   renderGlobalNotFoundResponse,
@@ -32,15 +36,16 @@ import {
 import {
   canonicalTrailingSlashPath,
   malformedUrlResponse,
+  repeatedSlashRedirect,
   trailingSlashRedirect,
 } from '../../routing/href'
 import { type PeerAddressSource, withForwardedHeaders } from '../../routing/forwarded'
-import { normalizePathname, parseNavState, selectRouteForRequest } from '../../routing/routes'
+import { normalizePathname, parseNavState, selectRouteForRequest } from '../../routing/match'
 import { runWithCacheScope } from '../../request/cache'
 import { metadataRouteHandlerModule } from '../../routing/metadata-files'
+import { immutableAssetPath, immutableCacheControl } from './immutable'
 import {
   finalizeResponse,
-  getAssetExtensions,
   getRenderExtensions,
   getProxyExtensions,
   getRequestExtensions,
@@ -55,13 +60,13 @@ import {
   getWorkUnit,
   runWithWorkUnit,
   setPhase,
+  setWorkUnitRelease,
   setWorkUnitRoute,
 } from '../../request/context'
 import { setRequestRuntime } from '../../routing/request-environment'
 import { getRenderSpanExtensions } from '../../render/hooks'
-import { publishEmittedAssets } from '../../css/build'
+import { publishEmittedAssets } from '../../css/assets'
 import { contentType } from '../../utils/content-type'
-import { stopEsbuildService } from '../../utils/esbuild'
 import { markErrorLogged } from '../../utils/error-log'
 import type {
   BuildManifest,
@@ -69,17 +74,6 @@ import type {
   RouteParamValue,
   StaticFileMetadata,
 } from '../../types'
-
-/** Compat module-mode route hrefs are the only prod use of the dev import layer; keep it off the start graph. */
-async function moduleHrefForRoute(
-  config: ResolvedConfig,
-  route: RouteManifestEntry,
-): Promise<string> {
-  const { devServerModuleHref } = await import('../../runtime/modules')
-  return devServerModuleHref(config, route.file, 'build', {
-    conditionTarget: serverBundleTargetForRuntime(route.segmentConfig?.runtime),
-  })
-}
 
 /**
  * The production request handler `pnext start` serves with. Exposed on its own
@@ -105,6 +99,22 @@ export async function createRequestHandler(
     config.outPath,
     config.root,
   )
+  // Everything a request imports comes from the build's release; each handler resolves once, here.
+  const release = attachRelease(config)
+  release.staticMetadataFiles = manifest.staticMetadataFiles
+  const handlerHrefs = new Map(
+    manifest.routes
+      .filter(route => route.kind === 'handler')
+      .map(route => [
+        route.id,
+        releaseModuleHref(
+          release,
+          'server',
+          serverBundleTargetForRuntime(route.segmentConfig?.runtime),
+          route.file,
+        ),
+      ]),
+  )
   const persistManifest = async () => {
     const stored = JSON.parse(await readFile(manifestPath, 'utf8')) as BuildManifest
     stored.staticFiles = manifest.staticFiles
@@ -120,6 +130,7 @@ export async function createRequestHandler(
   // Content-hashed asset names, as the build emitted them: a render in THIS
   // process must link the same files, not the logical `global.css` spelling.
   publishEmittedAssets(config.outPath, manifest.assetNames)
+  const exactNames = exactNameIndex(config.outPath)
   // Publish the live routing state the compat request interceptors (action
   // dispatch, rewrites) read; prod loads the route table once.
   setRequestRuntime({ config, routes: manifest.routes, dev: false })
@@ -127,6 +138,7 @@ export async function createRequestHandler(
     compiledModuleHref: manifest.proxyModule
       ? pathToFileHref(path.resolve(config.outPath, manifest.proxyModule))
       : undefined,
+    released: release.proxy as ProxyRunnerOptions['released'],
   })
   const routesById = new Map(manifest.routes.map(route => [route.id, route]))
   const nextCompat = Boolean(config.compat?.next)
@@ -149,6 +161,7 @@ export async function createRequestHandler(
     const route = routesById.get(metadata.routeId)
     if (!route) return
     await runWithWorkUnit('render', async () => {
+      setWorkUnitRelease(release)
       const url = new URL(`http://pnext.local${pathname}`)
       const params = routeParamsFromPath(route, pathname)
       const fetchCache = route.segmentConfig?.fetchCache
@@ -156,11 +169,10 @@ export async function createRequestHandler(
         if (route.kind === 'handler') {
           setWorkUnitRoute('route-handler', 'isr', { revalidateReason: reason })
           setPhase('handler')
-          registerServerRuntime(config, route.sourceFiles)
-          const href = compatModuleMode(config)
-            ? await moduleHrefForRoute(config, route)
-            : pathToFileHref(route.file)
-          const module = await importModuleOnce<Parameters<typeof handleRouteModule>[0]>(href)
+          await registerServerRuntime(config, route.sourceFiles)
+          const module = await importModuleOnce<Parameters<typeof handleRouteModule>[0]>(
+            handlerHrefs.get(route.id)!,
+          )
           const rendered = await getRenderExtensions().collectRenderMeta(
             () =>
               withRouteRuntime(route.segmentConfig?.runtime, () =>
@@ -255,7 +267,13 @@ export async function createRequestHandler(
 
   setRequestExtensions({
     onDemandRevalidatePath: async pathname => {
-      const built = await builtFileInfo(config.outPath, pathname, manifest.staticFiles)
+      const built = await builtFileInfo(
+        config.outPath,
+        pathname,
+        manifest.staticFiles,
+        false,
+        exactNames,
+      )
       if (!built?.metadata) return
       await runRegeneration(pathname, built.file, built.relative, built.metadata, 'on-demand')
     },
@@ -269,6 +287,8 @@ export async function createRequestHandler(
       request.method,
       request.headers,
       nextCompat,
+      manifest.publicAssets,
+      exactNames,
     )
     if (built) {
       setWorkUnitRoute('html', 'static')
@@ -293,15 +313,13 @@ export async function createRequestHandler(
     )
   }
 
-  // The boot config compile is the only build work a prod server does; drop the
-  // resident esbuild service child (~10+ MB RSS) — it respawns if ever needed.
-  stopEsbuildService()
-
   return function handleRequest(request: Request, server?: PeerAddressSource): Promise<Response> {
     // One work unit spans the whole request; its after-queue flushes once the
     // response fully closes (stream end, redirect, notFound, error, abort).
     return runWithWorkUnit('render', async () => {
       const unit = getWorkUnit()
+      // Every request is work of this release: app-directory facts come from it, never the disk.
+      setWorkUnitRelease(release)
       try {
         const raw = await handle(request, server)
         const finalized = await finalizeResponse(
@@ -343,6 +361,8 @@ export async function createRequestHandler(
     if (badRequest) return badRequest
     request = withForwardedHeaders(request, server)
     const requestedUrl = new URL(request.url)
+    const slashRedirect = repeatedSlashRedirect(requestedUrl)
+    if (slashRedirect) return slashRedirect
     // assetPrefix is independent from basePath. Strip a path-style asset
     // prefix first so `/cdn/_next/static/*` remains servable even when the app
     // itself lives under a different basePath.
@@ -383,6 +403,11 @@ export async function createRequestHandler(
     const revalidateBypass = Boolean(
       bypassToken && request.headers.get('x-prerender-revalidate') === bypassToken,
     )
+    // Trailing-slash normalization applies to the browser-visible (as-requested)
+    // URL, never to an internal rewrite destination, and precedes the proxy for
+    // every method as in Next: the proxy only ever sees canonical paths.
+    const canonicalRedirect = trailingSlashRedirect(config, requestedUrl)
+    if (canonicalRedirect) return canonicalRedirect
     const canonicalUrl = new URL(request.url)
     const canonicalHeaders = request.headers
     let proxyResponse: Response | undefined
@@ -427,11 +452,6 @@ export async function createRequestHandler(
         : new Request(canonicalRequestUrl, { headers: canonicalHeaders })
 
     const method = request.method.toUpperCase()
-    // Trailing-slash normalization applies to the browser-visible (as-requested)
-    // URL, never to an internal rewrite destination. A middleware/next.config
-    // rewrite to `/en/` must render internally, not 308 the visitor to `/en`.
-    const canonicalRedirect = trailingSlashRedirect(config, requestedUrl, method)
-    if (canonicalRedirect) return applyProxyResponse(canonicalRedirect, proxyResponse)
     // Soft navigations carry the client's parallel-route state; when the
     // target involves slots, interception, or a host render, the response is
     // state-dependent and must render dynamically (never from prebuilt html).
@@ -461,7 +481,13 @@ export async function createRequestHandler(
     // rewrites it.
     const built =
       method === 'GET' || method === 'HEAD'
-        ? await builtFileInfo(config.outPath, url.pathname, manifest.staticFiles, nextCompat)
+        ? await builtFileInfo(
+            config.outPath,
+            url.pathname,
+            manifest.staticFiles,
+            nextCompat,
+            exactNames,
+          )
         : null
     const hardStaticStale =
       built !== null &&
@@ -526,6 +552,8 @@ export async function createRequestHandler(
         request.method,
         request.headers,
         nextCompat,
+        manifest.publicAssets,
+        exactNames,
       )
       if (staticFile && !(draftBypass && isHtmlResponse(staticFile))) {
         const staticMode = servedBuilt.metadata?.revalidateSeconds !== undefined ? 'isr' : 'static'
@@ -594,7 +622,14 @@ export async function createRequestHandler(
       // isOnDemandRevalidate semantics) and persist the fresh bytes so
       // subsequent requests serve the regenerated static copy again.
       const renderedHandler = await getRenderExtensions().collectRenderMeta(
-        () => handleRoute(config, matched.route, canonicalRequest, matched.params),
+        () =>
+          handleRoute(
+            config,
+            matched.route,
+            handlerHrefs.get(matched.route.id)!,
+            canonicalRequest,
+            matched.params,
+          ),
         {
           fetchCache: matched.route.segmentConfig?.fetchCache,
           refreshFetches: staleOnDemand,
@@ -971,34 +1006,20 @@ function maybeCloseNodeFetchConnection(response: Response, request: Request) {
   return response
 }
 
-// Compat mode gate (a pure read of config.compat, no compat import): under
-// compat the compiled module is loaded so bare next/* / react aliases resolve
-// to the compat layer. Mirrors compat/aliases.ts reactCompatEnabled — kept inline
-// so start.ts carries no static edge into compat.
-function compatModuleMode(config: Awaited<ReturnType<typeof loadConfig>>): boolean {
-  return Boolean(config.compat?.next || config.compat?.react || config.compat?.reactCompiler)
-}
-
 async function handleRoute(
   config: Awaited<ReturnType<typeof loadConfig>>,
   route: RouteManifestEntry,
+  href: string,
   request: Request,
   params: Record<string, RouteParamValue>,
 ) {
   return withRouteRuntime(route.segmentConfig?.runtime, async () => {
-    registerServerRuntime(config, route.sourceFiles)
+    await registerServerRuntime(config, route.sourceFiles)
     // Module resolution and handler invocation run through the render-span seam
     // (compat/otel emits `resolve page components` + `executing api route`;
     // pass-through for pure-core apps).
     const spans = getRenderSpanExtensions()
     const module = await spans.withFindPageComponentsSpan(route.route, async () => {
-      // Compat mode loads the compiled module (aliases baked in): a raw import
-      // would resolve bare next/* specifiers (next/headers etc.) against whatever
-      // next package is installed instead of the compat layer — Bun's runtime
-      // onResolve plugin cannot alias bare imports. Same pattern as pageRender.
-      const href = compatModuleMode(config)
-        ? await moduleHrefForRoute(config, route)
-        : new URL(`file://${route.file}`).href
       const imported = await importModuleOnce<
         RouteHandlerModule & Parameters<typeof metadataRouteHandlerModule>[0]
       >(href)
@@ -1067,10 +1088,12 @@ async function builtFileInfo(
   pathname: string,
   staticFiles: Record<string, StaticFileMetadata> = {},
   nextStaticFallback = false,
+  exactNames?: ExactNames,
 ): Promise<BuiltFileInfo | null> {
   const file = await firstFile(
     path.join(outPath, 'public'),
     builtFileCandidates(outPath, pathname, nextStaticFallback),
+    exactNames,
   )
   if (!file) return null
   const publicPath = path.join(outPath, 'public')
@@ -1195,6 +1218,8 @@ export async function maybeBuiltFile(
   method = 'GET',
   requestHeaders?: Headers,
   nextStaticFallback = false,
+  publicAssets: string[] = [],
+  exactNames?: ExactNames,
 ) {
   const normalizedMethod = method.toUpperCase()
   if (normalizedMethod !== 'GET' && normalizedMethod !== 'HEAD') return null
@@ -1203,6 +1228,7 @@ export async function maybeBuiltFile(
   const file = await firstFile(
     publicPath,
     builtFileCandidates(outPath, pathname, nextStaticFallback),
+    exactNames,
   )
   if (!file) return null
   const relative = path.relative(publicPath, file).split(path.sep).join('/')
@@ -1219,7 +1245,8 @@ export async function maybeBuiltFile(
   const variant = requestHeaders?.get('rsc') === '1' ? '-rsc' : ''
   const etag = `W/"${fileStat.size.toString(16)}-${Math.trunc(fileStat.mtimeMs).toString(16)}${variant}"`
   if (!headers.has('cache-control')) {
-    headers.set('cache-control', immutableAssetPath(relative) ? immutableCacheControl : 'no-cache')
+    const immutable = immutableAssetPath(relative) && !publicAssets.includes(relative)
+    headers.set('cache-control', immutable ? immutableCacheControl : 'no-cache')
     headers.set('etag', etag)
     if (requestHeaders?.get('if-none-match') === etag) {
       return new Response(null, { status: 304, headers })
@@ -1344,40 +1371,11 @@ function cachedGzip(key: string, body: Buffer) {
   return zipped
 }
 
-export const immutableCacheControl = 'public, max-age=31536000, immutable'
-
-/**
- * Everything the build emits under `assets/` (served at `/_next/static/*` in
- * compat) is immutable, which is the promise Next makes for that whole
- * namespace. It holds because every one of those names carries a content hash:
- * esbuild's for chunks and fonts, assetContentHash for the route entries and the
- * stylesheets (see fingerprintClientEntries / fingerprintAsset), and a build id
- * for `_next/static/<id>/_*Manifest.js`. An UNHASHED name must never reach here —
- * the same URL would answer different bytes after a deploy, and every browser
- * that saw the old ones would keep them for a year.
- *
- * Route outputs (prerendered html, handler bodies) live outside both prefixes
- * and stay revalidating; the public/ tree the app ships is likewise untouched.
- */
-export function immutableAssetPath(relativePath: string) {
-  return immutableAssetPrefixes().some(prefix => relativePath.startsWith(prefix))
-}
-
-/** The public-relative prefixes `immutableAssetPath` covers. */
-export function immutableAssetPrefixes() {
-  return [
-    'assets/',
-    '_next/static/',
-    ...getAssetExtensions()
-      .staticAssetPublicPrefixes()
-      .map(prefix => prefix.replace(/^\/+/, '')),
-  ]
-}
-
-async function firstFile(root: string, files: string[]) {
+async function firstFile(root: string, files: string[], exactNames?: ExactNames) {
   for (const file of files) {
     if (!isInside(root, file)) continue
     if (!existsSync(file)) continue
+    if (exactNames && !hasExactName(exactNames, root, path.relative(root, file))) continue
     if ((await stat(file)).isFile()) return file
   }
   return null

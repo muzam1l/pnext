@@ -20,6 +20,89 @@ const PREDEFINED_SERVER_EXTERNAL_PACKAGES = [
   '@node-rs/bcrypt',
 ]
 
+/** Next's `next/dist/lib/server-external-packages.jsonc`. */
+const NEXT_SERVER_EXTERNAL_PACKAGES = new Set([
+  '@alinea/generated',
+  '@appsignal/nodejs',
+  '@aws-sdk/client-s3',
+  '@aws-sdk/s3-presigned-post',
+  '@blockfrost/blockfrost-js',
+  '@highlight-run/node',
+  '@huggingface/transformers',
+  '@jpg-store/lucid-cardano',
+  '@libsql/client',
+  '@mikro-orm/core',
+  '@mikro-orm/knex',
+  '@node-rs/argon2',
+  '@node-rs/bcrypt',
+  '@prisma/client',
+  '@react-pdf/renderer',
+  '@sentry/profiling-node',
+  '@sparticuz/chromium',
+  '@sparticuz/chromium-min',
+  '@statsig/statsig-node-core',
+  '@swc/core',
+  '@xenova/transformers',
+  '@zenstackhq/runtime',
+  'argon2',
+  'autoprefixer',
+  'aws-crt',
+  'bcrypt',
+  'better-sqlite3',
+  'canvas',
+  'chromadb-default-embed',
+  'config',
+  'cpu-features',
+  'cypress',
+  'dd-trace',
+  'eslint',
+  'express',
+  'firebase-admin',
+  'htmlrewriter',
+  'import-in-the-middle',
+  'isolated-vm',
+  'jest',
+  'jsdom',
+  'keyv',
+  'libsql',
+  'mdx-bundler',
+  'mongodb',
+  'mongoose',
+  'newrelic',
+  'next-mdx-remote',
+  'next-seo',
+  'node-cron',
+  'node-pty',
+  'node-web-audio-api',
+  'onnxruntime-node',
+  'oslo',
+  'pg',
+  'pino',
+  'pino-pretty',
+  'pino-roll',
+  'playwright',
+  'playwright-core',
+  'postcss',
+  'prettier',
+  'prisma',
+  'puppeteer',
+  'puppeteer-core',
+  'ravendb',
+  'require-in-the-middle',
+  'rimraf',
+  'sharp',
+  'shiki',
+  'sqlite3',
+  'thread-stream',
+  'ts-morph',
+  'ts-node',
+  'typescript',
+  'vscode-oniguruma',
+  'webpack',
+  'websocket',
+  'zeromq',
+])
+
 function stringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string')
@@ -49,6 +132,11 @@ export function deploymentId(): string | undefined {
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   const fromEnv = process.env.NEXT_DEPLOYMENT_ID
   return fromEnv && fromEnv.length > 0 ? fromEnv : undefined
+}
+
+/** Next's built-in server externals, which a release keeps out of its dependency graph. */
+export function builtInServerExternalPackages(): ReadonlySet<string> {
+  return NEXT_SERVER_EXTERNAL_PACKAGES
 }
 
 /** `publicRuntimeConfig`: the subset of runtime config safe to inline into client bundles. */

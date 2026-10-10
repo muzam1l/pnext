@@ -1,20 +1,45 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
+import { productionRelease } from '../runtime/production'
 import { readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import type { Plugin } from 'esbuild'
 import { hashedAssetName } from '../utils/asset-hash'
 import { build } from '../utils/esbuild'
-import { cssModuleScopePath, ensureDir, readText } from '../utils/fs'
+import { ensureDir, readText } from '../utils/fs'
 import { postcssConfigFile, runPostcss } from './postcss'
 import { extraPageExtensions, getCssExtensions } from '../extensions'
-import { nextCompatEnabled } from '../render/hooks'
 import { resolveImport } from '../resolve/imports'
+import { readSourceSync } from '../resolve/source-text'
 import { createVerboseLogger } from '../utils/verbose'
 import type { ClientReference } from '../client/reference'
 import type { ResolvedConfig } from '../config'
 import type { RouteManifestEntry } from '../types'
 
 import type { CssWorkerRequest, CssWorkerResponse } from './worker'
+import {
+  cssClassNames,
+  cssModuleClassName,
+  cssModuleMapping,
+  isCssModuleFile,
+  recordEmittedAsset,
+} from './assets'
+
+export {
+  assetHref,
+  assetPathname,
+  clearEmittedAssets,
+  cssModuleMapping,
+  emitFontCssStylesheet,
+  emittedAssetName,
+  emittedAssetNames,
+  publishEmittedAssets,
+  recordEmittedAsset,
+  registerCssRuntime,
+  routeCssAssetNames,
+  routeCssHref,
+  withAssetPrefix,
+  type AssetHrefConfig,
+} from './assets'
 
 interface Pending {
   resolve: () => void
@@ -126,8 +151,6 @@ interface CssBuildOptions {
   verbose?: boolean
 }
 
-let cssRuntimeRegistered = false
-
 export function globalCssSource(config: ResolvedConfig) {
   return globalCssSources(config)[0]
 }
@@ -135,7 +158,10 @@ export function globalCssSource(config: ResolvedConfig) {
 export function globalCssSources(
   config: Pick<ResolvedConfig, 'root' | 'appPath'> & Partial<Pick<ResolvedConfig, 'workspaceRoot'>>,
 ) {
-  return globalCssSourcesForPaths(config.root, config.appPath, config.workspaceRoot)
+  return (
+    productionRelease(config)?.globalCss ??
+    globalCssSourcesForPaths(config.root, config.appPath, config.workspaceRoot)
+  )
 }
 
 // The walk below reads and resolves the ROOT LAYOUT'S WHOLE IMPORT GRAPH, and every render asks it
@@ -213,7 +239,7 @@ function collectGlobalCssSources(
   }
   visited.add(resolvedFile)
 
-  for (const specifier of moduleSpecifiers(readFileSync(resolvedFile, 'utf8'))) {
+  for (const specifier of moduleSpecifiers(readSourceSync(resolvedFile))) {
     const resolved = resolveImport(root, resolvedFile, specifier, workspaceRoot)
     if (!resolved) continue
     if (isCssFile(resolved)) {
@@ -231,130 +257,6 @@ function rootLayoutFile(appPath: string, missing?: Set<string>) {
     missing?.add(file)
   }
   return path.join(appPath, 'layout.tsx')
-}
-
-export function globalCssHref(config: ResolvedConfig) {
-  return globalCssSources(config).length > 0 ? assetHref(config, 'global.css') : undefined
-}
-
-export type AssetHrefConfig = Pick<ResolvedConfig, 'assetPrefix' | 'compat' | 'outPath'>
-
-/**
- * Logical build-asset name -> the content-hashed name the build actually emitted
- * (`global.css` -> `global-1f4a9c2b3d5e6f70.css`). A production asset name must
- * carry its content, or the URL cannot honestly be served `immutable`: the same
- * name would answer different bytes after a deploy.
- *
- * Keyed by outPath, never process-global: one process builds several apps (the
- * test suite does it constantly) and their names must not cross. Empty in dev,
- * where names stay flat and every asset is served `no-cache` anyway.
- */
-const emittedAssets = new Map<string, Map<string, string>>()
-
-export function recordEmittedAsset(outPath: string, logical: string, emitted: string): void {
-  const names = emittedAssets.get(outPath) ?? new Map<string, string>()
-  names.set(logical, emitted)
-  emittedAssets.set(outPath, names)
-}
-
-/** Re-publish the build's name map at server boot (see BuildManifest.assetNames). */
-export function publishEmittedAssets(
-  outPath: string,
-  names: Record<string, string> | undefined,
-): void {
-  if (!names) return
-  for (const [logical, emitted] of Object.entries(names))
-    recordEmittedAsset(outPath, logical, emitted)
-}
-
-export function emittedAssetNames(outPath: string): Record<string, string> {
-  return Object.fromEntries(emittedAssets.get(outPath) ?? [])
-}
-
-export function clearEmittedAssets(outPath: string): void {
-  emittedAssets.delete(outPath)
-}
-
-/** The file name a logical asset name resolves to. Identity until a build records one. */
-export function emittedAssetName(
-  config: Pick<ResolvedConfig, 'outPath'> | undefined,
-  name: string,
-): string {
-  if (!config?.outPath) return name
-  return emittedAssets.get(config.outPath)?.get(name) ?? name
-}
-
-// Where a built asset lives in the URL space. next-compat serves the build output under Next's
-// static path, so a compat app's document references its CSS/JS exactly as Next does; core keeps
-// `/assets/`. Every document-emitted build-asset URL goes through here (and the dev/prod servers
-// accept both spellings), so an emitted href can never name a path the server will not serve —
-// including the content hash the production name carries.
-export function assetPathname(
-  config: Pick<ResolvedConfig, 'compat' | 'outPath'> | undefined,
-  name: string,
-) {
-  const emitted = emittedAssetName(config, name)
-  return nextCompatEnabled(config ?? {}) ? `/_next/static/${emitted}` : `/assets/${emitted}`
-}
-
-export function assetHref(config: AssetHrefConfig | undefined, name: string) {
-  return withAssetPrefix(config, assetPathname(config, name))
-}
-
-// A route's built CSS filenames - the one rule behind the document's links, the
-// inline-CSS path and analyze, so no consumer can disagree about whether a
-// route has CSS. compat cssChunking records split names in cssAssets.
-export function routeCssAssetNames(
-  route: Pick<RouteManifestEntry, 'id' | 'cssImports' | 'cssAssets'>,
-): string[] {
-  if (route.cssImports.length === 0) return []
-  return route.cssAssets?.length ? route.cssAssets : [`${route.id}.css`]
-}
-
-export function routeCssHref(
-  route: RouteManifestEntry,
-  config?: AssetHrefConfig,
-): string | string[] | undefined {
-  const assets = routeCssAssetNames(route)
-  if (assets.length === 0) return undefined
-  return assets.map(asset => assetHref(config, asset))
-}
-
-/**
- * Put a render's next/font rules in the first stylesheet chunk, matching Next's
- * linked CSS delivery without changing the rest of the route's chunk order.
- */
-export async function emitFontCssStylesheet(
-  config: ResolvedConfig,
-  routeId: string,
-  fontCss: string,
-  baseAsset: string | undefined,
-  options: { dev: boolean },
-) {
-  const outDir = path.join(config.outPath, options.dev ? 'cache' : 'public', 'assets')
-  await ensureDir(outDir)
-  const baseFile = baseAsset ? path.join(outDir, baseAsset) : undefined
-  const baseCss = baseFile && existsSync(baseFile) ? await readFile(baseFile, 'utf8') : ''
-  const contents = [fontCss, baseCss].filter(Boolean).join('\n')
-  const logicalName = baseAsset
-    ? baseAsset.replace(/-[0-9a-f]{16}(?=\.css$)/, '')
-    : `${routeId}.css`
-  const name = hashedAssetName(logicalName, contents)
-  const file = path.join(outDir, name)
-  if (!existsSync(file) || (await readFile(file, 'utf8')) !== contents)
-    await writeFile(file, contents)
-  return name
-}
-
-// Prepend the configured assetPrefix (a CDN origin or path) to an app-absolute
-// asset URL. Link hrefs use basePath instead and must NOT go through here.
-export function withAssetPrefix(
-  config: Pick<ResolvedConfig, 'assetPrefix'> | undefined,
-  href: string,
-) {
-  const prefix = config?.assetPrefix
-  if (!prefix) return href
-  return `${prefix.replace(/\/$/, '')}${href}`
 }
 
 /**
@@ -394,7 +296,7 @@ export async function buildGlobalCss(config: ResolvedConfig, options: CssBuildOp
   await log.step('global css: esbuild bundle', () =>
     build({
       stdin: {
-        contents: sources.map(file => `@import ${JSON.stringify(file)};`).join('\n'),
+        contents: stdinImports(config.root, sources),
         loader: 'css',
         resolveDir: config.root,
         sourcefile: 'global.css',
@@ -447,14 +349,28 @@ async function fingerprintAsset(
   outDir: string,
   assetName: string,
   options: CssBuildOptions,
+  file = assetName,
 ) {
-  const outfile = path.join(outDir, assetName)
+  const outfile = path.join(outDir, file)
   if (options.dev) return outfile
   const emittedName = hashedAssetName(assetName, await readFile(outfile))
   const emitted = path.join(outDir, emittedName)
   if (emitted !== outfile) await rename(outfile, emitted)
   recordEmittedAsset(config.outPath, assetName, emittedName)
   return emitted
+}
+
+// Relative to the build's resolveDir: an absolute specifier would match the public-url plugin's
+// `^/` filter and cost a JS round trip per import.
+function stdinImports(root: string, files: string[]) {
+  return files
+    .map(file => {
+      const relative = path.relative(root, file).split(path.sep).join('/')
+      const specifier =
+        path.isAbsolute(relative) || relative.startsWith('../') ? relative : `./${relative}`
+      return `@import ${JSON.stringify(specifier)};`
+    })
+    .join('\n')
 }
 
 function moduleSpecifiers(source: string) {
@@ -501,38 +417,120 @@ export function prepareRouteCssChunks(routes: Pick<RouteManifestEntry, 'id' | 'c
   for (const [id, segments] of plan) routeCssPlan.set(id, segments)
 }
 
+interface CssChunk {
+  imports: string[]
+  name: string
+  label: string
+}
+
+/** A route's stylesheet chunks, one per planned slice, and the split names the route records. */
+function routeCssChunks(route: RouteManifestEntry) {
+  if (route.cssImports.length === 0) return undefined
+  const segments = routeCssPlan.get(route.id)
+  if (segments && segments.length > 1) {
+    const cssAssets = segments.map((_, index) => `${route.id}-${index}.css`)
+    const chunks: CssChunk[] = segments.map((imports, index) => ({
+      imports,
+      name: cssAssets[index]!,
+      label: `route css ${route.route} #${index + 1}`,
+    }))
+    return { cssAssets, chunks }
+  }
+  const chunks: CssChunk[] = [
+    { imports: route.cssImports, name: `${route.id}.css`, label: `route css ${route.route}` },
+  ]
+  return { cssAssets: undefined, chunks }
+}
+
+function clientReferenceCssChunks(reference: ClientReference): CssChunk[] {
+  if (!reference.cssImports || reference.cssImports.length === 0) return []
+  return [
+    {
+      imports: reference.cssImports,
+      name: `${reference.id}.css`,
+      label: `island css ${reference.id}`,
+    },
+  ]
+}
+
 export async function buildRouteCss(
   config: ResolvedConfig,
   route: RouteManifestEntry,
   options: CssBuildOptions = {},
 ) {
-  if (route.cssImports.length === 0) return undefined
-  const segments = routeCssPlan.get(route.id)
-  if (segments && segments.length > 1) {
-    const assetNames = segments.map((_, index) => `${route.id}-${index}.css`)
-    route.cssAssets = assetNames
-    const files: string[] = []
-    for (const [index, segment] of segments.entries()) {
-      files.push(
-        await bundleCssChunk(
-          config,
-          segment,
-          assetNames[index]!,
-          `route css ${route.route} #${index + 1}`,
-          options,
-        ),
-      )
-    }
-    return files
+  const css = routeCssChunks(route)
+  if (!css) return undefined
+  route.cssAssets = css.cssAssets
+  const files: string[] = []
+  for (const chunk of css.chunks) {
+    files.push(await bundleCssChunk(config, chunk.imports, chunk.name, chunk.label, options))
   }
-  route.cssAssets = undefined
-  return bundleCssChunk(
-    config,
-    route.cssImports,
-    `${route.id}.css`,
-    `route css ${route.route}`,
-    options,
-  )
+  return css.cssAssets ? files : files[0]
+}
+
+/** Logical names the document stylesheets own; a route chunk spelled the same waits for them. */
+const DOCUMENT_CSS = new Set([
+  'global.css',
+  'not-found.css',
+  'global-not-found.css',
+  'global-error.css',
+])
+
+/**
+ * Every route's and island's stylesheet for a production build, bundled at once rather than one
+ * route after another and alongside the document stylesheets. Each route gets a `publish` that the
+ * prerender loop calls in route order once the document sheets are done: it records the route's
+ * names exactly when, and in the order, a serial pass would, so the manifest is unchanged.
+ */
+export function buildRouteStylesheets(
+  config: ResolvedConfig,
+  routes: RouteManifestEntry[],
+  documentCss: Promise<unknown>,
+  options: CssBuildOptions = {},
+) {
+  // One bundle per distinct input; an island several routes reach is built once.
+  const builds = new Map<string, { file: string; outDir: Promise<string>; emitted?: string }>()
+  const taken = new Set<string>()
+  const publish = new Map<RouteManifestEntry, () => Promise<void>>()
+  for (const route of routes) {
+    const css = routeCssChunks(route)
+    const chunks = [
+      ...(css?.chunks ?? []),
+      ...route.clientReferences.flatMap(clientReferenceCssChunks),
+    ]
+    const own = chunks.map(chunk => {
+      const key = `${chunk.name}\0${chunk.imports.join('\0')}`
+      let build = builds.get(key)
+      if (!build) {
+        // Two routes can share an id (`/a-b`, `/a/b`): different input under a taken name gets its own file.
+        const file = taken.has(chunk.name) ? `.${builds.size}-${chunk.name}` : chunk.name
+        taken.add(chunk.name)
+        const write = () => writeCssChunk(config, chunk.imports, file, chunk.label, options)
+        const outDir = DOCUMENT_CSS.has(file) ? documentCss.then(write) : write()
+        outDir.catch(() => undefined)
+        build = { file, outDir }
+        builds.set(key, build)
+      }
+      return { name: chunk.name, build }
+    })
+    publish.set(route, async () => {
+      if (css) route.cssAssets = css.cssAssets
+      for (const { name, build } of own) {
+        if (build.emitted) recordEmittedAsset(config.outPath, name, build.emitted)
+        else {
+          const emitted = await fingerprintAsset(
+            config,
+            await build.outDir,
+            name,
+            options,
+            build.file,
+          )
+          build.emitted = path.basename(emitted)
+        }
+      }
+    })
+  }
+  return publish
 }
 
 // The synthetic document conventions are created at render time and never
@@ -581,17 +579,24 @@ export async function buildClientReferenceCss(
   reference: ClientReference,
   options: CssBuildOptions = {},
 ) {
-  if (!reference.cssImports || reference.cssImports.length === 0) return undefined
-  return bundleCssChunk(
-    config,
-    reference.cssImports,
-    `${reference.id}.css`,
-    `island css ${reference.id}`,
-    options,
-  )
+  const [chunk] = clientReferenceCssChunks(reference)
+  if (!chunk) return undefined
+  return bundleCssChunk(config, chunk.imports, chunk.name, chunk.label, options)
 }
 
 async function bundleCssChunk(
+  config: ResolvedConfig,
+  cssImports: string[],
+  assetName: string,
+  label: string,
+  options: CssBuildOptions,
+) {
+  const outDir = await writeCssChunk(config, cssImports, assetName, label, options)
+  return fingerprintAsset(config, outDir, assetName, options)
+}
+
+/** Bundle (and postcss) one stylesheet under its logical name; returns its directory. */
+async function writeCssChunk(
   config: ResolvedConfig,
   cssImports: string[],
   assetName: string,
@@ -611,7 +616,7 @@ async function bundleCssChunk(
   const postcss = hasPostcssConfig(config.root)
   await build({
     stdin: {
-      contents: cssImports.map(file => `@import ${JSON.stringify(file)};`).join('\n'),
+      contents: stdinImports(config.root, cssImports),
       loader: 'css',
       resolveDir: config.root,
       sourcefile: assetName,
@@ -649,8 +654,7 @@ async function bundleCssChunk(
     await rewriteTailwindConfigDirectives(outfile, cssImports)
     await log.step(`${label}: postcss`, () => runPostcssOffThread(config, outfile, options))
   }
-
-  return fingerprintAsset(config, outDir, assetName, options)
+  return outDir
 }
 
 // A leading slash in a CSS url() is a public URL, not an app-root filesystem
@@ -665,34 +669,6 @@ function cssPublicUrlPlugin(): Plugin {
       )
     },
   }
-}
-
-export function registerCssRuntime() {
-  if (cssRuntimeRegistered) return
-  cssRuntimeRegistered = true
-
-  Bun.plugin({
-    name: 'pnext-css-runtime',
-    setup(plugin) {
-      plugin.onLoad({ filter: /\.(?:css|scss|sass)$/ }, async ({ path: file }) =>
-        isCssModuleFile(file)
-          ? {
-              exports: { default: await cssModuleMapping(file) },
-              loader: 'object',
-            }
-          : {
-              contents: 'export default undefined;',
-              loader: 'js',
-            },
-      )
-    },
-  })
-}
-
-// Sass is unsupported (no compiler); its imports still must not break the
-// bundle, so .scss/.sass load as empty modules with module class-name maps.
-function isCssModuleFile(file: string) {
-  return /\.module\.(?:css|scss|sass)$/.test(file)
 }
 
 export function cssModuleClientPlugin(): Plugin {
@@ -822,31 +798,6 @@ function cssModuleBuildPlugin(): Plugin {
   }
 }
 
-async function cssModuleMapping(file: string) {
-  // Compat handles *.module.{scss,sass} (sass compiles + scopes); core keeps
-  // plain .module.css. Lazy read: the registry populates at compat bootstrap.
-  const compatMapping = getCssExtensions().resolveCssModule(file)
-  if (compatMapping) return compatMapping
-  const source = await readText(file)
-  const classNames = cssClassNames(source)
-
-  return Object.fromEntries(
-    [...classNames].map(className => [className, cssModuleClassName(file, className)]),
-  )
-}
-
-function cssClassNames(source: string) {
-  const classNames = new Set<string>()
-  const classPattern = /(^|[^\\])\.(-?[_a-zA-Z][\w-]*)/g
-  let match: RegExpExecArray | null
-
-  while ((match = classPattern.exec(source))) {
-    if (match[2]) classNames.add(match[2])
-  }
-
-  return classNames
-}
-
 function transformCssModule(source: string, file: string) {
   let css = source
   for (const className of cssClassNames(source)) {
@@ -899,27 +850,12 @@ function keyframeNames(css: string) {
   return names
 }
 
-function cssModuleClassName(file: string, className: string) {
-  const base = path
-    .basename(file)
-    .replace(/\.module\.css$/, '')
-    .replace(/[^_a-zA-Z0-9]/g, '_')
-  const hash = pathHash(cssModuleScopePath(file))
-  return `${base}_${className}_${hash}`
-}
-
 function rewriteClassSelector(css: string, scopedClassName: string, originalClassName: string) {
   const esbuildNamePattern = new RegExp(
     `\\.${escapeRegex(originalClassName)}(?![-_a-zA-Z0-9])`,
     'g',
   )
   return css.replace(esbuildNamePattern, `.${scopedClassName}`)
-}
-
-function pathHash(file: string) {
-  let hash = 5381
-  for (const char of file) hash = ((hash << 5) + hash) ^ char.charCodeAt(0)
-  return (hash >>> 0).toString(36).slice(0, 5)
 }
 
 function escapeRegex(value: string) {

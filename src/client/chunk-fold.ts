@@ -91,8 +91,15 @@ async function foldGroup(
   const memberNames = members.map(output => path.basename(output))
   if (memberNames.some(name => !existsSync(path.join(chunksDir, name)))) return metafile
 
-  const sources = new Map<string, string>()
-  for (const name of memberNames) sources.set(name, await readText(path.join(chunksDir, name)))
+  // The state holds every output's current text, in step with what earlier groups wrote.
+  const sources = new Map(
+    await Promise.all(
+      memberNames.map(async name => {
+        const file = path.join(chunksDir, name)
+        return [name, state.outputs.get(file)?.text ?? (await readText(file))] as const
+      }),
+    ),
+  )
 
   const aliases = memberAliases(memberNames, sources)
   if (!aliases) return metafile
@@ -503,14 +510,20 @@ async function createFoldState(outDir: string, metafile: Metafile): Promise<Fold
     }
   }
 
+  const files = new Set<string>()
   for (const name of Object.keys(metafile.outputs)) {
     if (!name.endsWith('.js')) continue
     const resolved = path.resolve(name)
     const local = existsSync(resolved) ? resolved : path.join(outDir, path.basename(name))
-    if (outputs.has(local) || !existsSync(local)) continue
-    const output = foldOutput(await readText(local))
-    outputs.set(local, output)
-    index(local, output, true)
+    if (existsSync(local)) files.add(local)
+  }
+  // Read concurrently, indexed in metafile order.
+  const list = [...files]
+  const texts = await Promise.all(list.map(file => readText(file)))
+  for (const [at, file] of list.entries()) {
+    const output = foldOutput(texts[at]!)
+    outputs.set(file, output)
+    index(file, output, true)
   }
 
   return {

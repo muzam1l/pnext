@@ -1,13 +1,7 @@
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
-// Lazy: the oxc-parser native binding costs ~12.6 MB RSS; load it only when a parse happens.
-const parseSync: typeof import('oxc-parser').parseSync = (...args) =>
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  loadNative(() => require('oxc-parser') as typeof import('oxc-parser')).parseSync(...args)
-import { loadNative } from '../utils/native-require'
-import { registerServerRuntime } from '../runtime/loader'
 import { pathToFileHref, type ResolvedConfig } from '../config'
-import { devServerModuleHref } from '../runtime/modules'
+import { devServerModuleHref, registerServerRuntime } from '../runtime/load'
 import { runWithRequest } from '../request/context'
 import {
   copyMiddlewareHeaders,
@@ -140,14 +134,20 @@ export interface ProxyRunnerOptions {
    * load the build-time bundle that has aliases baked in.
    */
   compiledModuleHref?: string
+  /** A production release's proxy: its source and literal matcher config, as the build found them. */
+  released?: { file?: string; config?: ProxyConfig }
 }
 
 export function createProxyRunner(
   config: ResolvedConfig,
   runnerOptions: ProxyRunnerOptions = {},
 ): ProxyRunner {
-  const file = findProxyFile(config)
-  registerServerRuntime(config, file ? [file] : [])
+  const { released } = runnerOptions
+  const file = released ? released.file : findProxyFile(config)
+  const releasedMatchers = released?.config ? proxyMatchers(released.config) : undefined
+  // Awaited before the proxy module loads; a failure surfaces there.
+  const runtimeReady = registerServerRuntime(config, file ? [file] : [])
+  runtimeReady.catch(() => undefined)
   let moduleKey: string | undefined
   let modulePromise: Promise<ProxyModule> | undefined
   let matchers: CompiledMatcher[] | undefined
@@ -155,12 +155,14 @@ export function createProxyRunner(
   /** The module for `options`, started at most once per import version. */
   function proxyModule(options: ProxyRunOptions) {
     const key = proxyModuleKey(options)
+    const load = () =>
+      runtimeReady.then(() => importProxyModule(config, file!, options, runnerOptions))
     if (key !== moduleKey) {
       moduleKey = key
-      modulePromise = importProxyModule(config, file!, options, runnerOptions)
+      modulePromise = load()
       matchers = undefined
     }
-    return (modulePromise ??= importProxyModule(config, file!, options, runnerOptions))
+    return (modulePromise ??= load())
   }
 
   const runner: ProxyRunner = async (request, options = {}) => {
@@ -176,7 +178,7 @@ export function createProxyRunner(
     // Matcher first, straight off the source: a request no matcher selects must not wait on the
     // proxy's compile+import, which is otherwise the first serial link of a cold page.
     if (!matchers && proxyMatcherGateEnabled()) {
-      const staticMatchers = staticProxyMatchers(file)
+      const staticMatchers = released ? releasedMatchers : await staticProxyMatchers(file)
       if (staticMatchers && !matchesProxy(staticMatchers, url, request)) return undefined
     }
 
@@ -397,7 +399,7 @@ export function proxyRoutePatterns(config: ProxyConfig | undefined) {
   const matcher = config?.matcher
   if (!matcher) return ['^/(.*)$']
   const matchers = Array.isArray(matcher) ? matcher : [matcher]
-  return matchers.map(item => `^${matcherPattern(matcherSource(item))}$`)
+  return matchers.map(item => anchoredMatcherPattern(matcherSource(item)))
 }
 
 async function importProxyModule(
@@ -440,7 +442,7 @@ const staticMatcherCache = new Map<string, { key: string; matchers?: CompiledMat
  * middleware-manifest.json at build time); anything computed, any parse error, and any file without a
  * literal `config` yields undefined, and the caller falls back to the imported module's config.
  */
-function staticProxyMatchers(file: string): CompiledMatcher[] | undefined {
+async function staticProxyMatchers(file: string): Promise<CompiledMatcher[] | undefined> {
   let key: string
   try {
     const stats = statSync(file)
@@ -452,6 +454,7 @@ function staticProxyMatchers(file: string): CompiledMatcher[] | undefined {
   if (cached?.key === key) return cached.matchers
   let matchers: CompiledMatcher[] | undefined
   try {
+    const { staticProxyConfig } = await import('./proxy-config')
     const config = staticProxyConfig(file, readFileSync(file, 'utf8'))
     if (config) matchers = proxyMatchers(config)
   } catch {
@@ -459,121 +462,6 @@ function staticProxyMatchers(file: string): CompiledMatcher[] | undefined {
   }
   staticMatcherCache.set(file, { key, matchers })
   return matchers
-}
-
-function staticProxyConfig(file: string, source: string): ProxyConfig | undefined {
-  const result = parseSync(file, source, { lang: parserLang(file) })
-  // A recovered parse may have dropped the very declaration we are reading.
-  if (result.errors.length > 0) return undefined
-  for (const statement of result.program.body as StaticNode[]) {
-    if (statement.type !== 'ExportNamedDeclaration') continue
-    const declaration = statement.declaration
-    if (declaration?.type !== 'VariableDeclaration') continue
-    for (const declarator of declaration.declarations ?? []) {
-      if (declarator.id?.type !== 'Identifier' || declarator.id.name !== 'config') continue
-      const value = staticValue(declarator.init)
-      return isProxyConfigShape(value) ? (value as ProxyConfig) : undefined
-    }
-  }
-  return undefined
-}
-
-function parserLang(file: string) {
-  const ext = path.extname(file)
-  if (ext === '.tsx') return 'tsx'
-  if (ext === '.jsx') return 'jsx'
-  return ext === '.js' || ext === '.mjs' ? 'js' : 'ts'
-}
-
-/** Structural view of the oxc AST nodes this file reads — no full type import. */
-interface StaticNode {
-  type: string
-  name?: string
-  value?: unknown
-  computed?: boolean
-  shorthand?: boolean
-  key?: StaticNode
-  init?: StaticNode
-  id?: StaticNode
-  declaration?: StaticNode
-  declarations?: StaticNode[]
-  expression?: StaticNode
-  properties?: StaticNode[]
-  elements?: (StaticNode | null)[]
-  expressions?: StaticNode[]
-  quasis?: { value?: { cooked?: string } }[]
-}
-
-/** Literal-only evaluation; `undefined` marks "not statically known". */
-function staticValue(node: StaticNode | undefined | null): unknown {
-  if (!node) return undefined
-  switch (node.type) {
-    // `… as const` / `… satisfies ProxyConfig` wrap the literal, they never change it.
-    case 'TSAsExpression':
-    case 'TSSatisfiesExpression':
-    case 'TSNonNullExpression':
-      return staticValue(node.expression)
-    case 'Literal':
-    case 'StringLiteral':
-    case 'NumericLiteral':
-    case 'BooleanLiteral':
-      // A regex literal reports `value: null` here; it is not a matcher shape.
-      return node.value === null ? undefined : node.value
-    case 'TemplateLiteral':
-      return node.expressions?.length === 0
-        ? (node.quasis?.[0]?.value?.cooked ?? undefined)
-        : undefined
-    case 'ArrayExpression': {
-      const items: unknown[] = []
-      for (const element of node.elements ?? []) {
-        const value = staticValue(element)
-        if (value === undefined) return undefined
-        items.push(value)
-      }
-      return items
-    }
-    case 'ObjectExpression': {
-      const object: Record<string, unknown> = {}
-      for (const property of node.properties ?? []) {
-        if (property.type !== 'Property' && property.type !== 'ObjectProperty') return undefined
-        if (property.computed) return undefined
-        const key =
-          property.key?.type === 'Identifier' ? property.key.name : (property.key?.value as string)
-        if (typeof key !== 'string') return undefined
-        const value = staticValue(property.value as StaticNode | undefined)
-        if (value === undefined) return undefined
-        object[key] = value
-      }
-      return object
-    }
-    default:
-      return undefined
-  }
-}
-
-/** Only a config whose `matcher` is exactly the documented shape may gate. */
-function isProxyConfigShape(value: unknown): boolean {
-  if (typeof value !== 'object' || value === null) return false
-  const matcher = (value as { matcher?: unknown }).matcher
-  if (matcher === undefined) return true
-  const items = Array.isArray(matcher) ? matcher : [matcher]
-  return items.every(item => {
-    if (typeof item === 'string') return true
-    if (typeof item !== 'object' || item === null) return false
-    const { source, has, missing } = item as Record<string, unknown>
-    if (typeof source !== 'string') return false
-    return [has, missing].every(
-      list => list === undefined || (Array.isArray(list) && list.every(isConditionShape)),
-    )
-  })
-}
-
-function isConditionShape(value: unknown): boolean {
-  if (typeof value !== 'object' || value === null) return false
-  const { type, key, value: expected } = value as Record<string, unknown>
-  if (type !== 'header' && type !== 'query' && type !== 'cookie' && type !== 'host') return false
-  if (key !== undefined && typeof key !== 'string') return false
-  return expected === undefined || typeof expected === 'string'
 }
 
 function proxyMatchers(config: ProxyConfig | undefined): CompiledMatcher[] {
@@ -588,10 +476,11 @@ function proxyMatchers(config: ProxyConfig | undefined): CompiledMatcher[] {
 }
 
 function matchesProxy(matchers: CompiledMatcher[], url: URL, request: Request) {
-  const decoded = decodePathSeparators(url.pathname)
+  const { pathname } = url
+  const decoded = pathname.includes('%') ? decodedPathnames(pathname) : []
   return matchers.some(
     matcher =>
-      (matcher.regex.test(url.pathname) || matcher.regex.test(decoded)) &&
+      (matcher.regex.test(pathname) || decoded.some(item => matcher.regex.test(item))) &&
       matchesConditions(matcher, url, request),
   )
 }
@@ -641,8 +530,15 @@ function conditionValue(condition: ProxyRouteCondition, url: URL, request: Reque
   }
 }
 
-function decodePathSeparators(pathname: string) {
-  return pathname.replace(/%2f/gi, '/')
+// Next also matches `decodeURIComponent(pathname)`, so encoded paths can't skip the proxy.
+function decodedPathnames(pathname: string) {
+  const decoded = [pathname.replace(/%2f/gi, '/')]
+  try {
+    decoded.push(decodeURIComponent(pathname))
+  } catch {
+    // Malformed escapes match on the raw forms only.
+  }
+  return decoded
 }
 
 function matcherSource(matcher: ProxyMatcher) {
@@ -650,7 +546,12 @@ function matcherSource(matcher: ProxyMatcher) {
 }
 
 function matcherRegex(matcher: string) {
-  return new RegExp(`^${matcherPattern(matcher)}$`)
+  return new RegExp(anchoredMatcherPattern(matcher))
+}
+
+// Next's path-to-regexp (strict: false) also matches a trailing slash; routing strips any run of them.
+function anchoredMatcherPattern(matcher: string) {
+  return `^(?:${matcherPattern(matcher)})/*$`
 }
 
 function matcherPattern(matcher: string) {

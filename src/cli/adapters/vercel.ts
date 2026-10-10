@@ -3,8 +3,9 @@ import { existsSync, readFileSync, readdirSync, realpathSync, rmSync, statSync }
 import { builtinModules } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { DEFAULT_OUT_DIR, pathToFileHref } from '../../config'
+import { DEFAULT_OUT_DIR, devOutSegment, pathToFileHref } from '../../config'
 import type { ResolvedConfig } from '../../config'
+import { compiledClientReferenceFiles } from '../../client/reference'
 import { globalCssSources } from '../../css/build'
 import { getImportAliasExtensions } from '../../extensions'
 import { nextCompatEnabled } from '../../render/hooks'
@@ -14,6 +15,15 @@ import { resolveImport, workspacePackageRoots } from '../../resolve/imports'
 import { findProxyFile, proxyRoutePatterns, type ProxyModule } from '../../routing/proxy'
 import { cacheRoot } from '../boot/named-bin'
 import { startWarmChild, type WarmChild } from './vercel-warm'
+import {
+  immutableAssetPath,
+  immutableAssetPrefixes,
+  immutableCacheControl,
+} from '../serve/immutable'
+import { frameworkFingerprint } from '../../runtime/fingerprint'
+import { readPrebundleStamp, runtimeEntryDirs, runtimeEntryFiles } from '../../runtime/prebundle'
+import { buildIndexFile, readBuildIndex, releaseSourceFile } from '../../runtime/production'
+import { compiledSourceGraph, flushDevModuleCaches } from '../../runtime/module-cache'
 import { escapeRegex } from '../../utils/code'
 import { listFiles, toPosixPath, writeText } from '../../utils/fs'
 import { createVerboseLogger, type VerboseLogger } from '../../utils/verbose'
@@ -71,8 +81,14 @@ const droppedFileSuffixes = [
 interface PackRules {
   prunedDirs: Set<string>
   droppedSuffixes: string[]
+  /** Absolute app sources the release compiled: dropped unless `adapter.keep` names them. */
+  compiled: Set<string>
+  /** `adapter.keep` entries: names and `.suffix`es that always ship. */
+  keep: Set<string>
   /** Absolute sources exempt from the prune list — the app's own build output. */
   keepPaths: Set<string>
+  /** Absolute sources never shipped: the dev server's `<outRoot>/dev`, which a build leaves in place. */
+  devPaths: Set<string>
 }
 
 // Test seam: the packing suite builds one app both ways and diffs the trees,
@@ -89,13 +105,24 @@ export function setPackPruningEnabled(enabled: boolean) {
 }
 
 function packRules(config: ResolvedConfig): PackRules {
+  // An out dir inside a dev path (`outDir: '.pnext/dev'`) is the production output and must ship.
+  const devPaths = new Set(
+    [config.outRootPath, path.resolve(config.root, DEFAULT_OUT_DIR)]
+      .map(root => path.resolve(root, devOutSegment))
+      .filter(dev => !isInsideDir(dev, config.outPath)),
+  )
+  // Materialized pages sources: the release serves their compiled artifacts.
+  devPaths.add(path.join(config.outRootPath, 'pnext-pages-compat'))
   if (!packPruningEnabled) {
     return {
       // The two the function could never resolve through stay pruned even
       // here: a nested store or object database is not a packing choice.
       prunedDirs: new Set(['node_modules', '.git']),
       droppedSuffixes: [],
+      compiled: new Set(),
+      keep: new Set(),
       keepPaths: new Set([path.resolve(config.outPath)]),
+      devPaths,
     }
   }
   const keep = new Set(config.adapter?.keep ?? [])
@@ -110,11 +137,14 @@ function packRules(config: ResolvedConfig): PackRules {
     droppedSuffixes: [...droppedFileSuffixes, ...extra.filter(isSuffix)].filter(
       suffix => !keep.has(suffix),
     ),
+    compiled: new Set(),
+    keep,
     // The app's outDir shares its name with the prune list; it holds the
     // compiled module cache the function serves from and must survive. The
     // default out root goes with it: a `distDir` app moved its output away, but
     // the next.config bundle the function imports at boot still lives there.
     keepPaths: new Set([path.resolve(config.outPath), path.resolve(config.root, DEFAULT_OUT_DIR)]),
+    devPaths,
   }
 }
 
@@ -139,12 +169,60 @@ function withinKeepPath(pack: PackRules, source: string) {
  * that would pull the whole store into the function.
  */
 function shipsDir(pack: PackRules, name: string, source: string, isLink = false) {
+  if (pack.devPaths.has(path.resolve(source))) return false
   if (!pack.prunedDirs.has(name)) return true
   return !isLink && withinKeepPath(pack, source)
 }
 
-function shipsFile(pack: PackRules, name: string) {
-  return !pack.droppedSuffixes.some(suffix => name.endsWith(suffix))
+function shipsFile(pack: PackRules, name: string, source: string) {
+  if (pack.droppedSuffixes.some(suffix => name.endsWith(suffix))) return false
+  if (!pack.compiled.has(path.resolve(source)) || withinKeepPath(pack, source)) return true
+  return [...pack.keep].some(
+    entry => name === entry || (entry.startsWith('.') && name.endsWith(entry)),
+  )
+}
+
+/**
+ * App sources a release compiled into its output: the closure of `build-index.json`'s modules over the
+ * compile graph, plus the proxy, instrumentation and config it froze. Anything else may be read at
+ * request time and ships.
+ */
+function releaseCompiledSources(config: ResolvedConfig) {
+  flushDevModuleCaches()
+  const index = readBuildIndex(config.outPath)
+  const graph = compiledSourceGraph(config.outPath, config.workspaceRoot)
+  const queue = Object.keys(index.modules).map(key =>
+    releaseSourceFile(
+      key.slice(key.indexOf(':', key.indexOf(':') + 1) + 1),
+      config.root,
+      config.workspaceRoot,
+    ),
+  )
+  if (index.proxy) queue.push(path.resolve(config.root, index.proxy.file))
+  const script = /\.(?:[cm]?[jt]s|[jt]sx)$/
+  const frozen = (dir: string, pattern: RegExp) =>
+    (readDirEntries(dir) ?? [])
+      .filter(entry => pattern.test(entry.name) && script.test(entry.name))
+      .forEach(entry => queue.push(path.join(dir, entry.name)))
+  frozen(config.root, /^(?:pnext|next)\.config\./)
+  if (index.instrumentation) {
+    for (const dir of [config.root, path.join(config.root, 'src')])
+      frozen(dir, /^instrumentation\./)
+  }
+  const compiled = new Set<string>()
+  for (const file of queue) {
+    if (compiled.has(file)) continue
+    compiled.add(file)
+    let real = file
+    try {
+      real = realpathSync(file)
+    } catch {
+      continue
+    }
+    compiled.add(real)
+    queue.push(...(graph.get(file) ?? []), ...(graph.get(real) ?? []))
+  }
+  return compiled
 }
 
 interface VercelConfig {
@@ -156,6 +234,7 @@ interface VercelConfig {
         methods?: string[]
         headers?: Record<string, string>
         continue?: boolean
+        important?: boolean
       }
     | { handle: 'filesystem' }
   )[]
@@ -184,7 +263,10 @@ export async function writeVercelOutput(
   const warmedModulesEarly = new Promise<string[]>(resolve => {
     resolveWarmedModules = resolve
   })
-  const warmSettled = warm.finish(log, modules => resolveWarmedModules(modules))
+  const warmSettled = warm.finish(log, modules => resolveWarmedModules(modules), {
+    globalCss: globalCssSources(config),
+    clientReferences: [...compiledClientReferenceFiles()],
+  })
   // Nothing awaits it until writeServerFunction's copy step; park the
   // rejection so it never surfaces as unhandled in between (it never actually
   // rejects — warmWithRestarts catches everything itself — but the gap
@@ -213,7 +295,7 @@ export async function writeVercelOutput(
     // server function: served, but at function cost with no edge cache.
     ...compatStaticRewrite(config, outputPath),
     // Every content-hashed build asset, exactly the set `pnext start` serves immutable.
-    await immutableAssetRoute(),
+    ...(await immutableAssetRoutes(path.join(config.outPath, 'public'), manifest.publicAssets)),
     // Proxy-matched paths go to the server function before the CDN filesystem
     // check — `pnext start` runs the proxy ahead of static files too.
     ...(await proxyRoutes(config)),
@@ -281,7 +363,8 @@ async function proxyRoutes(config: ResolvedConfig) {
   const proxyFile = findProxyFile(config)
   if (!proxyFile) return []
   const proxyModule = (await import(pathToFileHref(proxyFile))) as ProxyModule
-  return proxyRoutePatterns(proxyModule.config).map(src => ({
+  // Percent-encoded paths and repeated slashes go to the function, which decodes or 308s them.
+  return [...proxyRoutePatterns(proxyModule.config), '^.*(?:%|//).*$'].map(src => ({
     src,
     dest: `/${SERVER_FUNCTION}`,
   }))
@@ -305,14 +388,18 @@ async function writeServerFunction(
   const pack = packRules(config)
   const framework = await resolveFrameworkPackage(workspaceRoot)
   const { root: pnextRoot, inWorkspace: pnextInWorkspace, targetRel: pnextTargetRel } = framework
+  const release = releaseEntries(config, manifest)
+  // A release served by the framework's prebundle needs none of its other source.
+  const prebundle = release ? readPrebundleStamp(pnextRoot, frameworkFingerprint()) : undefined
   const closure = await traceNodeModulesClosure(
     config,
     manifest,
     functionPath,
     framework,
-    warmedModules,
+    [...warmedModules, ...(release ?? [])],
     pack,
     log,
+    Boolean(release),
   )
 
   const replicaPathFor = (file: string) => {
@@ -338,17 +425,16 @@ async function writeServerFunction(
   for (const relative of closure.workspacePackages) {
     neededRoots.add(path.resolve(workspaceRoot, relative))
   }
-  // The renderer re-resolves the root layout's global css imports from source
-  // at request time; the packages holding those css files must be present.
-  for (const file of globalCssSources(config)) {
-    const root = packageRoots.find(candidate => isInsideDir(candidate, file))
-    if (root) neededRoots.add(root)
+  // Without a release the server compiles app source at request time: the renderer re-resolves the
+  // root layout's global css imports, and a compat compile resolves the shipped sources' imports for
+  // real, so the packages behind them and the declared workspace dependencies must be present.
+  if (!release) {
+    for (const file of globalCssSources(config)) {
+      const root = packageRoots.find(candidate => isInsideDir(candidate, file))
+      if (root) neededRoots.add(root)
+    }
+    addWorkspaceDependencies(neededRoots, packageRoots, [path.resolve(config.root), ...neededRoots])
   }
-  // Tracing sees what the *server* loaded, which is not everything the shipped source can still ask
-  // for: the app's own sources travel with the function and a compat compile at request time resolves
-  // their imports for real. A workspace package one of them names but no traced module reached would
-  // not be here, so close over the declared workspace dependencies too.
-  addWorkspaceDependencies(neededRoots, packageRoots, [path.resolve(config.root), ...neededRoots])
   neededRoots.delete(path.resolve(config.root))
   neededRoots.delete(pnextRoot)
 
@@ -364,16 +450,22 @@ async function writeServerFunction(
   await log.step(`copy function tree (${closure.packageCount} packages, ${roots} roots)`, () =>
     Promise.all([
       closure.copy(),
-      // `public` is served by the CDN, never from the function; the rest are
-      // named again because the app root is the one tree whose build output
-      // ships, so it cannot rely on the depth-wise prune alone.
-      copyTree(config.root, path.join(functionPath, appRel), pack, [
-        'public',
-        '.vercel',
-        '.next',
-        '.turbo',
-      ]),
-      copyPackageTree(pnextRoot, path.join(functionPath, pnextTargetRel), pack),
+      // A release ships the app tree minus what it compiled: request code may read files beside
+      // its source. `public` is served by the CDN, never from the function; the rest are named
+      // again because the app root is the one tree whose build output ships, so it
+      // cannot rely on the depth-wise prune alone.
+      copyTree(
+        config.root,
+        path.join(functionPath, appRel),
+        release ? { ...pack, compiled: releaseCompiledSources(config) } : pack,
+        ['public', '.vercel', '.next', '.turbo'],
+      ),
+      copyPackageTree(
+        pnextRoot,
+        path.join(functionPath, pnextTargetRel),
+        pack,
+        prebundle && ['config', 'dist', ...prebundle.source],
+      ),
       ...[...neededRoots].map(packageRoot =>
         copyPackageTree(
           packageRoot,
@@ -407,7 +499,9 @@ async function writeServerFunction(
     injectCompatPaths(config, functionPath, pnextRoot, replicaPathFor),
   )
 
-  const startEntry = toPosixPath(path.join(pnextTargetRel, 'src/cli/start.ts'))
+  const startEntry = toPosixPath(
+    path.join(pnextTargetRel, prebundle ? 'dist/server/cli/start.js' : 'src/cli/start.ts'),
+  )
   await writeText(
     path.join(functionPath, 'index.mjs'),
     `import path from 'node:path';
@@ -544,7 +638,7 @@ async function copyTree(
           visited.add(link.path)
           return copyTree(link.path, target, pack, [], visited)
         }
-        return shipsFile(pack, entry.name) ? linkOrCopyFile(link.path, target) : undefined
+        return shipsFile(pack, entry.name, source) ? linkOrCopyFile(link.path, target) : undefined
       }
       // One syscall for the whole subtree beats one per file — the excluded
       // names are stripped from the copy afterwards.
@@ -552,7 +646,8 @@ async function copyTree(
         return normalizeClone(target, source, pack, visited)
       }
       if (entry.isDirectory()) return copyTree(source, target, pack, [], visited)
-      if (entry.isFile() && shipsFile(pack, entry.name)) return linkOrCopyFile(source, target)
+      if (entry.isFile() && shipsFile(pack, entry.name, source))
+        return linkOrCopyFile(source, target)
     }),
   )
 }
@@ -631,19 +726,20 @@ async function normalizeClone(
       if (!shipsDir(pack, entry.name, source, entry.isSymbolicLink())) {
         rmSync(full, { recursive: true, force: true })
       } else if (entry.isSymbolicLink()) {
-        const link = resolveLinkTarget(full)
+        // From the source: a relative link in the clone would resolve against the function tree.
+        const link = resolveLinkTarget(source)
         rmSync(full, { force: true })
         if (!link) continue
         if (link.isDirectory) {
           if (visited.has(link.path)) continue
           visited.add(link.path)
           pending.push(copyTree(link.path, full, pack, [], visited))
-        } else if (shipsFile(pack, entry.name)) {
+        } else if (shipsFile(pack, entry.name, source)) {
           pending.push(linkOrCopyFile(link.path, full))
         }
       } else if (entry.isDirectory()) {
         stack.push([full, source])
-      } else if (!shipsFile(pack, entry.name)) {
+      } else if (!shipsFile(pack, entry.name, source)) {
         rmSync(full, { force: true })
       }
     }
@@ -703,10 +799,10 @@ const packageCopyExcludes = [
  * Copies a workspace package the way npm would publish it: a `files` list is the package's own
  * statement of what it ships, so it beats guessing at build-time directory names. Glob entries fall
  * back to the exclude list - matching npm's glob semantics is not worth it for a packaging copy.
+ * `only` names a narrower list.
  */
-async function copyPackageTree(from: string, to: string, pack: PackRules) {
-  const packageJson = await readPackageJson(from)
-  const files = packageJson?.files
+async function copyPackageTree(from: string, to: string, pack: PackRules, only?: string[]) {
+  const files = only ?? (await readPackageJson(from))?.files
   if (!files?.length || files.some(entry => /[*?[\]{}!]/.test(entry))) {
     return copyTree(from, to, pack, packageCopyExcludes)
   }
@@ -721,7 +817,8 @@ async function copyPackageTree(from: string, to: string, pack: PackRules) {
       const stats = statSync(source, { throwIfNoEntry: false })
       if (!stats) return
       if (stats.isDirectory()) return copyTree(source, path.join(to, name), pack)
-      if (!shipsFile(pack, name)) return
+      if (!shipsFile(pack, name, source)) return
+      await mkdir(path.dirname(path.join(to, name)), { recursive: true })
       return linkOrCopyFile(source, path.join(to, name))
     }),
   )
@@ -958,10 +1055,15 @@ async function traceNodeModulesClosure(
   warmedModules: string[],
   pack: PackRules,
   log: VerboseLogger,
+  // A release imports only build output, so its closure is traced from that alone.
+  release = false,
 ) {
   const workspaceRoot = config.workspaceRoot
   const specifiers = new Set<string>()
   const tracedFiles = new Set<string>()
+  // Package directories compiled modules import by absolute href (natively loaded server
+  // dependencies, externals). One outside the top-level node_modules ships where it is.
+  const hrefPackageDirs = new Set<string>()
   // Compat-aliased specifiers whose target lives in the framework source
   // (react, next/*) never resolve from node_modules at runtime — shipping
   // them would drag in the full next/react trees. Aliases that point into
@@ -972,7 +1074,8 @@ async function traceNodeModulesClosure(
   await log.step('trace runtime imports', async () => {
     // Only code Bun imports raw at request time needs real node_modules: route handlers, the proxy,
     // the config chain, and the compiled modules the warm step just wrote. Pages resolve through that
-    // compiled cache, whose externals are vendored, so their dependencies never load raw.
+    // compiled cache; what it does not vendor (server dependencies Bun loads natively, externals) it
+    // imports by absolute href, and those packages ship with their dependency closure below.
     const queue: string[] = []
     const seen = tracedFiles
     const enqueue = (file: string | undefined) => {
@@ -983,12 +1086,14 @@ async function traceNodeModulesClosure(
       queue.push(resolved)
     }
 
-    for (const route of manifest.routes) {
-      if (route.kind === 'handler') enqueue(route.file)
+    if (!release) {
+      for (const route of manifest.routes) {
+        if (route.kind === 'handler') enqueue(route.file)
+      }
+      enqueue(findProxyFile(config) ?? undefined)
+      enqueue(path.join(config.root, 'pnext.config.ts'))
+      enqueue(path.join(config.root, 'next.config.js'))
     }
-    enqueue(findProxyFile(config) ?? undefined)
-    enqueue(path.join(config.root, 'pnext.config.ts'))
-    enqueue(path.join(config.root, 'next.config.js'))
     for (const file of warmedModules) enqueue(file)
 
     const visit = async (file: string) => {
@@ -1001,10 +1106,14 @@ async function traceNodeModulesClosure(
         // external — by absolute href. Follow the ones inside the build output
         // and ship the packages the rest point into.
         const absolute = absolutePathFromSpecifier(specifier)
+        // The framework ships whole at its own location, where baked paths are rewritten to.
+        if (absolute && isInsideDir(framework.root, absolute)) continue
         if (absolute) {
           const name = packageNameFromPath(absolute)
-          if (name) specifiers.add(name)
-          else if (isInsideDir(config.outPath, absolute)) enqueue(absolute)
+          if (name) {
+            specifiers.add(name)
+            hrefPackageDirs.add(packageDirFromPath(absolute, name))
+          } else if (isInsideDir(config.outPath, absolute)) enqueue(absolute)
           continue
         }
         if (/^(?:node:|bun$|bun:|data:)/.test(specifier)) continue
@@ -1019,6 +1128,12 @@ async function traceNodeModulesClosure(
           !resolved.includes('node_modules')
         ) {
           enqueue(resolved)
+        }
+        // A release reaches an installed package it cannot name bare by a relative path.
+        const installed = specifier.startsWith('.') && resolved && packageNameFromPath(resolved)
+        if (installed) {
+          specifiers.add(installed)
+          hrefPackageDirs.add(packageDirFromPath(resolved, installed))
         }
         const name = packageNameFromSpecifier(specifier)
         if (name) specifiers.add(name)
@@ -1037,6 +1152,9 @@ async function traceNodeModulesClosure(
   })
 
   const packageDirs = new Map<string, string>()
+  // A dependency version nested under the package that needs it (a version conflict): it ships
+  // under that package's copy, where Bun resolves it from at runtime, not over the hoisted one.
+  const nestedCopies = new Map<string, string>()
   const workspaceLinks = new Map<string, string>()
   // Native bindings resolved here are built for the build host; the function
   // needs the ones for its own platform, fetched below.
@@ -1046,8 +1164,13 @@ async function traceNodeModulesClosure(
   // registry. Its optional deps back compat features that only load when the app uses them, so they
   // ship only where the app declares them too.
   const appDependencies = await declaredDependencies(config.root)
+  // A release never compiles, so only the dependencies its runtime entries import ship - not the
+  // compilers the framework also depends on for build and dev.
+  const runtimeDependencies = release ? await frameworkRuntimePackages(framework.root) : undefined
   const queue: { name: string; from: string; owner?: PackageVersion }[] = [
-    ...framework.dependencies.map(name => ({ name, from: framework.root })),
+    ...framework.dependencies
+      .filter(name => !runtimeDependencies || runtimeDependencies.has(name))
+      .map(name => ({ name, from: framework.root })),
     ...framework.optionalDependencies
       .filter(name => appDependencies.has(name))
       .map(name => ({ name, from: framework.root })),
@@ -1087,16 +1210,34 @@ async function traceNodeModulesClosure(
     }
     packageDirs.set(name, dir)
     if (!packageJson) continue
-    const self = { name, version: packageJson.version ?? '' }
     // Peer dependencies are deliberately not expanded — they fan out to whole
     // ecosystems (react, next, ...) that are only shipped when something
     // actually imports them.
-    for (const dependency of [
-      ...Object.keys(packageJson.dependencies ?? {}),
-      ...Object.keys(packageJson.optionalDependencies ?? {}),
-    ]) {
-      queue.push({ name: dependency, from: dir, owner: self })
+    const expand = async (
+      packageDir: string,
+      packageJson: Awaited<ReturnType<typeof readPackageJson>>,
+      target: string,
+    ) => {
+      const self = { name: packageJson?.name ?? name, version: packageJson?.version ?? '' }
+      for (const dependency of [
+        ...Object.keys(packageJson?.dependencies ?? {}),
+        ...Object.keys(packageJson?.optionalDependencies ?? {}),
+      ]) {
+        const nested = path.join(packageDir, 'node_modules', dependency)
+        const nestedJson = existsSync(path.join(nested, 'package.json'))
+          ? await readPackageJson(nested)
+          : undefined
+        if (!nestedJson || nestedJson.os || nestedJson.cpu) {
+          queue.push({ name: dependency, from: packageDir, owner: self })
+          continue
+        }
+        const nestedTarget = path.join(target, 'node_modules', dependency)
+        if (nestedCopies.has(nestedTarget)) continue
+        nestedCopies.set(nestedTarget, nested)
+        await expand(nested, nestedJson, nestedTarget)
+      }
     }
+    await expand(dir, packageJson, path.join('node_modules', name))
   }
 
   if (hostNatives.size > 0 && !skipDependencyClosure()) {
@@ -1118,6 +1259,19 @@ async function traceNodeModulesClosure(
           await copyTree(dir, target, pack)
         }),
       )
+    }
+    for (const [target, dir] of skipDependencyClosure() ? [] : nestedCopies) {
+      await mkdir(path.dirname(path.join(functionPath, target)), { recursive: true })
+      await copyTree(dir, path.join(functionPath, target), pack)
+    }
+    // Baked paths map the workspace root onto the function root, so an href into a nested or
+    // app-level node_modules needs that exact directory there.
+    for (const dir of skipDependencyClosure() ? [] : hrefPackageDirs) {
+      const relative = path.relative(workspaceRoot, dir)
+      const target = path.join(functionPath, relative)
+      if (relative.startsWith('..') || existsSync(target)) continue
+      await mkdir(path.dirname(target), { recursive: true })
+      await copyTree(dir, target, pack)
     }
     for (const [name, workspaceRelative] of workspaceLinks) {
       const linkPath = path.join(functionPath, 'node_modules', name)
@@ -1141,6 +1295,80 @@ async function traceNodeModulesClosure(
 interface PackageVersion {
   name: string
   version: string
+}
+
+/** Every compiled entry `<out>/server/build-index.json` names, when the build emitted one. */
+function releaseEntries(config: ResolvedConfig, manifest: BuildManifest): string[] | undefined {
+  if (!existsSync(buildIndexFile(config.outPath))) return undefined
+  const index = readBuildIndex(config.outPath)
+  return [
+    ...Object.values(index.modules),
+    index.nextConfig,
+    index.instrumentation?.file,
+    index.instrumentation?.edge,
+    ...Object.values(index.compat?.cacheHandlers ?? {}),
+    manifest.proxyModule,
+  ]
+    .filter(artifact => artifact !== undefined)
+    .map(artifact => path.resolve(config.outPath, artifact))
+}
+
+/**
+ * Packages the framework's production entries import, statically or dynamically. Lazy `require`s
+ * are the compiler facades (esbuild, oxc), which only build and dev reach.
+ */
+async function frameworkRuntimePackages(frameworkRoot: string) {
+  const src = path.join(frameworkRoot, 'src')
+  const scanners = {
+    ts: new Bun.Transpiler({ loader: 'ts' }),
+    tsx: new Bun.Transpiler({ loader: 'tsx' }),
+  }
+  const queue = [
+    ...runtimeEntryFiles.map(file => path.join(src, file)),
+    ...runtimeEntryDirs.flatMap(dir =>
+      listSourceFiles(path.join(src, dir)).filter(file => /(?<!\.d)\.tsx?$/.test(file)),
+    ),
+  ]
+  const seen = new Set(queue)
+  const packages = new Set<string>()
+  for (const file of queue) {
+    const scanner = file.endsWith('.tsx') || file.endsWith('.jsx') ? scanners.tsx : scanners.ts
+    for (const edge of scanner.scanImports(await readFile(file, 'utf8'))) {
+      if (edge.kind !== 'import-statement' && edge.kind !== 'dynamic-import') continue
+      if (!edge.path.startsWith('.')) {
+        const name = packageNameFromSpecifier(edge.path)
+        if (name) packages.add(name)
+        continue
+      }
+      const target = resolveFrom(edge.path, path.dirname(file))
+      if (
+        target &&
+        !seen.has(target) &&
+        isInsideDir(src, target) &&
+        scriptFilePattern.test(target)
+      ) {
+        seen.add(target)
+        queue.push(target)
+      }
+    }
+  }
+  return packages
+}
+
+function resolveFrom(specifier: string, dir: string) {
+  try {
+    return Bun.resolveSync(specifier, dir)
+  } catch {
+    return undefined
+  }
+}
+
+function listSourceFiles(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap(entry =>
+    entry.isDirectory()
+      ? listSourceFiles(path.join(dir, entry.name))
+      : [path.join(dir, entry.name)],
+  )
 }
 
 /**
@@ -1297,6 +1525,13 @@ function absolutePathFromSpecifier(specifier: string) {
   return path.isAbsolute(specifier) ? specifier : undefined
 }
 
+/** The `<...>/node_modules/<name>` directory holding `file`. */
+function packageDirFromPath(file: string, name: string) {
+  const posix = toPosixPath(file)
+  const marker = `/node_modules/${name}/`
+  return posix.slice(0, posix.lastIndexOf(marker) + marker.length - 1)
+}
+
 /** The package an absolute path belongs to, if it points inside node_modules. */
 function packageNameFromPath(file: string) {
   const parts = toPosixPath(file).split('/node_modules/')
@@ -1379,14 +1614,50 @@ async function staticOverrides(
   return overrides
 }
 
-async function immutableAssetRoute() {
-  const { immutableAssetPrefixes, immutableCacheControl } = await import('../serve/pipeline')
-  const prefixes = [...new Set(immutableAssetPrefixes())].map(escapeRegex)
-  return {
-    src: `^/(?:${prefixes.join('|')})`,
+// `important` lets route headers win over the CDN's own static-file cache-control, as Next's builder does.
+async function immutableAssetRoutes(publicDir: string, publicAssets: string[] = []) {
+  const app = new Set(publicAssets)
+  const built =
+    publicAssets.length > 0
+      ? (await listFiles(publicDir))
+          .map(file => toPosixPath(path.relative(publicDir, file)))
+          .filter(relative => !app.has(relative) && immutableAssetPath(relative))
+      : []
+  const patterns = immutableAssetPatterns(built, publicAssets)
+  return routeSources(patterns, source => `^/(?:${source})`).map(src => ({
+    src,
     headers: { 'cache-control': immutableCacheControl },
     continue: true,
+    important: true,
+  }))
+}
+
+/**
+ * Whole immutable prefixes that hold no app public file; under the others, each build file collapsed
+ * to its topmost folder below the prefix that holds no app public file, else its exact name.
+ */
+function immutableAssetPatterns(built: string[], publicAssets: string[]) {
+  const appDirs = new Set(publicAssets.flatMap(ancestorDirs))
+  const prefixes = [...new Set(immutableAssetPrefixes())]
+  const patterns = prefixes.filter(prefix => !appDirs.has(prefix)).map(escapeRegex)
+  for (const relative of built) {
+    const prefix = prefixes.find(prefix => relative.startsWith(prefix))
+    if (!prefix || !appDirs.has(prefix)) continue
+    const dir = ancestorDirs(relative).find(dir => dir.length > prefix.length && !appDirs.has(dir))
+    patterns.push(dir ? escapeRegex(requestPath(dir)) : `${escapeRegex(requestPath(relative))}$`)
   }
+  return [...new Set(patterns)]
+}
+
+/** A public-relative path as browsers request it (the WHATWG path percent-encode set). */
+function requestPath(relative: string) {
+  return relative.replace(/[\0-\x20"#<>?`{}\x7f-\u{10ffff}]/gu, char => encodeURIComponent(char))
+}
+
+/** `a/b/c.js` -> `['a/', 'a/b/']`. */
+function ancestorDirs(relative: string) {
+  const parts = relative.split('/').slice(0, -1)
+  return parts.map((_, index) => `${parts.slice(0, index + 1).join('/')}/`)
 }
 
 // Headers a CDN route cannot replay; a file that sets one stays on the server function.
@@ -1434,23 +1705,29 @@ function staticHeaderRoutes(staticFiles: Record<string, StaticFileMetadata>) {
     groups.set(key, group)
     group.patterns.push(servedPathPattern(relative))
   }
-  return [...groups.values()].flatMap(({ headers, patterns }) => {
-    const sources: string[] = []
-    for (const pattern of patterns) {
-      const last = sources.length - 1
-      if (last >= 0 && sources[last]!.length + pattern.length < maxRouteSourceLength) {
-        sources[last] += `|${pattern}`
-      } else {
-        sources.push(pattern)
-      }
-    }
-    return sources.map(source => ({
-      src: `^/(?:${source})$`,
+  return [...groups.values()].flatMap(({ headers, patterns }) =>
+    routeSources(patterns, source => `^/(?:${source})$`).map(src => ({
+      src,
       methods: ['GET', 'HEAD'],
       headers,
       continue: true,
-    }))
-  })
+      important: true,
+    })),
+  )
+}
+
+/** Joins patterns into as few `wrap`ped route sources as fit `maxRouteSourceLength`. */
+function routeSources(patterns: string[], wrap: (alternation: string) => string) {
+  const sources: string[] = []
+  for (const pattern of patterns) {
+    const last = sources.length - 1
+    if (last >= 0 && wrap(`${sources[last]}|${pattern}`).length <= maxRouteSourceLength) {
+      sources[last] += `|${pattern}`
+    } else {
+      sources.push(pattern)
+    }
+  }
+  return sources.map(wrap)
 }
 
 /** A static file's request paths: `a/index.html` also answers `/a` and `/a/`. */

@@ -57,7 +57,10 @@ function isAppConvention(name: string): boolean {
  * outside the source app preserves native App routes and avoids hybrid-route
  * conflict validation; linked sources and node_modules keep normal resolution.
  */
-export async function materializePagesApp(root: string): Promise<string | undefined> {
+export async function materializePagesApp(
+  root: string,
+  base = path.join(tmpdir(), 'pnext-pages-compat'),
+): Promise<string | undefined> {
   const pagesPath = path.join(root, 'pages')
   if (!existsSync(pagesPath)) return undefined
 
@@ -71,11 +74,7 @@ export async function materializePagesApp(root: string): Promise<string | undefi
   // one shared directory let one process scan a half-materialized tree ("page.js doesn't have a root
   // layout" on a build that passes on the next run). Naming the directory after what goes in it makes
   // the second writer a no-op, and staging + rename means a reader sees the whole tree or nothing.
-  const generatedRoot = path.join(
-    tmpdir(),
-    'pnext-pages-compat',
-    materializationKey(root, nativeApp, pages, apiRoutes),
-  )
+  const generatedRoot = path.join(base, materializationKey(root, nativeApp, pages, apiRoutes))
   const appPath = path.join(generatedRoot, 'app')
   if (existsSync(appPath)) return appPath
 
@@ -88,8 +87,18 @@ export async function materializePagesApp(root: string): Promise<string | undefi
     await rm(staging, { recursive: true, force: true })
     if (!existsSync(appPath)) throw new Error(`pnext: could not materialize ${root}/pages`)
   }
-  void sweepStaleMaterializations(path.dirname(generatedRoot))
+  void sweepStaleMaterializations(
+    base,
+    isInsideApp(root, generatedRoot) ? path.basename(generatedRoot) : undefined,
+  )
   return appPath
+}
+
+const isInsideApp = (root: string, dir: string) => !path.relative(root, dir).startsWith('..')
+
+/** A materialized tree's link to app source: relative when the tree lives inside the app. */
+function materializedLinkTarget(root: string, generatedRoot: string, target: string) {
+  return isInsideApp(root, generatedRoot) ? path.relative(generatedRoot, target) : target
 }
 
 /**
@@ -134,10 +143,12 @@ function materializationKey(
 // a dev server holds its materialized tree open for as long as it runs.
 const STALE_MATERIALIZATION_MS = 7 * 24 * 60 * 60_000
 
-async function sweepStaleMaterializations(base: string) {
+// A build's own output keeps only its `current` tree: nothing else serves from it.
+async function sweepStaleMaterializations(base: string, current?: string) {
   try {
-    const cutoff = Date.now() - STALE_MATERIALIZATION_MS
+    const cutoff = current ? Infinity : Date.now() - STALE_MATERIALIZATION_MS
     for (const entry of await readdir(base)) {
+      if (current && (entry === current || entry.endsWith('.staging'))) continue
       const dir = path.join(base, entry)
       const info = statSync(dir, { throwIfNoEntry: false })
       if (info && info.mtimeMs < cutoff) await rm(dir, { recursive: true, force: true })
@@ -158,23 +169,28 @@ async function buildMaterializedApp(
   const appPath = path.join(generatedRoot, 'app')
   const sourcePages = path.join(generatedRoot, 'source-pages')
   const sourceApp = path.join(generatedRoot, 'source-app')
+  // Inside a build's output the links stay relative, so a moved build names no build-machine path.
+  const link = (target: string, at: string) =>
+    symlink(materializedLinkTarget(root, generatedRoot, target), at, 'dir')
 
   await rm(generatedRoot, { recursive: true, force: true })
   await mkdir(appPath, { recursive: true })
-  await symlink(pagesPath, sourcePages, 'dir')
+  await link(pagesPath, sourcePages)
+  // Inside the app, packages resolve up to the app's own node_modules under their real paths.
   const nodeModules = path.join(root, 'node_modules')
-  if (existsSync(nodeModules))
-    await symlink(nodeModules, path.join(generatedRoot, 'node_modules'), 'dir')
+  if (existsSync(nodeModules) && !isInsideApp(root, generatedRoot)) {
+    await link(nodeModules, path.join(generatedRoot, 'node_modules'))
+  }
 
   // Static assets referenced from materialized routes (e.g. an app route's
   // `new URL('../../public/vercel.png', import.meta.url)` or a `public/*` asset
   // import) resolve relative to the generated root; without the symlink the
   // bundler can't find them and the route 500s.
   const publicDir = path.join(root, 'public')
-  if (existsSync(publicDir)) await symlink(publicDir, path.join(generatedRoot, 'public'), 'dir')
+  if (existsSync(publicDir)) await link(publicDir, path.join(generatedRoot, 'public'))
 
   if (existsSync(nativeApp)) {
-    await symlink(nativeApp, sourceApp, 'dir')
+    await link(nativeApp, sourceApp)
     await materializeNativeApp(sourceApp, appPath)
   }
   if (!existsSync(path.join(appPath, 'layout.js'))) {

@@ -1,5 +1,6 @@
-import { existsSync, readdirSync, readFileSync, type Dirent } from 'node:fs'
+import { existsSync, readdirSync, type Dirent } from 'node:fs'
 import path from 'node:path'
+import { readSourceSync } from '../../resolve/source-text'
 
 /**
  * Build-time app facts that let compat drop code an app cannot reach. The fact here: whether any
@@ -95,7 +96,7 @@ function scan(dir: string, match: (source: string) => boolean): boolean {
     if (!sourceFile.test(entry.name)) continue
     let source: string
     try {
-      source = readFileSync(file, 'utf8')
+      source = readSourceSync(file)
     } catch {
       continue
     }

@@ -2,15 +2,19 @@
 // shims plus the API-route and data-fetch (`/_next/data`) dispatch. Registered by
 // ../register/pages-api.ts, which wires the exports below into the extension registries.
 
-import { existsSync, readFileSync } from 'node:fs'
+import { type Dirent, existsSync, readFileSync, readdirSync } from 'node:fs'
 import { Writable } from 'node:stream'
 import path from 'node:path'
-import { devServerModuleHref } from '../../runtime/modules'
-import { pagesApiBundleTargetForRuntime } from '../../runtime/loader'
+import {
+  devServerModuleHref,
+  pagesApiBundleTargetForRuntime,
+  serverBundleTargetForRuntime,
+} from '../../runtime/load'
+import { productionRelease } from '../../runtime/production'
+import type { ResolvedConfig } from '../../config'
 import { getRequestExtensions, type RequestInterceptor } from '../../extensions'
 import { getRequestRuntime } from '../../routing/request-environment'
-import { selectRouteForRequest } from '../../routing/routes'
-import { serverBundleTargetForRuntime } from '../../runtime/loader'
+import { selectRouteForRequest } from '../../routing/match'
 import { setWorkUnitRoute } from '../../request/context'
 import { canonicalUrlHref } from '../next/canonical-url'
 import { markPathRevalidated, normalizeRevalidatePath } from '../cache/revalidate'
@@ -65,7 +69,7 @@ export const pagesDataInterceptor: RequestInterceptor = async request => {
     return dataResponse({ notFound: true }, 404, url)
   }
   const route = selection.route
-  if (!isMaterializedPagesRoute(route.file)) return undefined
+  if (!isMaterializedPagesRoute(runtime.config, route.file)) return undefined
 
   const module = (await import(
     await devServerModuleHref(
@@ -150,14 +154,48 @@ function dataResponse(body: Record<string, unknown>, status: number, url: URL): 
 
 // The materialized hybrid app hosts BOTH routers; only pages wrappers
 // re-export from source-pages/, so sniff the (tiny, generated) wrapper body —
-// app routes must never serve _next/data.
-function isMaterializedPagesRoute(file: string): boolean {
+// app routes must never serve _next/data. A release carries the answer.
+const releasedPagesRoutes = new WeakMap<object, Set<string>>()
+
+export function isMaterializedPagesRoute(config: ResolvedConfig, file: string): boolean {
+  const released = productionRelease(config)?.compat?.pagesRoutes
+  if (released) {
+    let routes = releasedPagesRoutes.get(released)
+    if (!routes) {
+      routes = new Set(released.map(route => path.join(config.root, route)))
+      releasedPagesRoutes.set(released, routes)
+    }
+    return routes.has(file)
+  }
   if (!file.split(path.sep).join('/').includes('pnext-pages-compat/')) return false
   try {
     return readFileSync(file, 'utf8').includes('source-pages/')
   } catch {
     return false
   }
+}
+
+/** The materialized pages-router wrappers of a pages-compat app, root-relative, for its release. */
+export function pagesRouteFacts(config: ResolvedConfig): string[] {
+  if (!config.appPath.includes('pnext-pages-compat')) return []
+  const routes: string[] = []
+  const visit = (dir: string) => {
+    let entries: Dirent[]
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const file = path.join(dir, entry.name)
+      if (entry.isDirectory()) visit(file)
+      else if (isMaterializedPagesRoute(config, file)) {
+        routes.push(path.relative(config.root, file).split(path.sep).join('/'))
+      }
+    }
+  }
+  visit(config.appPath)
+  return routes
 }
 
 function pagesDataRequestShim(request: Request, url: URL) {
@@ -194,11 +232,16 @@ function pagesDataResponseShim() {
 
 export const pagesApiInterceptor: RequestInterceptor = async (request, { config }) => {
   const url = new URL(request.url)
-  const file = pagesApiFile(config.root, url.pathname)
+  const released = productionRelease(config)?.compat?.pagesApi
+  const exists = released
+    ? (candidate: string) => path.relative(config.root, candidate) in released
+    : existsSync
+  const file = pagesApiFile(config.root, url.pathname, exists)
   if (!file) return undefined
+  const runtime = released ? released[path.relative(config.root, file)] : apiRuntime(file)
   const imported = (await import(
     await devServerModuleHref(config, file, 'build', {
-      conditionTarget: pagesApiBundleTargetForRuntime(apiRuntime(file)),
+      conditionTarget: pagesApiBundleTargetForRuntime(runtime),
     })
   )) as PagesApiModule
   if (typeof imported.default !== 'function') return undefined
@@ -208,7 +251,7 @@ export const pagesApiInterceptor: RequestInterceptor = async (request, { config 
   // nextUrl, text() — Request prototype getters a spread would lose); node
   // handlers get the IncomingMessage-shaped shim.
   const handlerRequest =
-    apiRuntime(file) === 'edge' ? toNextRequest(request) : createPagesApiRequest(request, url)
+    runtime === 'edge' ? toNextRequest(request) : createPagesApiRequest(request, url)
   const finished = withPagesApiHandlerSpan(url.pathname, () =>
     Promise.resolve(imported.default!(handlerRequest, responder.res)),
   ).catch(error => responder.fail(error))
@@ -226,7 +269,33 @@ export const pagesApiInterceptor: RequestInterceptor = async (request, { config 
 
 const STREAM_STARTED = Symbol('pnext.pagesApiStreamStarted')
 
-function pagesApiFile(root: string, pathname: string): string | undefined {
+/** Every pages API source with its runtime (`nodejs` unless declared), root-relative: what a release serves. */
+export function pagesApiFacts(root: string): Record<string, string> {
+  const facts: Record<string, string> = {}
+  const visit = (dir: string) => {
+    let entries: Dirent[]
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const file = path.join(dir, entry.name)
+      if (entry.isDirectory()) visit(file)
+      else if (pageExtensions.some(ext => entry.name.endsWith(`.${ext}`))) {
+        facts[path.relative(root, file)] = apiRuntime(file) ?? 'nodejs'
+      }
+    }
+  }
+  visit(path.join(root, 'pages', 'api'))
+  return facts
+}
+
+function pagesApiFile(
+  root: string,
+  pathname: string,
+  exists: (file: string) => boolean,
+): string | undefined {
   if (pathname !== '/api' && !pathname.startsWith('/api/')) return undefined
   let relative: string
   try {
@@ -239,9 +308,9 @@ function pagesApiFile(root: string, pathname: string): string | undefined {
   if (base !== baseDir && !base.startsWith(`${baseDir}${path.sep}`)) return undefined
   for (const ext of pageExtensions) {
     const file = `${base}.${ext}`
-    if (existsSync(file)) return file
+    if (exists(file)) return file
     const index = path.join(base, `index.${ext}`)
-    if (existsSync(index)) return index
+    if (exists(index)) return index
   }
   return undefined
 }

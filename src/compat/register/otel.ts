@@ -14,8 +14,7 @@
 // opentelemetry suite. Everything is inert unless next compat is on AND @opentelemetry/api resolves from
 // the app.
 
-import { readFileSync } from 'node:fs'
-import path from 'node:path'
+import { isMaterializedPagesRoute } from '../pages/api'
 import type { ResolvedConfig } from '../../config'
 import type { RouteManifestEntry } from '../../types'
 import {
@@ -30,7 +29,7 @@ import {
 } from '../../extensions'
 import { nextCompatEnabled } from '../aliases'
 import { getRequestRuntime } from '../../routing/request-environment'
-import { selectRouteForRequest } from '../../routing/routes'
+import { selectRouteForRequest } from '../../routing/match'
 import { queueAfterTask } from '../../request/context'
 import {
   getDocumentScriptExtensions,
@@ -247,14 +246,11 @@ function routeEntryFor(routePattern: string): RouteManifestEntry | undefined {
 // stable generator-owned marker; cache per file (routes don't change at start).
 const pagesCompatFileCache = new Map<string, boolean>()
 function isPagesCompatEntry(entry: RouteManifestEntry | undefined): boolean {
-  if (!entry?.file.includes(`${path.sep}pnext-pages-compat${path.sep}`)) return false
+  const config = getRequestRuntime()?.config
+  if (!entry || !config) return false
   let cached = pagesCompatFileCache.get(entry.file)
   if (cached === undefined) {
-    try {
-      cached = readFileSync(entry.file, 'utf8').includes('source-pages/')
-    } catch {
-      cached = false
-    }
+    cached = isMaterializedPagesRoute(config, entry.file)
     pagesCompatFileCache.set(entry.file, cached)
   }
   return cached

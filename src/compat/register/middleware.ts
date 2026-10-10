@@ -14,7 +14,7 @@ import {
   type ProxyConfig,
   type ProxyModule,
 } from '../../routing/proxy'
-import { devServerModuleHref } from '../../runtime/modules'
+import { devServerModuleHref } from '../../runtime/load'
 import { pathToFileHref, type ResolvedConfig } from '../../config'
 import { toPosixPath } from '../../utils/fs'
 import type { RouteManifestEntry } from '../../types'

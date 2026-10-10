@@ -18,9 +18,8 @@ import { currentRequest, getWorkUnit } from '../../request/context'
 // readonly property." `require()` returns the real, mutable CJS exports
 // object that node/http/https resolve `.get` calls through at runtime, so
 // patch that instead of the namespace binding.
+// Required on install, not at import: loading node:http/https costs every build ~10 ms.
 const requireNode = createRequire(import.meta.url)
-const httpModule = requireNode('node:http') as typeof http
-const httpsModule = requireNode('node:https') as typeof https
 
 interface TestProxyInfo {
   proxyPort: number
@@ -284,6 +283,8 @@ export function installTestProxyFetch(): void {
   ;(testFetch as typeof fetch).preconnect = originalFetch.preconnect?.bind(originalFetch)
   globalThis.fetch = testFetch as typeof fetch
 
+  const httpModule = requireNode('node:http') as typeof http
+  const httpsModule = requireNode('node:https') as typeof https
   const originalHttpGet = httpModule.get
   const originalHttpsGet = httpsModule.get
   httpModule.get = patchableGet(originalHttpGet, originalFetch)

@@ -1,7 +1,8 @@
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { type Dirent, existsSync, readdirSync, readFileSync } from 'node:fs'
 import { mkdir, readdir, rename, rm, stat, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { frozenDirListing } from '../runtime/production'
 import type { BuildManifest } from '../types'
 
 // Write-then-rename so a concurrent import never observes a truncated file; Bun caches a failed load for the
@@ -75,6 +76,8 @@ export function withDirCache<T>(run: () => T): T {
 
 /** File and subdirectory names of `dir` (both empty when it does not exist). */
 export function readDirListing(dir: string): DirListing {
+  const frozen = frozenDirListing(dir)
+  if (frozen) return frozen
   const cached = dirListings?.get(dir)
   if (cached) return cached
   let listing: DirListing
@@ -92,6 +95,75 @@ export function readDirListing(dir: string): DirListing {
   }
   dirListings?.set(dir, listing)
   return listing
+}
+
+/** On-disk names per directory and recent wrong-case misses, kept by one server; undefined on a case-sensitive filesystem. */
+export type ExactNames = { dirs: Map<string, Set<string>>; misses: Set<string> } | undefined
+
+const maxExactNameMisses = 1024
+
+/** Only a case-insensitive filesystem (macOS, Windows) needs `hasExactName`; one probe per server, on `dir`'s own mount. */
+export function exactNameIndex(dir: string): ExactNames {
+  let entries: Dirent[] = []
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    // Probe `dir` itself under its parent.
+  }
+  // A symlink's flipped name answers for its target, and a dangling one never exists.
+  const entry = entries.find(item => !item.isSymbolicLink() && hasCase(item.name))
+  const probe = entry ? path.join(dir, entry.name) : dir
+  const name = path.basename(probe)
+  if (!hasCase(name)) return undefined
+  return existsSync(path.join(path.dirname(probe), flipCase(name)))
+    ? { dirs: new Map(), misses: new Set() }
+    : undefined
+}
+
+function flipCase(name: string) {
+  return name === name.toUpperCase() ? name.toLowerCase() : name.toUpperCase()
+}
+
+function hasCase(name: string) {
+  return flipCase(name) !== name
+}
+
+/** Whether `relative` under `root` is spelled exactly as on disk (Next serves static files by exact name). */
+export function hasExactName(names: NonNullable<ExactNames>, root: string, relative: string) {
+  let dir = root
+  for (const name of relative.split(path.sep)) {
+    const file = `${dir}${path.sep}${name}`
+    const listing = dirNames(names, dir)
+    // An unreadable directory fails this request only; nothing about it is remembered.
+    if (!listing) return false
+    if (!listing.has(name)) {
+      if (names.misses.has(file)) return false
+      // A miss re-reads the directory once: the server may have written the file since.
+      const fresh = dirNames(names, dir, true)
+      if (!fresh?.has(name)) {
+        if (fresh) {
+          if (names.misses.size >= maxExactNameMisses) names.misses.clear()
+          names.misses.add(file)
+        }
+        return false
+      }
+    }
+    dir = file
+  }
+  return true
+}
+
+function dirNames(names: NonNullable<ExactNames>, dir: string, refresh = false) {
+  let entries = refresh ? undefined : names.dirs.get(dir)
+  if (!entries) {
+    try {
+      entries = new Set(readdirSync(dir))
+    } catch {
+      return undefined
+    }
+    names.dirs.set(dir, entries)
+  }
+  return entries
 }
 
 /** listFiles for callers already running synchronously (route fact scans). */
@@ -206,11 +278,22 @@ export function includeTypes(config: { include?: unknown }, files: string[], def
   return added
 }
 
+// pnext's own files outside the app (a linked or store install) are named from the framework root,
+// so a build moved to another machine finds them wherever pnext is installed there.
+const frameworkRoot = path.resolve(import.meta.dirname, '..', '..')
+const frameworkPrefix = 'pnext:'
+
 /** Relativize only source-path fields while writing; build hooks keep absolute paths. */
 export function serializeBuildManifest(data: BuildManifest): string {
   const { root, appDir, outDir } = data
+  const relative = (file: string) => {
+    const inRoot = toPosixPath(path.relative(root, file))
+    if (!inRoot.startsWith('..')) return inRoot
+    const inFramework = toPosixPath(path.relative(frameworkRoot, file))
+    return inFramework.startsWith('..') ? inRoot : `${frameworkPrefix}${inFramework}`
+  }
   const stored = {
-    ...mapSourcePaths(data, file => toPosixPath(path.relative(root, file))),
+    ...mapSourcePaths(data, relative),
     root: toPosixPath(path.relative(outDir, root)) || '.',
     appDir: toPosixPath(path.relative(root, appDir)),
     outDir: '.',
@@ -220,7 +303,10 @@ export function serializeBuildManifest(data: BuildManifest): string {
 
 export function resolveManifest(data: BuildManifest, outPath: string, root: string): BuildManifest {
   if (path.isAbsolute(data.root)) return data
-  const absolute = (file: string) => path.join(root, file)
+  const absolute = (file: string) =>
+    file.startsWith(frameworkPrefix)
+      ? path.join(frameworkRoot, file.slice(frameworkPrefix.length))
+      : path.join(root, file)
   return {
     ...mapSourcePaths(data, absolute),
     root,

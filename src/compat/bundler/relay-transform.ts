@@ -14,7 +14,7 @@
 // Everything is resolved relative to `process.cwd()`, matching the SWC transform's root. That is what
 // makes the multi-project fixture work: each sub-project is built with its own cwd.
 
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import path from 'node:path'
 import { withSniff, type ServerSourceTransform } from '../../extensions'
 import type { RelayCompilerConfig } from './config'
@@ -34,6 +34,14 @@ function relayTagPattern(): RegExp {
 }
 
 const OPERATION_NAME = /\b(?:query|mutation|subscription|fragment)\s+([A-Za-z_][\w]*)/
+
+function realFile(file: string): string {
+  try {
+    return realpathSync(file)
+  } catch {
+    return file
+  }
+}
 
 function isUnder(dir: string, file: string): boolean {
   const relative = path.relative(dir, file)
@@ -61,6 +69,7 @@ export function createRelayTransform(
 
   const cwd = path.resolve(process.cwd())
   const srcDir = path.resolve(cwd, relay.src)
+  const realSrcDir = realFile(srcDir)
   const artifactDir = relay.artifactDirectory
     ? path.resolve(cwd, relay.artifactDirectory)
     : undefined
@@ -88,11 +97,14 @@ export function createRelayTransform(
 
   return withSniff(['graphql'], (source, file) => {
     if (!source.includes('graphql`') && !/graphql\s*`/.test(source)) return source
-    const absolute = path.resolve(file)
+    const resolved = path.resolve(file)
+    // A build materializes pages under its out dir; its links lead back to the source file.
+    const absolute = isUnder(cwd, resolved) ? realFile(resolved) : resolved
     // Next scopes the transform to `src`. Files outside the build cwd entirely
     // (materialized copies) are not covered by that check, so only skip a file
     // that lives under the cwd but outside the configured source root.
-    if (isUnder(cwd, absolute) && !isUnder(srcDir, absolute)) return source
+    const inSrc = isUnder(srcDir, resolved) || isUnder(realSrcDir, absolute)
+    if (isUnder(cwd, absolute) && !inSrc) return source
 
     const bindings = new Map<string, string>()
     const replaced = source.replace(relayTagPattern(), (match, body: string) => {

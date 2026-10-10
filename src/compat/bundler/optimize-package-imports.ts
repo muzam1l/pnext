@@ -181,9 +181,33 @@ function parseGeneratedBarrel(entry: string): BarrelMap | undefined {
   if (isGeneratedFontAwesomePackage(packageDir)) {
     return parseGeneratedFontAwesomeBarrel(entry, source)
   }
+  const plain = plainReExports(source)
+  const exported = plain
+    ? { exports: plain, count: plain.size, reExportsOnly: () => true }
+    : parsedReExports(entry, source)
+  if (!exported || exported.count < GENERATED_BARREL_MIN_EXPORTS) return undefined
+  const { exports, count: exportCount } = exported
+  const siblings = siblingFilesByStem(path.dirname(entry), entry)
+  const members = new Map<string, BarrelMember>()
+  for (const [name, member] of exports) {
+    const files = siblings.get(name)
+    const file = files?.[0]
+    if (
+      file &&
+      files.length === 1 &&
+      path.resolve(path.dirname(entry), member.source) === path.resolve(path.dirname(entry), file)
+    ) {
+      members.set(name, member)
+    }
+  }
+  if (members.size / exportCount >= GENERATED_BARREL_LEAF_RATIO) return members
+  return exported.reExportsOnly() ? manyToFewBarrelMembers(exports, entry) : undefined
+}
+
+/** The entry's re-export records off oxc's module record; the AST is read only if asked for. */
+function parsedReExports(entry: string, source: string) {
   const parsed = parseSync(entry, source, { lang: 'js' })
   if (parsed.errors.length > 0) return undefined
-  const siblings = siblingFilesByStem(path.dirname(entry), entry)
   const exports = new Map<string, BarrelMember>()
   const exportNames = new Set<string>()
   let exportCount = 0
@@ -206,22 +230,56 @@ function parseGeneratedBarrel(entry: string): BarrelMap | undefined {
       exports.set(name, { source: request, imported })
     }
   }
-  if (exportCount < GENERATED_BARREL_MIN_EXPORTS) return undefined
+  return {
+    exports,
+    count: exportCount,
+    // Re-exports and nothing else: no statement runs code or declares a binding.
+    reExportsOnly: () =>
+      parsed.program.body.every(
+        node => node.type === 'ExportNamedDeclaration' && !node.declaration,
+      ),
+  }
+}
 
-  const members = new Map<string, BarrelMember>()
-  for (const [name, member] of exports) {
-    const files = siblings.get(name)
-    const file = files?.[0]
-    if (
-      file &&
-      files.length === 1 &&
-      path.resolve(path.dirname(entry), member.source) === path.resolve(path.dirname(entry), file)
-    ) {
-      members.set(name, member)
+const PLAIN_RE_EXPORT = /export\s*\{([^{}]*)\}\s*from\s*(['"])([^'"\\\n]*)\2[ \t]*;?/y
+const PLAIN_GAP = /(?:\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*/y
+const PLAIN_SPECIFIER = /^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/
+
+/**
+ * A generated catalogue is usually nothing but `export { a as b } from './x'` lines. Read that
+ * exact shape without building an AST (oxc's module record alone costs more than the parse on a
+ * 1 MB entry); anything else - or a repeated name - answers undefined and takes the oxc path.
+ */
+function plainReExports(source: string): Map<string, BarrelMember> | undefined {
+  // The scan knows only LF as a line end; CR, U+2028 and U+2029 also end a `//` comment.
+  if (/[\r\u2028\u2029]/.test(source)) return undefined
+  const exports = new Map<string, BarrelMember>()
+  let at = 0
+  for (;;) {
+    PLAIN_GAP.lastIndex = at
+    PLAIN_GAP.exec(source)
+    if (PLAIN_GAP.lastIndex >= source.length) break
+    // Without a `;`, only a line break can end the statement before the next one.
+    if (at > 0 && source[at - 1] !== ';' && !source.slice(at, PLAIN_GAP.lastIndex).includes('\n'))
+      return undefined
+    PLAIN_RE_EXPORT.lastIndex = PLAIN_GAP.lastIndex
+    const statement = PLAIN_RE_EXPORT.exec(source)
+    if (!statement) return undefined
+    at = PLAIN_RE_EXPORT.lastIndex
+    const parts = statement[1]!.split(',')
+    for (const [index, part] of parts.entries()) {
+      const specifier = PLAIN_SPECIFIER.exec(part.trim())
+      if (!specifier) {
+        if (part.trim() === '' && index === parts.length - 1 && index > 0) continue
+        return undefined
+      }
+      const imported = specifier[1]!
+      const name = specifier[2] ?? imported
+      if (exports.has(name)) return undefined
+      exports.set(name, { source: statement[3]!, imported })
     }
   }
-  if (members.size / exportCount >= GENERATED_BARREL_LEAF_RATIO) return members
-  return manyToFewBarrelMembers(parsed.program.body, exports, entry)
+  return exports
 }
 
 /**
@@ -234,26 +292,28 @@ function parseGeneratedBarrel(entry: string): BarrelMap | undefined {
  * read for demanded members.
  */
 function manyToFewBarrelMembers(
-  body: readonly { type: string; declaration?: unknown }[],
   exports: ReadonlyMap<string, BarrelMember>,
   entry: string,
 ): BarrelMap | undefined {
-  for (const node of body) {
-    if (node.type !== 'ExportNamedDeclaration' || node.declaration) return undefined
-  }
   const byDirectory = new Map<string, Map<string, string[]>>()
+  // Thousands of names share a handful of leaves: judge each leaf once.
+  const unambiguous = new Map<string, boolean>()
   const members = new Map<string, BarrelMember>()
   for (const [name, member] of exports) {
     if (!member.source.startsWith('.')) continue
-    const file = path.resolve(path.dirname(entry), member.source)
-    const directory = path.dirname(file)
-    let siblings = byDirectory.get(directory)
-    if (!siblings) {
-      siblings = siblingFilesByStem(directory, entry)
-      byDirectory.set(directory, siblings)
+    let leaf = unambiguous.get(member.source)
+    if (leaf === undefined) {
+      const file = path.resolve(path.dirname(entry), member.source)
+      const directory = path.dirname(file)
+      let siblings = byDirectory.get(directory)
+      if (!siblings) {
+        siblings = siblingFilesByStem(directory, entry)
+        byDirectory.set(directory, siblings)
+      }
+      leaf = siblings.get(path.basename(file).replace(/\.(?:c|m)?js$/, ''))?.length === 1
+      unambiguous.set(member.source, leaf)
     }
-    if (siblings.get(path.basename(file).replace(/\.(?:c|m)?js$/, ''))?.length !== 1) continue
-    members.set(name, member)
+    if (leaf) members.set(name, member)
   }
   return members.size > 0 ? members : undefined
 }

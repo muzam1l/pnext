@@ -1,4 +1,6 @@
 import path from 'node:path'
+import { isReleaseCompile } from '../runtime/load'
+import { toPosixPath } from '../utils/fs'
 import { createRequire } from 'node:module'
 import type { Plugin } from 'esbuild'
 import { frameworkRuntimeAliasEntries, pnextAliases, type CompatAliasTarget } from '../config'
@@ -329,7 +331,12 @@ export function rewriteNextFontSource(
   let next = rewriteNextGoogleFontImports(source, runtimePath)
   const localFontNames = nextLocalFontImportNames(next)
   if (localFontNames.size === 0) return next
-  const callerFile = localFontCallerFile(file, root)
+  // A release names the caller root-relative, so its font identity survives moving the build.
+  const absoluteCaller = localFontCallerFile(file, root)
+  const callerFile =
+    isReleaseCompile() && root && path.isAbsolute(absoluteCaller)
+      ? toPosixPath(path.relative(root, absoluteCaller))
+      : absoluteCaller
   // Rewrite each `NAME(...)` call to `NAME.withFile(<file>)(...)` so the runtime
   // gets the caller path (for `src` resolution + a stable per-caller hash). The
   // client runtime only uses `callerFile` for the hash (which must match the

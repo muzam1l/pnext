@@ -2,10 +2,11 @@ import { existsSync, realpathSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import path from 'node:path'
 import { loadEnv } from './env'
-import { findWorkspaceRoot } from './resolve/imports'
+import { findWorkspaceRoot } from './resolve/package-json'
 import { PREFETCH_MODES, type PNextConfig } from './types'
 import { setCacheComponents } from './render/ppr'
 import { setLegacyRequestAPIs } from './request/context'
+import { attachRelease, locateRelease, readBuildIndex, releaseConfig } from './runtime/production'
 
 export type ResolvedConfig = Required<Pick<PNextConfig, 'outDir' | 'basePath'>> &
   Omit<PNextConfig, 'outDir' | 'basePath'> & {
@@ -61,7 +62,13 @@ export interface ConfigSourceOverrides {
 }
 export type ConfigSource = (
   root: string,
-  options: { dev?: boolean; serve?: boolean; warnings?: boolean },
+  options: {
+    dev?: boolean
+    serve?: boolean
+    warnings?: boolean
+    bundle?: string | null
+    handlers?: Record<string, string>
+  },
 ) => Promise<ConfigSourceOverrides>
 
 let configSource: ConfigSource | undefined
@@ -73,7 +80,7 @@ export function registerConfigSource(source: ConfigSource): void {
 async function resolveConfigSource(
   config: PNextConfig,
   root: string,
-  options: { dev?: boolean; serve?: boolean; warnings?: boolean },
+  options: Parameters<ConfigSource>[1],
 ): Promise<ConfigSourceOverrides> {
   if (!config.compat?.next) return {}
   if (!configSource) {
@@ -90,6 +97,8 @@ export async function loadConfig(
   options: { dev?: boolean; serve?: boolean; warnings?: boolean } = {},
 ): Promise<ResolvedConfig> {
   const root = canonicalRoot(path.resolve(rootInput))
+  const released = options.serve ? locateRelease(root, DEFAULT_OUT_DIR) : undefined
+  if (released) return loadReleasedConfig(root, released, options)
   await loadEnv(root, options)
   const configPath = path.join(root, 'pnext.config.ts')
   const loadedConfig = existsSync(configPath)
@@ -119,8 +128,13 @@ export async function loadConfig(
   setCacheComponents(false)
   const sourceOverrides = stripUndefined(await resolveConfigSource(config, root, options))
   const merged = { ...defaultConfig, ...config, ...sourceOverrides }
-  const appPath = await resolveAppPath(root, config)
   const outRootPath = path.resolve(root, merged.outDir)
+  // A build materializes pages into its output, so the release names them portably.
+  const appPath = await resolveAppPath(
+    root,
+    config,
+    options.dev ? undefined : path.join(outRootPath, 'pnext-pages-compat'),
+  )
   const workspaceRoot = canonicalRoot(
     config.workspaceRoot
       ? path.resolve(root, config.workspaceRoot)
@@ -154,6 +168,36 @@ export async function loadConfig(
     typesPath: path.join(outRootPath, 'types'),
     checksPath: path.join(outRootPath, 'typecheck', 'checks'),
   }
+}
+
+/**
+ * A production server's config: what the build resolved, read from its release instead of re-importing
+ * `pnext.config.ts`/`next.config.*`. Per-app process state is re-derived exactly as a source load does.
+ */
+async function loadReleasedConfig(
+  root: string,
+  outPath: string,
+  options: { dev?: boolean; serve?: boolean; warnings?: boolean },
+): Promise<ResolvedConfig> {
+  const index = readBuildIndex(outPath)
+  const config = releaseConfig(index.config, root, outPath)
+  await loadEnv(root, options)
+  setLegacyRequestAPIs(
+    typeof config.compat?.next === 'object' && config.compat.next.legacyRequestAPIs === true,
+  )
+  setCacheComponents(false)
+  await resolveConfigSource(config, root, {
+    ...options,
+    bundle: index.nextConfig ? path.resolve(outPath, index.nextConfig) : null,
+    handlers: Object.fromEntries(
+      Object.entries(index.compat?.cacheHandlers ?? {}).map(([name, file]) => [
+        name,
+        path.resolve(outPath, file),
+      ]),
+    ),
+  })
+  attachRelease(config, index)
+  return config
 }
 
 // One row per enum-valued config field; validateConfig checks them all.
@@ -264,7 +308,7 @@ export function pnextAliases(target: CompatAliasTarget): Record<string, string> 
   }
 }
 
-async function resolveAppPath(root: string, config: PNextConfig) {
+async function resolveAppPath(root: string, config: PNextConfig, pagesBase?: string) {
   const rootApp = path.join(root, 'app')
   if (config.compat?.next) {
     const pagesPath = path.join(root, 'pages')
@@ -272,13 +316,13 @@ async function resolveAppPath(root: string, config: PNextConfig) {
     if (existsSync(rootApp)) {
       if (hasPages) {
         const { materializePagesApp } = await import('./compat/pages/router')
-        const hybrid = await materializePagesApp(root)
+        const hybrid = await materializePagesApp(root, pagesBase)
         if (hybrid) return hybrid
       }
       return rootApp
     }
     const { materializePagesApp } = await import('./compat/pages/router')
-    const pagesApp = await materializePagesApp(root)
+    const pagesApp = await materializePagesApp(root, pagesBase)
     if (pagesApp) return pagesApp
   } else if (existsSync(rootApp)) return rootApp
   return path.join(root, 'src', 'app')

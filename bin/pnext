@@ -64,11 +64,18 @@ case "$1" in
   *) named=pnext ;;
 esac
 
+# The published package runs `start` from its publish-time prebundle, once its stamp marks it
+# complete; the prebundle hands a build of any other source back to src.
+entry=$dir/../src/cli/index.ts
+if [ "$1" = start ] && [ -f "$dir/../dist/server/generation.json" ]; then
+  entry=$dir/../dist/server/cli/index.js
+fi
+
 bun_bin=$(command -v bun)
 for candidate in "${XDG_CACHE_HOME:-$HOME/.cache}"/pnext/bin/bun-*/"$named"; do
   if [ -x "$candidate" ] && [ "$candidate" -ef "$bun_bin" ]; then
-    exec "$candidate" --conditions=react-server "$dir/../src/cli/index.ts" "$@"
+    exec "$candidate" --conditions=react-server "$entry" "$@"
   fi
 done
 
-exec bun --conditions=react-server "$dir/../src/cli/index.ts" "$@"
+exec bun --conditions=react-server "$entry" "$@"

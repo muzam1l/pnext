@@ -10,8 +10,9 @@
 // undefined/non-component default export; and the output:'export' extras (exportPathMap + app, a
 // dynamic route without generateStaticParams, route handlers without static opt-ins, force-dynamic).
 
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync } from 'node:fs'
 import path from 'node:path'
+import { readSourceSync } from '../../resolve/source-text'
 import type { ResolvedConfig } from '../../config'
 import { extraPageExtensions } from '../../extensions'
 import type { RouteManifestEntry } from '../../types'
@@ -366,7 +367,7 @@ function readSource(file: string): string | undefined {
   if (sourceCache.has(file)) return sourceCache.get(file)
   let source: string | undefined
   try {
-    source = readFileSync(file, 'utf8')
+    source = readSourceSync(file)
   } catch {
     source = undefined
   }
@@ -379,7 +380,12 @@ function routeFiles(route: RouteManifestEntry): string[] {
 }
 
 function isAppSourceFile(config: ResolvedConfig, file: string): boolean {
-  if (isInside(config.outPath, file)) return false
+  const materialized =
+    file.includes(`${path.sep}source-app${path.sep}`) ||
+    file.includes(`${path.sep}source-pages${path.sep}`)
+  // A build materializes pages sources into its output (`<out>/pnext-pages-compat`).
+  if (isInside(config.outPath, file))
+    return materialized && file.includes(`${path.sep}pnext-pages-compat${path.sep}`)
   const relative = path.relative(config.root, file)
   if (relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative)) {
     // A standalone npm layout keeps node_modules INSIDE the root; framework-supplied route
@@ -387,10 +393,7 @@ function isAppSourceFile(config: ResolvedConfig, file: string): boolean {
     // (a JSDoc example in pnext's extensions.ts failed a real app's build as './pic.png').
     return !relative.split(path.sep).includes('node_modules')
   }
-  return (
-    file.includes(`${path.sep}source-app${path.sep}`) ||
-    file.includes(`${path.sep}source-pages${path.sep}`)
-  )
+  return materialized
 }
 
 function isInside(parent: string, file: string): boolean {

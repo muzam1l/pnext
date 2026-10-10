@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, statSync } from 'node:fs'
 import path from 'node:path'
+import { readSourceSync } from '../resolve/source-text'
 
 /**
  * Conservative static scan of a compat app's client graph deciding whether the client bundle can ship
@@ -87,7 +88,7 @@ export function clientSuspenseFree(seeds: Iterable<string>): boolean {
     if (!SOURCE_EXTENSION.test(file) || !existsSync(file)) return false
     let source: string
     try {
-      source = readFileSync(file, 'utf8')
+      source = readSourceSync(file)
     } catch {
       return false
     }

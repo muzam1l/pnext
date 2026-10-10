@@ -667,6 +667,8 @@ export interface BuildManifest {
   staticFiles?: Record<string, StaticFileMetadata>
   /** Logical build-asset name -> the content-hashed name emitted (`global.css` -> `global-<hash>.css`). */
   assetNames?: Record<string, string>
+  /** App `public/` files under an immutable asset prefix; they stay revalidating. */
+  publicAssets?: string[]
   staticMetadataFiles?: StaticMetadataFileEntry[]
   staticModuleMetadata?: Record<string, StaticModuleMetadata>
   staticRouteMetadata?: Record<string, StaticRouteMetadata>
