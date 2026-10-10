@@ -74,6 +74,16 @@ export async function writeVercelOutput(
     ),
   )
   const overrides = await staticOverrides(staticPath, staticFiles)
+  const proxy = await proxyRoutes(config)
+  await log.step('drop public files from the function', () =>
+    dropPublicFiles(
+      config.publicPath,
+      path.join(functionPath, 'static'),
+      staticFiles,
+      proxy.map(route => new RegExp(route.src)),
+      config.basePath,
+    ),
+  )
 
   const routes: NonNullable<VercelConfig['routes']> = [
     // next-compat documents reference the build output under Next's static path (assetPathname),
@@ -85,7 +95,7 @@ export async function writeVercelOutput(
     ...(await immutableAssetRoutes(staticPath, manifest.publicAssets)),
     // Proxy-matched paths go to the server function before the CDN filesystem
     // check — `pnext start` runs the proxy ahead of static files too.
-    ...(await proxyRoutes(config)),
+    ...proxy,
     ...staticHeaderRoutes(staticFiles),
     { handle: 'filesystem' },
     { src: '^/.*$', dest: `/${SERVER_FUNCTION}` },
@@ -504,6 +514,32 @@ const functionOnlyHeaders = new Set([
   'connection',
   'set-cookie',
 ])
+
+/**
+ * The CDN answers the app's `public/` files, so the function drops them: all but pages, files the CDN
+ * cannot serve, and paths a proxy route or an encoded name sends to it. Build assets stay: a render
+ * reads them (font CSS, inlined CSS).
+ */
+async function dropPublicFiles(
+  publicDir: string,
+  dir: string,
+  staticFiles: Record<string, StaticFileMetadata>,
+  proxied: RegExp[],
+  basePath: string,
+) {
+  const publicFiles = existsSync(publicDir) ? await listFiles(publicDir) : []
+  const dropped = publicFiles
+    .map(source => toPosixPath(path.relative(publicDir, source)))
+    .filter(relative => {
+      const metadata = staticFiles[relative]
+      if (relative.endsWith('.html') || (metadata && !canServeStaticOnVercel(metadata)))
+        return false
+      if (requestPath(relative) !== relative) return false
+      const paths = [`/${relative}`, `${basePath}/${relative}`]
+      return !proxied.some(src => paths.some(pathname => src.test(pathname)))
+    })
+  await Promise.all(dropped.map(relative => rm(path.join(dir, relative), { force: true })))
+}
 
 function canServeStaticOnVercel(metadata: StaticFileMetadata) {
   if (metadata.status !== 200) return false

@@ -126,10 +126,18 @@ export async function emitFontCssStylesheet(
     : `${routeId}.css`
   const name = hashedAssetName(logicalName, contents)
   const file = path.join(outDir, name)
-  if (!existsSync(file) || (await readFile(file, 'utf8')) !== contents)
+  if (existsSync(file) && (await readFile(file, 'utf8')) === contents) return name
+  try {
     await writeFile(file, contents)
+  } catch (error) {
+    // A read-only deployment cannot add the sheet; the render inlines the font rules instead.
+    if (options.dev || !readOnlyErrors.has((error as NodeJS.ErrnoException).code ?? '')) throw error
+    return undefined
+  }
   return name
 }
+
+const readOnlyErrors = new Set(['EROFS', 'EACCES', 'EPERM'])
 
 // Prepend the configured assetPrefix (a CDN origin or path) to an app-absolute
 // asset URL. Link hrefs use basePath instead and must NOT go through here.

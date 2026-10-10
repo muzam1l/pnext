@@ -3987,14 +3987,17 @@ async function renderTreeInFrame(
       ...(nonce ? { nonce } : {}),
     }),
   )
+  let fontStyle = ''
   if (!inlineStylesheets && fonts.css) {
     const fontAsset = await profileRenderStep(profile, 'font stylesheet', () =>
       emitFontCssStylesheet(options.config, options.route.id, fonts.css, stylesheetAssets[0], {
         dev: Boolean(options.dev),
       }),
     )
-    const fontHref = assetHref(options.config, fontAsset)
-    if (globalStylesheet) globalStylesheet = fontHref
+    const fontHref = fontAsset && assetHref(options.config, fontAsset)
+    if (!fontHref)
+      fontStyle = `<style${nonce ? ` nonce="${escapeHtml(nonce)}"` : ''}>${fonts.css}</style>`
+    else if (globalStylesheet) globalStylesheet = fontHref
     else if (Array.isArray(routeStylesheet))
       routeStylesheet = [fontHref, ...routeStylesheet.slice(1)]
     else routeStylesheet = fontHref
@@ -4039,7 +4042,7 @@ async function renderTreeInFrame(
       : ''
   // Inlined CSS is a stylesheet, not a script: it belongs at the stylesheet slot so the cascade
   // (and the emitted order) matches the linked path.
-  const headStyles = inlineStylesheets?.join('\n') ?? ''
+  const headStyles = [fontStyle, ...(inlineStylesheets ?? [])].filter(Boolean).join('\n')
   const headScripts = profileRenderSyncStep(profile, 'head scripts', () =>
     [
       renderCollectedHeadScripts(),

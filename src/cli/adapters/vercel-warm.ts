@@ -614,7 +614,8 @@ async function importClientModules(
 ) {
   if (!getCompatModeExtensions().reactEnabled(config)) return
   for (const file of clientFiles) {
-    if (skip.has(file)) continue
+    // A package's client modules serve from the linked dependency graph; a vendor href is dev-only.
+    if (skip.has(file) || file.includes(`${path.sep}node_modules${path.sep}`)) continue
     const href = await devClientModuleHref(config, file, 'build')
     report(file, fileURLToPath(href))
     try {

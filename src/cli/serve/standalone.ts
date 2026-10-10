@@ -13,7 +13,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { frameworkRuntimeSpecifiers, type ResolvedConfig } from '../../config'
 import { frameworkFingerprint } from '../../runtime/fingerprint'
 import { cacheRoot, compiledSourceGraph, flushDevModuleCaches } from '../../runtime/module-cache'
-import { PREBUNDLE_STAMP, prebundledFile, readPrebundleStamp } from '../../runtime/prebundle'
+import { PREBUNDLE_STAMP, readPrebundleStamp } from '../../runtime/prebundle'
 import {
   buildIndexFile,
   type BuildIndex,
@@ -40,9 +40,15 @@ const buildOnlyModule = /^(?:build|modules|loader|compile|esbuild|dev|run|typege
 const builtins = new Set(builtinModules)
 const scriptFile = /\.(?:[cm]?[jt]sx?)$/
 
+let prebundled: boolean | undefined
+/** Whether a release serves from the framework's prebundle: one matches this source. */
+function servesPrebundle() {
+  return (prebundled ??= readPrebundleStamp(frameworkRoot, frameworkFingerprint()) !== undefined)
+}
+
 /** The framework module a release serves from: its prebundle when one matches this source. */
 function frameworkStartEntry() {
-  return readPrebundleStamp(frameworkRoot, frameworkFingerprint())
+  return servesPrebundle()
     ? path.join(frameworkRoot, 'dist', 'server', 'cli', 'start.js')
     : path.join(frameworkRoot, 'src', 'cli', 'start.ts')
 }
@@ -580,11 +586,13 @@ function resolveEdge(specifier: string, from: string, require = false) {
   return target
 }
 
-/** The prebundled module a framework source file is served by, when it has one. */
+/** The prebundled module a framework source file is served by, when the release serves the prebundle. */
 function frameworkCounterparts(file: string) {
-  const counterpart = prebundledFile(file)
-  if (counterpart === file) return []
-  return [counterpart, path.join(frameworkRoot, PREBUNDLE_STAMP)]
+  const src = path.join(frameworkRoot, 'src')
+  if (!servesPrebundle() || !isInside(src, file)) return []
+  const relative = path.relative(src, file).replace(/\.tsx?$/, '.js')
+  const counterpart = path.join(frameworkRoot, 'dist', 'server', relative)
+  return existsSync(counterpart) ? [counterpart, path.join(frameworkRoot, PREBUNDLE_STAMP)] : []
 }
 
 /** `_chunks/name-<hash>.js` chunk or `name.ts` module -> `name`. */
