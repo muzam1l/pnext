@@ -448,6 +448,7 @@ async function staticOverrides(
 }
 
 // `important` lets route headers win over the CDN's own static-file cache-control, as Next's builder does.
+// Vercel anchors every `src` at both ends, so a prefix must match the rest of the path.
 async function immutableAssetRoutes(publicDir: string, publicAssets: string[] = []) {
   const app = new Set(publicAssets)
   const built =
@@ -457,7 +458,7 @@ async function immutableAssetRoutes(publicDir: string, publicAssets: string[] = 
           .filter(relative => !app.has(relative) && immutableAssetPath(relative))
       : []
   const patterns = immutableAssetPatterns(built, publicAssets)
-  return routeSources(patterns, source => `^/(?:${source})`).map(src => ({
+  return routeSources(patterns, source => `^/(?:${source})$`).map(src => ({
     src,
     headers: { 'cache-control': immutableCacheControl },
     continue: true,
@@ -472,12 +473,14 @@ async function immutableAssetRoutes(publicDir: string, publicAssets: string[] = 
 function immutableAssetPatterns(built: string[], publicAssets: string[]) {
   const appDirs = new Set(publicAssets.flatMap(ancestorDirs))
   const prefixes = [...new Set(immutableAssetPrefixes())]
-  const patterns = prefixes.filter(prefix => !appDirs.has(prefix)).map(escapeRegex)
+  const patterns = prefixes
+    .filter(prefix => !appDirs.has(prefix))
+    .map(prefix => `${escapeRegex(prefix)}.+`)
   for (const relative of built) {
     const prefix = prefixes.find(prefix => relative.startsWith(prefix))
     if (!prefix || !appDirs.has(prefix)) continue
     const dir = ancestorDirs(relative).find(dir => dir.length > prefix.length && !appDirs.has(dir))
-    patterns.push(dir ? escapeRegex(requestPath(dir)) : `${escapeRegex(requestPath(relative))}$`)
+    patterns.push(dir ? `${escapeRegex(requestPath(dir))}.+` : escapeRegex(requestPath(relative)))
   }
   return [...new Set(patterns)]
 }

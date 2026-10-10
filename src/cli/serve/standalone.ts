@@ -299,7 +299,11 @@ function createTracer(config: TraceConfig, from?: TraceSnapshot, onReady?: (dest
             release && !isInside(outPath, target) && !isInside(cache, target) && !shipped(target)
           // An app source named by URL is its identity: it resolves to the app root, never read.
           if (appFile && scriptFile.test(target)) continue
-          if (!statSync(target, { throwIfNoEntry: false })?.isFile()) continue
+          const stat = statSync(target, { throwIfNoEntry: false })
+          // A package directory it reads by URL (migrations, data) ships whole.
+          if (stat?.isDirectory() && !release && packageDataDir(target, file))
+            for (const asset of dataFiles(target)) setFile(trace, place(asset), asset)
+          if (!stat?.isFile()) continue
           // A file it reads by URL (a font, data) ships, under the app's own path.
           const at = appFile
             ? toPosixPath(
@@ -448,15 +452,8 @@ function createPlacer(outPath: string, cache: string, claims = new Map<string, s
       const dir = packageDir(frameworkRoot, frameworkPackage.name)
       return `${dir}/${toPosixPath(path.relative(frameworkRoot, file))}`
     }
-    const posix = toPosixPath(file)
-    const at = posix.lastIndexOf('/node_modules/')
-    if (at !== -1) {
-      const rest = posix.slice(at + '/node_modules/'.length).split('/')
-      const length = rest[0]!.startsWith('@') ? 2 : 1
-      const name = rest.slice(0, length).join('/')
-      const root = `${posix.slice(0, at)}/node_modules/${name}`
-      return [packageDir(root, name), ...rest.slice(length)].join('/')
-    }
+    const owner = installedPackage(file)
+    if (owner) return [packageDir(owner.root, owner.name), ...owner.rest].join('/')
     // Workspace source reached through a link: it ships under its package name.
     const root = packageRoot(path.dirname(file))
     const name = root && readPackageName(root)
@@ -496,6 +493,17 @@ function addTree(root: string, dest: string, trace: Trace) {
     }
   }
   visit(root, new Set())
+}
+
+/** The installed package holding `file`: its `node_modules/<name>` dir, name, and path inside. */
+function installedPackage(file: string) {
+  const posix = toPosixPath(file)
+  const at = posix.lastIndexOf('/node_modules/')
+  if (at === -1) return undefined
+  const rest = posix.slice(at + '/node_modules/'.length).split('/')
+  const length = rest[0]!.startsWith('@') ? 2 : 1
+  const name = rest.slice(0, length).join('/')
+  return { root: `${posix.slice(0, at)}/node_modules/${name}`, name, rest: rest.slice(length) }
 }
 
 function installed(file: string) {
@@ -616,6 +624,22 @@ function addPackageFiles(file: string, trace: Trace, place: (file: string) => st
   }
 }
 
+/** Whether `dir` is data of `from`'s package: inside it, not the module's own dir or above. */
+function packageDataDir(dir: string, from: string) {
+  const root = installedPackage(from)?.root ?? packageRoot(path.dirname(from))
+  if (!root || !isInside(root, dir) || isInside(dir, path.dirname(from))) return false
+  return !path.relative(root, dir).split(path.sep).includes('node_modules')
+}
+
+/** Every file under `dir`, nested packages aside. */
+function dataFiles(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+    const file = path.join(dir, entry.name)
+    if (entry.isDirectory()) return entry.name === 'node_modules' ? [] : dataFiles(file)
+    return entry.isFile() ? [file] : []
+  })
+}
+
 function packageRoot(dir: string): string | undefined {
   for (; dir !== path.dirname(dir); dir = path.dirname(dir)) {
     if (existsSync(path.join(dir, 'package.json'))) return dir
@@ -655,7 +679,7 @@ function rewriteSpecifiers(file: string, source: string, edits: Map<string, stri
 function urlTarget(specifier: string, from: string) {
   try {
     const url = new URL(specifier, pathToFileURL(from))
-    return url.protocol === 'file:' ? fileURLToPath(url) : undefined
+    return url.protocol === 'file:' ? path.resolve(fileURLToPath(url)) : undefined
   } catch {
     return undefined
   }
