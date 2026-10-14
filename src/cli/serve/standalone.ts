@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto'
 import { constants, existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { builtinModules } from 'node:module'
+import { builtinModules, createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { frameworkRuntimeSpecifiers, type ResolvedConfig } from '../../config'
@@ -24,7 +24,7 @@ import {
 } from '../../runtime/production'
 import { toPosixPath } from '../../utils/fs'
 import { splitResourceQuery } from '../../utils/resource-query'
-import { importMetaRefs, moduleSpecifierEdges } from '../../resolve/scan-facts'
+import { importMetaRefs, moduleSpecifierEdges, requireResolveRefs } from '../../resolve/scan-facts'
 import { spliceSource } from '../../runtime/module-transform'
 import type { BuildManifest } from '../../types'
 
@@ -552,6 +552,9 @@ function scanEdges(file: string, source: string): Edge[] {
     dynamic: entry.kind === 'dynamic-import',
     require: entry.kind === 'require-call',
   }))
+  // `require.resolve` names a module the code loads or reads later; `scanImports` leaves it out.
+  for (const ref of requireResolveRefs(file, source))
+    edges.push({ specifier: ref.specifier, dynamic: false, require: true })
   // A module names files beside itself by `new URL(…, import.meta.url)` and `import.meta.resolve`.
   const refs = importMetaRefs(file, source)
   for (const url of refs.urls) edges.push({ specifier: url.specifier, dynamic: false, url: true })
@@ -572,12 +575,15 @@ function resolveEdge(specifier: string, from: string, require = false) {
   const bare = require ? specifier : splitResourceQuery(specifier).path
   if (builtins.has(bare)) return undefined
   const dir = path.dirname(from)
-  const key = `${dir}\0${bare}`
+  const key = `${require}\0${dir}\0${bare}`
   if (resolved.has(key)) return resolved.get(key)
   let target: string | undefined
   try {
     const request = bare.startsWith('file:') ? fileURLToPath(bare) : bare
-    target = realpathSync(Bun.resolveSync(request, dir))
+    // A `require()` takes a package's `require` export, as Bun loads it at runtime.
+    target = realpathSync(
+      require ? createRequire(from).resolve(request) : Bun.resolveSync(request, dir),
+    )
     if (!statSync(target).isFile()) target = undefined
   } catch {
     target = undefined
@@ -672,7 +678,12 @@ function relativeSpecifier(fromDir: string, to: string) {
 /** Swap specifier literals for their standalone locations, by parsed span: never inside a string. */
 function rewriteSpecifiers(file: string, source: string, edits: Map<string, string>) {
   const refs = importMetaRefs(file, source)
-  const spans = [...moduleSpecifierEdges(source, file), ...refs.urls, ...refs.resolves]
+  const spans = [
+    ...moduleSpecifierEdges(source, file),
+    ...refs.urls,
+    ...refs.resolves,
+    ...requireResolveRefs(file, source),
+  ]
   const changes = spans.flatMap(span => {
     const value = edits.get(span.specifier)
     return value === undefined

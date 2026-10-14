@@ -686,6 +686,44 @@ export function importMetaRefs(file: string, source: string): ImportMetaRefs {
   return refs
 }
 
+const requireResolveMemo = new Map<string, LiteralSpan[]>()
+
+/** Every `require.resolve('<literal>')` a module makes, from the AST: never a comment or a string. */
+export function requireResolveRefs(file: string, source: string): LiteralSpan[] {
+  if (stylesheetOrData.test(file) || !source.includes('require.resolve')) return []
+  const lang = langForFile(file)
+  const key = `${lang}\0${source.length}\0${bun.hash(source).toString()}`
+  const cached = requireResolveMemo.get(key)
+  if (cached) return cached
+  const spans: LiteralSpan[] = []
+  const visit = (value: unknown) => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item)
+      return
+    }
+    if (!isNode(value)) return
+    if (value.type === 'CallExpression') {
+      const callee = child(value, 'callee')
+      const target = (value.arguments as AstNode[])[0]
+      const specifier = stringValue(target)
+      if (
+        specifier !== undefined &&
+        callee?.type === 'MemberExpression' &&
+        !callee.computed &&
+        child(callee, 'object')?.name === 'require' &&
+        child(callee, 'property')?.name === 'resolve'
+      )
+        spans.push({ specifier, start: target!.start, end: target!.end })
+    }
+    for (const key in value) {
+      if (key !== 'start' && key !== 'end' && key !== 'type') visit(value[key])
+    }
+  }
+  visit(parseSync(file, source, { lang }).program)
+  requireResolveMemo.set(key, spans)
+  return spans
+}
+
 /**
  * Whether the module declares top-level state: a `const`/`let`/`var` initialized by `new`, or by a
  * call through a plain name (not `require`, not `/* @__PURE__ *\/`), from the AST: never a line
