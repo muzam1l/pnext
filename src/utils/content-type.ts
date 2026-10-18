@@ -26,6 +26,7 @@ const contentTypes: Record<string, string> = {
   '.woff2': 'font/woff2',
 }
 
+/** The listed types are pinned; every other extension takes Bun's full table (`.pdf`, `.txt`, ...). */
 export function contentType(file: string): string {
-  return contentTypes[path.extname(file).toLowerCase()] ?? 'application/octet-stream'
+  return contentTypes[path.extname(file).toLowerCase()] ?? Bun.file(file).type
 }

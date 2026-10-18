@@ -21,6 +21,7 @@ import {
   serverBundleTargetForRuntime,
   serverBundleConditions,
   serverBundleRequireConditions,
+  serverCssModuleSource,
   type ServerBundleTarget,
 } from './loader'
 import {
@@ -37,7 +38,6 @@ import {
   extraLoadableExtensions,
   getAssetExtensions,
   getBundlerExtensions,
-  getCssExtensions,
   getImportAliasExtensions,
   serverDefineOptions,
 } from '../extensions'
@@ -2456,7 +2456,7 @@ async function assetStubModule(config: ResolvedConfig, resolved: string, profile
   if (existing) return existing
   const next = (async () => {
     const contents =
-      (await serverCssModuleSource(config, resolved)) ??
+      (await serverCssModuleSource(base)) ??
       (isCssFile(base)
         ? ''
         : isStaticImageFile(base)
@@ -2551,9 +2551,8 @@ function serverAssetPlugin(config: ResolvedConfig): Plugin {
         return { path: resolved, namespace: serverAssetNamespace }
       })
       build.onLoad({ filter: /.*/, namespace: serverAssetNamespace }, async args => {
-        // Registry-provided CSS modules (e.g. *.module.scss) export their class
-        // map on the server instead of the empty-asset stub.
-        const cssModule = await serverCssModuleSource(config, args.path)
+        // CSS modules export their class map on the server instead of the empty-asset stub.
+        const cssModule = await serverCssModuleSource(args.path)
         return {
           contents:
             cssModule ??
@@ -3372,15 +3371,6 @@ async function clientReferencePath(config: ResolvedConfig, file: string) {
 
 function isCssFile(file: string) {
   return file.endsWith('.css')
-}
-
-/** A CSS module's class map as a build's server output imports it; core's plain CSS modules map here. */
-async function serverCssModuleSource(config: ResolvedConfig, file: string) {
-  const registered = getCssExtensions().loadCssModuleForClient(file)
-  const coreBuild = isReleaseCompile() && !reactCompatEnabled(config)
-  if (registered !== undefined || !coreBuild || !file.endsWith('.module.css')) return registered
-  const { cssModuleMapping } = await import('../css/build')
-  return `export default ${JSON.stringify(await cssModuleMapping(file))};`
 }
 
 function isStaticImageFile(file: string) {

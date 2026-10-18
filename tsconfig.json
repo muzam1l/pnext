@@ -3,7 +3,8 @@
   "compilerOptions": {
     "jsxImportSource": "preact",
     "types": ["bun-types"],
-    "allowImportingTsExtensions": true
+    "allowImportingTsExtensions": true,
+    "noUncheckedIndexedAccess": true
   },
   "include": ["."],
   "exclude": ["node_modules", ".pnext", "bench/fixtures", "src/cli/template"]

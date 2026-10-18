@@ -1166,6 +1166,14 @@ function coreStaticAssetModule(
   return `const src = ${JSON.stringify(src)};\nexport default src;\nexport { src };\n`
 }
 
+/** A CSS module's class map as server code imports it, in dev and build alike; undefined for plain CSS. */
+export async function serverCssModuleSource(file: string) {
+  const registered = getCssExtensions().loadCssModuleForClient(file)
+  if (registered !== undefined || !file.endsWith('.module.css')) return registered
+  const { cssModuleMapping } = await import('../css/assets')
+  return `export default ${JSON.stringify(await cssModuleMapping(file))};`
+}
+
 export function serverAssetPlugin(config?: ResolvedConfig): Plugin {
   return {
     name: 'pnext-empty-server-assets',
@@ -1182,7 +1190,7 @@ export function serverAssetPlugin(config?: ResolvedConfig): Plugin {
       })
       build.onLoad({ filter: /.*/, namespace: 'pnext-empty-server-asset' }, async args => ({
         contents:
-          getCssExtensions().loadCssModuleForClient(args.path) ??
+          (await serverCssModuleSource(args.path)) ??
           (isCssFile(args.path)
             ? ''
             : isStaticImageFile(args.path)
