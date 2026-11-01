@@ -62,7 +62,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api -X POST "repos/${{ github.repository }}/statuses/$SHA" \
+          gh api --silent -X POST "repos/${{ github.repository }}/statuses/$SHA" \
             -f state=pending -f context="$CHECK" -f description="running in pnext-workspace" -f target_url="$RUN_URL"
 
       - name: Run in pnext-workspace
@@ -71,12 +71,15 @@ jobs:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           KEY: pnext-pr${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          WS_REF=main
-          if [ "$(gh api "repos/$GH_REPO/git/ref/heads/$HEAD_REF" --jq .ref 2>/dev/null)" = "refs/heads/$HEAD_REF" ]; then
-            WS_REF=$HEAD_REF
+          # The token only has Actions access, so a missing branch is detected by the dispatch itself.
+          dispatch() { gh workflow run "$CHECK.yml" --ref "$1" -f pnext_sha="$SHA" -f run_key="$KEY"; }
+          WS_REF=$HEAD_REF
+          if ! dispatch "$WS_REF" 2> dispatch.err; then
+            grep -q 'No ref found' dispatch.err || { cat dispatch.err; exit 1; }
+            WS_REF=main
+            dispatch "$WS_REF"
           fi
           echo "workspace ref: $WS_REF"
-          gh workflow run "$CHECK.yml" --ref "$WS_REF" -f pnext_sha="$SHA" -f run_key="$KEY"
           for _ in $(seq 1 24); do
             sleep 5
             RUN_ID=$(gh run list --workflow "$CHECK.yml" --event workflow_dispatch --limit 20 \
@@ -104,7 +107,7 @@ jobs:
             echo "$SUMMARY"
           fi
           STATE=$([ "$CONCLUSION" = success ] && echo success || echo failure)
-          gh api -X POST "repos/${{ github.repository }}/statuses/$SHA" \
+          gh api --silent -X POST "repos/${{ github.repository }}/statuses/$SHA" \
             -f state="$STATE" -f context="$CHECK" -f description="$SUMMARY" -f target_url="$RUN_URL"
           [ "$STATE" = success ]
 
