@@ -2,6 +2,7 @@
 // still needs one so hydration throws reach the window last resort (not preact's diff) and primitive
 // throws keep their raw value en route to global-error. Exactly those two behaviors, ~0.5 KB raw.
 import { Component, type ComponentChildren } from 'preact'
+import { errorRuntime } from './lazy'
 import { normalizeBoundaryError } from './primitive-throw'
 
 interface BareBoundaryState {
@@ -20,11 +21,11 @@ export class BareErrorBoundary extends Component<{ children?: unknown }, BareBou
     if (!this.state.hasError) return this.props.children
     const { error } = this.state
     // A primitive would arrive at the window handler as a synthesized Error, so
-    // escalate it to global-error directly (deferred tier) with its raw value.
+    // escalate it to global-error directly (the deferred install chunk) with its raw value.
     // Everything else re-throws: unmarked, so the window last resort still sees
     // a genuinely uncaught error and drives it.
     if (error === null || typeof error !== 'object') {
-      void import('./install').then(module => module.escalateToGlobalError(error))
+      void errorRuntime().then(module => module.escalateToGlobalError(error))
       return null
     }
     throw error as Error

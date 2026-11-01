@@ -35,7 +35,12 @@ type RequestHandler = (request: Request, server?: PeerAddressSource) => Promise<
  * without the Bun.serve wrapper.
  */
 export async function createRequestHandler(
-  options: { root?: string; config?: ResolvedConfig; manifest?: BuildManifest } = {},
+  options: {
+    root?: string
+    config?: ResolvedConfig
+    manifest?: BuildManifest
+    warm?: boolean
+  } = {},
 ): Promise<RequestHandler> {
   registerPrebundleResolve()
   const config = options.config ?? (await loadConfig(options.root, { serve: true }))
@@ -94,6 +99,7 @@ export async function start(options: StartOptions = {}) {
   const server = Bun.serve({
     hostname,
     port,
+    idleTimeout: 255,
     fetch: (request, server) =>
       handler ? handler(request, server) : ensureHandler().then(ready => ready(request, server)),
   })
@@ -125,12 +131,12 @@ function installProcessErrorHandlers(): void {
   }
   if (globalWithFlag.__pnextProcessErrorHandlers) return
   globalWithFlag.__pnextProcessErrorHandlers = true
-  const report = (reason: unknown) => {
+  const report = (label: string, reason: unknown) => {
     if (isPostpone(reason)) return
-    if (markErrorLogged(reason)) console.error(reason)
+    if (markErrorLogged(reason)) console.error(`⨯ ${label}:`, reason)
   }
-  process.on('unhandledRejection', report)
-  process.on('uncaughtException', report)
+  process.on('unhandledRejection', reason => report('unhandledRejection', reason))
+  process.on('uncaughtException', reason => report('uncaughtException', reason))
 }
 
 export async function readProductionManifest(config: ResolvedConfig): Promise<BuildManifest> {

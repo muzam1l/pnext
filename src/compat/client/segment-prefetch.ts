@@ -353,6 +353,69 @@ async function fetchAppShell(pathname: string): Promise<void> {
   })
 }
 
+// Runtime prefetches in flight or still fresh, by URL (pathname + search): expiry time.
+const runtimeRequested = new Map<string, number>()
+// Bumped by every invalidation, so a response in flight across one never repopulates the caches.
+let runtimeGeneration = 0
+
+/**
+ * Next's runtime prefetch: once the static body prefetch of a route the build lists as runtime-prefetchable
+ * (`_buildManifest.js`) lands, fetch its request-sampled body with `next-router-prefetch: 2`. A complete
+ * static response already holds the whole page, so it needs none.
+ */
+export function scheduleRuntimePrefetch(input: {
+  pathname: string
+  search: string
+  route: string | null | undefined
+  runtime: boolean
+  complete: boolean
+}): void {
+  const routes = (globalThis as { __PNEXT_RUNTIME_PREFETCH__?: string[] })
+    .__PNEXT_RUNTIME_PREFETCH__
+  if (input.runtime || input.complete || !input.route || !routes?.includes(input.route)) return
+  const url = new URL(input.pathname + input.search, location.href)
+  url.searchParams.delete(RSC_QUERY)
+  const key = url.pathname + url.search
+  if ((runtimeRequested.get(key) ?? 0) > Date.now()) return
+  runtimeRequested.set(key, Number.POSITIVE_INFINITY)
+  const generation = runtimeGeneration
+  void fetchRuntimePrefetch(url, generation).then(
+    staleTimeMs => {
+      if (generation === runtimeGeneration) runtimeRequested.set(key, Date.now() + staleTimeMs)
+    },
+    () => {
+      if (generation === runtimeGeneration) runtimeRequested.delete(key)
+    },
+  )
+}
+
+async function fetchRuntimePrefetch(url: URL, generation: number): Promise<number> {
+  const response = await fetch(withRscQuery(url.href, 'runtime'), {
+    headers: { rsc: '1', 'next-router-prefetch': '2' },
+    credentials: 'same-origin',
+    priority: 'low',
+  })
+  if (!response.ok) throw new Error(`runtime prefetch ${response.status}`)
+  const decoded = decodeSegmentPayload(await response.text(), INDEX_SEGMENT_PATH)
+  const seconds = headerStaleTimeSeconds(response)
+  const staleTimeMs = (Number.isFinite(seconds) ? seconds : 30) * 1000
+  if (!decoded || generation !== runtimeGeneration) return staleTimeMs
+  recordSegment({
+    segmentPath: INDEX_SEGMENT_PATH,
+    pathname: url.pathname,
+    search: url.search,
+    html: decoded.html,
+    staleTimeMs,
+    complete: response.headers.get('x-pnext-runtime-complete') === '1',
+    static: false,
+    runtime: true,
+    vary: decoded.vary,
+    route: decoded.route,
+    params: decoded.params,
+  })
+  return staleTimeMs
+}
+
 function appShellsEnabled(): boolean {
   if (!process.browser && typeof window === 'undefined') return false
   return (window as { __PNEXT_APP_SHELLS__?: boolean }).__PNEXT_APP_SHELLS__ === true
@@ -367,4 +430,6 @@ export function resetAppShellPrefetches(): void {
 export function resetSegmentPrefetchDedupe(): void {
   treeCache.clear()
   appShellRequested.clear()
+  runtimeRequested.clear()
+  runtimeGeneration += 1
 }

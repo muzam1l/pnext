@@ -12,7 +12,7 @@ import type {
   StaticMetadataFileEntry,
 } from '../types'
 import { escapeHtml, stringifyHtmlValue } from '../utils/html'
-import { toPosixPath } from '../utils/fs'
+import { readDirListing, toPosixPath } from '../utils/fs'
 import { servedAppFiles, servedRelease } from '../runtime/production'
 
 export type StaticMetadataKind =
@@ -60,6 +60,14 @@ const staticMetadataFiles = new Map<string, StaticMetadataFile[]>()
 const dynamicMetadataFiles = new Map<string, DynamicMetadataFile[]>()
 
 /** Drop the memoized app/ metadata-file walks (dev structural invalidation). */
+/** Whether `dir` holds a metadata image file (icon, apple-icon, opengraph-image, twitter-image). */
+export function hasHeadMetadataFiles(dir: string): boolean {
+  for (const name of readDirListing(dir).files) {
+    if (/^(icon|apple-icon|opengraph-image|twitter-image)\d*\.\w+$/.test(name)) return true
+  }
+  return false
+}
+
 export function clearMetadataFileCaches() {
   staticMetadataFiles.clear()
   dynamicMetadataFiles.clear()
@@ -147,6 +155,8 @@ export async function withDynamicMetadataRoutes(
   routeFile: string,
   pathname: string,
   loadModule: MetadataModuleLoader,
+  /** When set, a parallel slot's failing image generator is reported here and contributes nothing. */
+  onSlotError?: (error: unknown) => void,
 ): Promise<StaticMetadataForPath> {
   // Every render with no prebuilt metadata reaches here, so an app with no
   // manifest/icon/sitemap modules pays one memoized lookup and no copy.
@@ -158,19 +168,34 @@ export async function withDynamicMetadataRoutes(
     .filter((file): file is MatchedDynamicMetadataFile => file !== undefined)
 
   const manifest = bestDynamicFiles(files, 'manifest')[0]
-  const icons = await dynamicImageLinks(bestDynamicFiles(files, 'icon'), loadModule, 'icon')
+  const entriesOf = (file: MatchedDynamicMetadataFile, module: DynamicMetadataModule) =>
+    onSlotError && file.relative.split('/').some(name => name.startsWith('@'))
+      ? dynamicImageEntries(file, module).catch(error => {
+          onSlotError(error)
+          return []
+        })
+      : dynamicImageEntries(file, module)
+  const icons = await dynamicImageLinks(
+    bestDynamicFiles(files, 'icon'),
+    loadModule,
+    'icon',
+    entriesOf,
+  )
   const appleIcons = await dynamicImageLinks(
     bestDynamicFiles(files, 'apple-icon'),
     loadModule,
     'apple-touch-icon',
+    entriesOf,
   )
   const openGraphImages = await dynamicMetadataImages(
     bestDynamicFiles(files, 'opengraph-image'),
     loadModule,
+    entriesOf,
   )
   const twitterImages = await dynamicMetadataImages(
     bestDynamicFiles(files, 'twitter-image'),
     loadModule,
+    entriesOf,
   )
 
   return {
@@ -519,11 +544,12 @@ async function dynamicImageLinks(
   files: MatchedDynamicMetadataFile[],
   loadModule: MetadataModuleLoader,
   rel: string,
+  entriesOf: ImageEntriesReader,
 ): Promise<MetadataLink[]> {
   const links: MetadataLink[] = []
   for (const file of files) {
     const module = (await loadModule(file.file)) as DynamicMetadataModule
-    for (const image of await dynamicImageEntries(file, module)) {
+    for (const image of await entriesOf(file, module)) {
       links.push({
         rel,
         url: image.url,
@@ -538,11 +564,12 @@ async function dynamicImageLinks(
 async function dynamicMetadataImages(
   files: MatchedDynamicMetadataFile[],
   loadModule: MetadataModuleLoader,
+  entriesOf: ImageEntriesReader,
 ): Promise<MetadataImage[]> {
   const images: MetadataImage[] = []
   for (const file of files) {
     const module = (await loadModule(file.file)) as DynamicMetadataModule
-    for (const image of await dynamicImageEntries(file, module)) {
+    for (const image of await entriesOf(file, module)) {
       images.push({
         url: image.url,
         type: image.type,
@@ -554,6 +581,11 @@ async function dynamicMetadataImages(
   }
   return images
 }
+
+type ImageEntriesReader = (
+  file: MatchedDynamicMetadataFile,
+  module: DynamicMetadataModule,
+) => Promise<DynamicImageEntry[]>
 
 interface DynamicImageEntry {
   url: string
@@ -748,6 +780,7 @@ export function metadataRouteHandlerModule(
   if (!metadata) return undefined
 
   const handler: DynamicMetadataHandlerModule = {
+    ...module,
     GET: async (_request, context) => metadataRouteResponse(module, metadata, await context.params),
   }
   if (metadata.generatedParam) {

@@ -24,7 +24,13 @@ import { pathToFileURL } from 'node:url'
 import type { Plugin } from 'esbuild'
 import type { ResolvedConfig } from '../../config'
 import { rewriteSpecifierLiterals } from '../../resolve/scan-facts'
-import { turbopackLoaderRules, turbopackResolveAlias, type WebpackLoaderRule } from './config'
+import {
+  EMPTY_ALIAS_MODULE,
+  EMPTY_ALIAS_DYNAMIC_MODULE,
+  turbopackLoaderRules,
+  turbopackResolveAlias,
+  type WebpackLoaderRule,
+} from './config'
 import { outCachePath } from '../../out-paths'
 
 interface LoaderFn {
@@ -33,6 +39,8 @@ interface LoaderFn {
 }
 
 interface LoaderContext {
+  context: string
+  target: 'node' | 'web'
   resourcePath: string
   resourceQuery: string
   mode: string
@@ -41,13 +49,20 @@ interface LoaderContext {
     readFileSync: typeof readFileSync
   }
   addDependency: (file: string) => void
+  addContextDependency: (directory: string) => void
+  addMissingDependency: (file: string) => void
+  resolve: (context: string, request: string, callback: ResolveCallback) => void
   getOptions: () => Record<string, unknown>
   async: () => (err: unknown, result?: unknown) => void
   callback: (err: unknown, result?: unknown, ...rest: unknown[]) => void
-  getResolve: (options?: unknown) => (context: string, request: string) => Promise<string>
+  getResolve: (
+    options?: unknown,
+  ) => (context: string, request: string, callback?: ResolveCallback) => Promise<string> | void
   emitFile: (name: string, content: unknown) => void
   importModule: (request: string) => Promise<unknown>
 }
+
+type ResolveCallback = (error: unknown, result?: string) => void
 
 /** Where a loader chain runs — client builds cannot support `this.importModule`. */
 type LoaderContextTarget = 'client' | 'server'
@@ -269,6 +284,8 @@ export function rewriteResolveAliasImports(source: string, file: string, root: s
     const aliased = resolveAliasSpecifier(specifier, root)
     if (!aliased) return undefined
     const target = firstExisting(aliased) ?? aliased
+    if (target === EMPTY_ALIAS_MODULE && kind === 'dynamic')
+      return JSON.stringify(EMPTY_ALIAS_DYNAMIC_MODULE)
     // A bare alias target (e.g. `'preact/compat': 'react'`) is not a file path;
     // leave the host resolver to handle it.
     if (!path.isAbsolute(target)) return undefined
@@ -276,11 +293,23 @@ export function rewriteResolveAliasImports(source: string, file: string, root: s
   })
 }
 
+// Same computed-key read as env.ts: NODE_ENV is set by pnext itself, not a turbo input.
+function loaderMode(): 'development' | 'production' {
+  const nodeEnvKey = 'NODE_ENV'
+  return process.env[nodeEnvKey] === 'development' ? 'development' : 'production'
+}
+
 /** `this.getResolve()(context, request)` — alias-aware, extension-probing. */
 function resolveLoaderRequest(root: string, context: string, request: string): Promise<string> {
   const resolved = resolveSpecifier(root, context, request)
   if (resolved && existsSync(resolved)) return Promise.resolve(resolved)
-  return Promise.reject(new Error(`Cannot resolve '${request}' from '${context}'`))
+  try {
+    return Promise.resolve(
+      createRequire(path.join(context, 'noop-require.cjs')).resolve(resolved ?? request),
+    )
+  } catch (error) {
+    return Promise.reject(error instanceof Error ? error : new Error(String(error)))
+  }
 }
 
 /**
@@ -357,17 +386,32 @@ function runLoader(
       else resolve(result as string | Buffer)
     }
     const ctx: LoaderContext = {
+      context: path.dirname(resourcePath),
+      target: target === 'server' ? 'node' : 'web',
       resourcePath,
       resourceQuery,
-      mode: 'production',
+      mode: loaderMode(),
       fs: { readFile, readFileSync },
       // eslint-disable-next-line @typescript-eslint/no-empty-function -- loader deps aren't tracked
       addDependency: () => {},
+      // eslint-disable-next-line @typescript-eslint/no-empty-function -- loader deps aren't tracked
+      addContextDependency: () => {},
+      // eslint-disable-next-line @typescript-eslint/no-empty-function -- loader deps aren't tracked
+      addMissingDependency: () => {},
+      resolve: (context, request, callback) => {
+        resolveLoaderRequest(root, context, request).then(
+          result => callback(null, result),
+          callback,
+        )
+      },
       getOptions: () => ({}),
       async: () => finish,
       callback: finish,
-      getResolve: () => (context: string, request: string) =>
-        resolveLoaderRequest(root, context, request),
+      getResolve: () => (context, request, callback) => {
+        const resolved = resolveLoaderRequest(root, context, request)
+        if (callback) resolved.then(result => callback(null, result), callback)
+        else return resolved
+      },
       // eslint-disable-next-line @typescript-eslint/no-empty-function -- emitted files aren't tracked
       emitFile: () => {},
       importModule:
@@ -528,6 +572,7 @@ function aliasSpecifierFilter(): RegExp | undefined {
 // runtime namespace so two `?query` imports of one file stay distinct modules.
 const QUERY_SEPARATOR = '\0'
 const QUERY_NAMESPACE = 'pnext-webpack-loader-query'
+const loaderOutput = Symbol('pnext-loader-output')
 
 /**
  * esbuild plugin applying configured `turbopack.rules` loader chains (plus
@@ -570,6 +615,9 @@ export function webpackLoaderRulesPlugin(
           if (isPNextRuntimeImporter(args.importer)) return undefined
           const resolved = resolveAliasSpecifier(args.path, config.root)
           if (!resolved) return undefined
+          if (resolved === EMPTY_ALIAS_MODULE && args.kind === 'dynamic-import') {
+            return build.resolve(EMPTY_ALIAS_DYNAMIC_MODULE, { kind: args.kind })
+          }
           const target = firstExisting(resolved) ?? resolved
           // A bare alias target (e.g. `'preact/compat': 'react'`) is not a
           // file path — hand it back to esbuild's own resolver.
@@ -585,6 +633,14 @@ export function webpackLoaderRulesPlugin(
         })
       }
       if (filter) {
+        build.onResolve({ filter: /^[^./]/ }, args => {
+          if (!(args.pluginData as Record<symbol, boolean> | undefined)?.[loaderOutput]) return
+          return build.resolve(args.path, {
+            resolveDir: config.root,
+            kind: args.kind,
+            importer: args.importer,
+          })
+        })
         build.onLoad({ filter, namespace: 'file' }, async args => {
           const resourcePath = path.resolve(args.path)
           const resourceQuery = args.suffix ?? ''
@@ -597,7 +653,13 @@ export function webpackLoaderRulesPlugin(
               target,
               config,
             )
-            return loaded ?? undefined
+            return loaded
+              ? {
+                  ...loaded,
+                  resolveDir: path.dirname(originalResourcePath(resourcePath, config)),
+                  pluginData: { [loaderOutput]: true },
+                }
+              : undefined
           } catch (error) {
             return { errors: [{ text: error instanceof Error ? error.message : String(error) }] }
           }

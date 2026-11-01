@@ -467,7 +467,7 @@ async function resolveGoogleFont(
   const emitted = await Promise.all(
     fontFiles.map(async fontFile => ({
       ...fontFile,
-      emitted: await emitRemoteFontFile(context, fontFile.googleFontFileUrl, {
+      emitted: await emitRemoteFontFile(context, new URL(fontFile.googleFontFileUrl, url).href, {
         preload: fontFile.preloadFontFile,
         adjustFontFallback,
       }),
@@ -750,7 +750,7 @@ function findGoogleFontFiles(css: string, subsetsToPreload: string[] | undefined
       continue
     }
 
-    const googleFontFileUrl = /src: url\((.+?)\)/.exec(line)?.[1]
+    const googleFontFileUrl = /src: url\((['"]?)(.+?)\1\)/.exec(line)?.[2]
     if (!googleFontFileUrl || fontFiles.some(file => file.googleFontFileUrl === googleFontFileUrl))
       continue
     fontFiles.push({

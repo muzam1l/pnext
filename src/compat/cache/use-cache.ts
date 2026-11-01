@@ -14,12 +14,16 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { Fragment, h, type ComponentChildren } from 'preact'
 import { Suspense as CoreSuspense } from '../../api/suspense'
-import { currentParams, currentRequest, getWorkUnit } from '../../request/context'
+import { currentParams, currentRequest, getWorkUnit, queueAfterTask } from '../../request/context'
+import { currentParamsSnapshot } from '../../render/slots'
 import {
   hangingPromise,
+  currentPrerenderScope,
+  isPostpone,
   isPrefetchShellPrerender,
   isPrerendering,
   isRuntimePrefetchPrerender,
+  isTaskBoundaryPrerender,
   markRuntimeApiOnAwait,
   PostponeError,
   realNow,
@@ -37,8 +41,10 @@ import {
   recordCacheRevalidate,
   recordCacheStale,
   recordCacheTags,
+  insideDataCacheProducer,
   runInsideDataCacheProducer,
   setUseCacheRevalidateSink,
+  setUseCacheTagSink,
   tagsRevalidatedAfterSeq,
   tagsStaleSince,
 } from './revalidate'
@@ -61,6 +67,7 @@ import {
   USE_CACHE_CLOSE_OVER_FUNCTION_MESSAGE,
   USE_CACHE_HANGING_MESSAGE,
 } from './build-prerender-errors'
+import { getNextConfig } from '../next/config-loader'
 
 // ---------------------------------------------------------------------------
 // Build-prerender `use cache` fill timeout (E236 hanging-input detection).
@@ -100,12 +107,14 @@ interface UseCacheEntry {
   value: Promise<unknown>
   storedAt: number
   tags: string[]
+  rootParamsRead?: Set<string>
   revalidateSeconds?: number
   expireSeconds?: number
   staleSeconds?: number
   /** A background stale-while-revalidate refresh is already in flight. */
   refreshing?: boolean
   modernKey?: string
+  pendingWrite?: Promise<void>
   /** Pathname of the render that produced this entry (path-revalidation scope). */
   route?: string
   /** Hard-tag-revalidation sequence sampled when production began. */
@@ -157,12 +166,15 @@ interface UseCacheScope {
   functionId?: string
   /** Root param NAMES read (via next/root-params) while producing this entry. */
   rootParamsRead?: Set<string>
+  /** A `use cache: private` body. */
+  private?: true
 }
 
 const USE_CACHE_ENTRIES = Symbol.for('pnext.compat.useCacheEntries')
 const USE_CACHE_SCOPE_STORAGE = Symbol.for('pnext.compat.useCacheScopeStorage')
 const USE_CACHE_KNOWN_ROOT_PARAMS = Symbol.for('pnext.compat.knownRootParamsByFunctionId')
 const USE_CACHE_REQUEST_TOKENS = Symbol.for('pnext.compat.useCacheRequestTokens')
+const USE_CACHE_HANDLER_LOOKUPS = Symbol.for('pnext.compat.useCacheHandlerLookups')
 
 function useCacheGlobal<T>(key: symbol, create: () => T): T {
   const state = globalThis as Record<PropertyKey, unknown>
@@ -180,6 +192,10 @@ const scopeStorage = useCacheGlobal(
   () => new AsyncLocalStorage<UseCacheScope>(),
 )
 const requestTokens = useCacheGlobal(USE_CACHE_REQUEST_TOKENS, () => new WeakMap<object, object>())
+const handlerLookups = useCacheGlobal(
+  USE_CACHE_HANDLER_LOOKUPS,
+  () => new WeakMap<object, Map<string, ReturnType<typeof modernCacheGet>>>(),
+)
 const USE_CACHE_RDC_CAPTURE = Symbol.for('pnext.compat.useCacheRdcCapture')
 const USE_CACHE_RDC_RECORDS = Symbol.for('pnext.compat.useCacheRdcRecords')
 
@@ -192,8 +208,14 @@ function useCacheRdcCapture(): Set<string> | undefined {
     Set<string> | undefined
 }
 
-function captureUseCacheRdcEntry(key: string) {
-  useCacheRdcCapture()?.add(key)
+function captureUseCacheRdcResult<T>(key: string, result: Promise<T>): Promise<T> {
+  const capture = useCacheRdcCapture()
+  if (!capture || !isPrerendering() || insideDataCacheProducer() || insideUseCacheProducer())
+    return result
+  return result.then(value => {
+    capture.add(key)
+    return value
+  })
 }
 
 export function beginUseCacheRdcCapture() {
@@ -358,19 +380,29 @@ function rootParamNames(): Set<string> | undefined {
 export function recordUseCacheRootParamRead(name: string): boolean {
   const scope = scopeStorage.getStore()
   if (!scope?.functionId) return false
+  recordRootParamRead(scope, name)
+  return true
+}
+
+function recordRootParamRead(scope: UseCacheScope, name: string): void {
   ;(scope.rootParamsRead ??= new Set()).add(name)
+  if (!scope.functionId) return
   let known = knownRootParamsByFunctionId.get(scope.functionId)
   if (!known) {
     known = new Set()
     knownRootParamsByFunctionId.set(scope.functionId, known)
   }
   known.add(name)
-  return true
 }
 
 /** True when a `use cache` producer is currently on the stack (E1140 guard). */
 export function insideUseCacheProducer(): boolean {
   return scopeStorage.getStore()?.functionId !== undefined
+}
+
+/** True while executing a `use cache: private` body. */
+export function insidePrivateUseCache(): boolean {
+  return scopeStorage.getStore()?.private === true
 }
 
 /**
@@ -381,7 +413,7 @@ export function insideUseCacheProducer(): boolean {
  */
 function withRootParamKeyArgs(id: string, args: unknown[]): unknown[] {
   const known = knownRootParamsByFunctionId.get(id)
-  const params = currentParams()
+  const params = currentUseCacheRootParams()
   // The first call has no observed read-set yet, but it must still not seed a cross-root entry. Once
   // reads are known, narrow back to that set; until then every KNOWN (resolved) root param is a
   // conservative cache discriminator - never non-root route params (they must not split entries) and
@@ -398,35 +430,67 @@ function withRootParamKeyArgs(id: string, args: unknown[]): unknown[] {
   return [{ $pnextRootParams: rootParamEntries }, ...args]
 }
 
+export function currentUseCacheRootParams() {
+  return currentParamsSnapshot() ?? currentParams()
+}
+
 /** Test hook. */
 export function clearKnownRootParams() {
   knownRootParamsByFunctionId.clear()
 }
 
-// Next's `default` cacheLife profile, applied to a `use cache` entry that never
-// calls cacheLife(). Kept here (not read from config) so the runtime has no
-// dependency on the compat config loader; a config `expireTime`/custom default
-// override only affects explicit cacheLife() calls (see compat/next/cache.ts).
 const DEFAULT_REVALIDATE_SECONDS = 900
+const INFINITE_CACHE_SECONDS = 0xfffffffe
 const DEFAULT_EXPIRE_SECONDS = 31536000
 const DEFAULT_STALE_SECONDS = 300
+
+function implicitCacheLife(): Required<CacheLifeStash> {
+  const profile = (getNextConfig().cacheLife as Record<string, CacheLifeStash> | undefined)?.default
+  return {
+    revalidateSeconds: normalizeCacheDuration(
+      profile?.revalidateSeconds ?? (profile as { revalidate?: number } | undefined)?.revalidate,
+      DEFAULT_REVALIDATE_SECONDS,
+    ),
+    expireSeconds: normalizeCacheDuration(
+      profile?.expireSeconds ?? (profile as { expire?: number } | undefined)?.expire,
+      DEFAULT_EXPIRE_SECONDS,
+    ),
+    staleSeconds: normalizeCacheDuration(
+      profile?.staleSeconds ?? (profile as { stale?: number } | undefined)?.stale,
+      DEFAULT_STALE_SECONDS,
+    ),
+  }
+}
+
+function normalizeCacheDuration(value: number | undefined, fallback: number): number {
+  if (value === Infinity) return INFINITE_CACHE_SECONDS
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
 
 // A runtime prefetch (`unstable_instant`) includes a `use cache` scope only when its effective STALE
 // window is at least this long; a shorter-lived cache stays a postponed hole. The threshold applies to
 // `stale` ONLY, never `expire` - a public cache with a short expire but a long stale is still included.
 const RUNTIME_PREFETCH_DYNAMIC_STALE = 30
 
-// A STATIC prerender whose output the client prefetches omits a `use cache` scope that expires inside
-// this window: data that short-lived is not worth prerendering, so its boundary stays a hole the
-// navigation fills live. Note the two thresholds read DIFFERENT fields: a runtime prefetch gates on
-// `stale` (a short-expire/long-stale cache is still prefetchable), a static prefetch shell on `expire`.
+// Static shells omit caches with short expiry as well as caches with short stale windows.
 const PREFETCH_SHELL_DYNAMIC_EXPIRE = 300
+const PREFETCH_SHELL_DYNAMIC_STALE = 300
 
 /** How the active prerender gates a short-lived `use cache` scope, if at all. */
 function prefetchCacheGate(): 'stale' | 'expire' | null {
+  if (insideDataCacheProducer() || insideUseCacheProducer()) return null
   if (isRuntimePrefetchPrerender()) return 'stale'
-  if (isPrefetchShellPrerender()) return 'expire'
+  if (isPrefetchShellPrerender() || isTaskBoundaryPrerender()) return 'expire'
   return null
+}
+
+function cacheLifeTooShort(gate: 'stale' | 'expire', life: CacheLifeStash | undefined): boolean {
+  return (
+    (life?.staleSeconds ?? DEFAULT_STALE_SECONDS) <
+      (gate === 'stale' ? RUNTIME_PREFETCH_DYNAMIC_STALE : PREFETCH_SHELL_DYNAMIC_STALE) ||
+    (gate === 'expire' &&
+      (life?.expireSeconds ?? DEFAULT_EXPIRE_SECONDS) < PREFETCH_SHELL_DYNAMIC_EXPIRE)
+  )
 }
 
 /**
@@ -444,12 +508,7 @@ function gatePrefetchCacheLife<T>(
   // same way awaiting cookies()/params does (identity for the shell gate).
   return markRuntimeApiOnAwait(
     Promise.resolve(result).then(value => {
-      const effective = life()
-      const short =
-        gate === 'stale'
-          ? (effective?.staleSeconds ?? DEFAULT_STALE_SECONDS) < RUNTIME_PREFETCH_DYNAMIC_STALE
-          : (effective?.expireSeconds ?? DEFAULT_EXPIRE_SECONDS) < PREFETCH_SHELL_DYNAMIC_EXPIRE
-      if (short) return hangingPromise<T>('use cache')
+      if (cacheLifeTooShort(gate, life())) return hangingPromise<T>('use cache')
       return value
     }),
   )
@@ -531,9 +590,8 @@ function minDefined(a: number | undefined, b: number | undefined): number | unde
 // An explicit data-cache revalidate (e.g. `fetch(..., { next: { revalidate } })`
 // or a nested unstable_cache read) recorded while a `use cache` entry is
 // producing lowers the producing entry's own cacheLife, matching Next.
-setUseCacheRevalidateSink(seconds => {
-  recordUseCacheLife(seconds)
-})
+setUseCacheRevalidateSink(recordUseCacheLife)
+setUseCacheTagSink(recordUseCacheTags)
 
 /** cacheTag() inside a 'use cache' function: tag the active entry. */
 export function recordUseCacheTags(tags: readonly string[]): boolean {
@@ -568,14 +626,21 @@ export function recordUseCacheLife(life: number | CacheLifeStash): boolean {
 }
 
 function entryExpired(entry: UseCacheEntry) {
+  const age = realNow() - entry.storedAt
   return (
-    entry.revalidateSeconds !== undefined &&
-    realNow() - entry.storedAt >= entry.revalidateSeconds * 1000
+    (entry.revalidateSeconds !== undefined && age >= entry.revalidateSeconds * 1000) ||
+    (entry.expireSeconds !== undefined && age >= entry.expireSeconds * 1000)
   )
 }
 
 /** Propagate an entry's cache meta to the surrounding render/'use cache' scopes. */
 function propagate(entry: UseCacheEntry, parent?: UseCacheScope) {
+  if (parent) {
+    propagateToParent(entry, parent)
+    return
+  }
+  const gate = prefetchCacheGate()
+  if (gate && cacheLifeTooShort(gate, entry)) return
   const { tags, revalidateSeconds, expireSeconds, staleSeconds } = entry
   recordCacheTags(tags)
   if (revalidateSeconds !== undefined) recordCacheRevalidate(revalidateSeconds)
@@ -591,11 +656,11 @@ function propagate(entry: UseCacheEntry, parent?: UseCacheScope) {
     ...(expireSeconds !== undefined ? { expireSeconds } : {}),
     ...(staleSeconds !== undefined ? { staleSeconds } : {}),
   })
-  if (parent) propagateToParent(entry, parent)
 }
 
 function propagateToParent(entry: UseCacheEntry, parent: UseCacheScope): void {
   for (const tag of entry.tags) parent.tags.add(tag)
+  for (const name of entry.rootParamsRead ?? []) recordRootParamRead(parent, name)
   parent.revalidateSeconds = minDefined(parent.revalidateSeconds, entry.revalidateSeconds)
   parent.expireSeconds = minDefined(parent.expireSeconds, entry.expireSeconds)
   parent.staleSeconds = minDefined(parent.staleSeconds, entry.staleSeconds)
@@ -605,7 +670,7 @@ export function pnextUseCache<Args extends unknown[], Result>(
   id: string,
   fn: (...args: Args) => Result,
 ): (...args: Args) => Result {
-  const wrapper = (...args: Args): Result => {
+  const run = (...args: Args): Result => {
     const serializedArgs = installSearchParamsTripwire(serializeCacheBoundaryArgs(args), id) as Args
     // Draft mode skips cache reads/writes but KEEPS the cache-scope rules:
     // dynamic APIs (cookies()/headers()) inside 'use cache' still throw.
@@ -617,20 +682,17 @@ export function pnextUseCache<Args extends unknown[], Result>(
     const keyArgs = declaredArgs(fn, serializedArgs)
     const key = cacheKeyFor(id, withRootParamKeyArgs(id, keyArgs))
     if (isPromiseLike(key)) {
-      return key.then(
-        resolvedKey => {
-          if (resolvedKey === null) return fn(...serializedArgs)
-          return readOrProduceEntry(
-            resolvedKey,
-            id,
-            argsJsonFromKey(id, resolvedKey),
-            fn,
-            holes.args as Args,
-            holes.fills,
-          )
-        },
-        () => fn(...serializedArgs),
-      ) as Result
+      return key.then(resolvedKey => {
+        if (resolvedKey === null) return fn(...serializedArgs)
+        return readOrProduceEntry(
+          resolvedKey,
+          id,
+          argsJsonFromKey(id, resolvedKey),
+          fn,
+          holes.args as Args,
+          holes.fills,
+        )
+      }) as Result
     }
     if (key === null) return fn(...serializedArgs)
 
@@ -643,6 +705,7 @@ export function pnextUseCache<Args extends unknown[], Result>(
       holes.fills,
     )
   }
+  const wrapper = (...args: Args): Result => sinkDiscardedRejection(run(...args))
   ;(wrapper as unknown as Record<symbol, unknown>)[USE_CACHE_WRAPPER] = true
   return wrapper
 }
@@ -689,12 +752,13 @@ function installSearchParamsTripwire(args: unknown[], id: string): unknown[] {
 function withFillTimeout(value: Promise<unknown>, route: string | undefined): Promise<unknown> {
   return new Promise<unknown>((resolve, reject) => {
     const timer = setTimeout(() => {
+      const message = `Route "${route ?? ''}": ${USE_CACHE_HANGING_MESSAGE}`
       recordPrerenderError({
         kind: 'hanging',
         route: route ?? '',
-        consoleBlock: `Error: ${USE_CACHE_HANGING_MESSAGE}`,
+        consoleBlock: `Error: ${message}`,
       })
-      reject(new Error(USE_CACHE_HANGING_MESSAGE))
+      reject(new Error(message))
     }, fillTimeoutHolder().ms)
     // The timer must not keep the build process alive past the fill settling.
     if (typeof timer.unref === 'function') timer.unref()
@@ -756,20 +820,17 @@ export function pnextUseCacheBound<Args extends unknown[], Result>(
     const keyArgs = [captured, ...declaredArgs(fn, serializedArgs)]
     const key = cacheKeyFor(id, withRootParamKeyArgs(id, keyArgs))
     if (isPromiseLike(key)) {
-      return key.then(
-        resolvedKey => {
-          if (resolvedKey === null) return fn(...serializedArgs)
-          return readOrProduceEntry(
-            resolvedKey,
-            id,
-            argsJsonFromKey(id, resolvedKey),
-            fn,
-            holes.args as Args,
-            holes.fills,
-          )
-        },
-        () => fn(...serializedArgs),
-      ) as Result
+      return key.then(resolvedKey => {
+        if (resolvedKey === null) return fn(...serializedArgs)
+        return readOrProduceEntry(
+          resolvedKey,
+          id,
+          argsJsonFromKey(id, resolvedKey),
+          fn,
+          holes.args as Args,
+          holes.fills,
+        )
+      }) as Result
     }
     if (key === null) return fn(...serializedArgs)
     return readOrProduceEntry(
@@ -817,7 +878,7 @@ export function pnextUseCachePrivate<Args extends unknown[], Result>(
     // so its stale window never reaches x-nextjs-stale-time and the client
     // reuses the navigation for the page's LONGEST window instead.
     const runScoped = (call: () => Result): Result => {
-      const scope: UseCacheScope = { tags: new Set(), functionId: id }
+      const scope: UseCacheScope = { tags: new Set(), functionId: id, private: true }
       const result = scopeStorage.run(scope, call)
       const settle = () => {
         if (scope.staleSeconds !== undefined) stashCacheLife({ staleSeconds: scope.staleSeconds })
@@ -836,12 +897,10 @@ export function pnextUseCachePrivate<Args extends unknown[], Result>(
     const keyArgs = declaredArgs(fn, serializedArgs)
     const key = cacheKeyFor(id, keyArgs)
     if (isPromiseLike(key)) {
-      return key.then(
-        resolvedKey =>
-          resolvedKey === null
-            ? runScoped(() => fn(...serializedArgs))
-            : runScoped(() => privateMemo(store, resolvedKey, fn, serializedArgs)),
-        () => runScoped(() => fn(...serializedArgs)),
+      return key.then(resolvedKey =>
+        resolvedKey === null
+          ? runScoped(() => fn(...serializedArgs))
+          : runScoped(() => privateMemo(store, resolvedKey, fn, serializedArgs)),
       ) as Result
     }
     if (key === null) return runScoped(() => fn(...serializedArgs))
@@ -865,7 +924,7 @@ function runtimePrefetchPrivate<Args extends unknown[], Result>(
   fn: (...args: Args) => Result,
   args: Args,
 ): Promise<unknown> {
-  const scope: UseCacheScope = { tags: new Set(), functionId: id }
+  const scope: UseCacheScope = { tags: new Set(), functionId: id, private: true }
   const produced = (async () => await scopeStorage.run(scope, () => fn(...args)))()
   // Awaiting the private cache arms the sync-IO abort (see gatePrefetchCacheLife).
   return markRuntimeApiOnAwait(
@@ -977,6 +1036,22 @@ function serializeCacheBoundaryValue(value: unknown, stack: WeakSet<object>): un
   }
 }
 
+/**
+ * A `use cache` wrapper is a SYNC closure, so the renderer's speculative page warm - which skips async
+ * page components precisely to avoid double-running them - invokes a cached page a second time and
+ * discards the promise. A rejecting cached page (cookies() inside `use cache`) would then escape as an
+ * unhandled rejection alongside the real render's report. Attach a no-op sink so only the consumed
+ * promise (returned unchanged) carries the failure into the render error path.
+ */
+function sinkDiscardedRejection<Result>(result: Result): Result {
+  if (isPromiseLike(result)) void Promise.resolve(result).catch(noop)
+  return result
+}
+
+function noop(): undefined {
+  return undefined
+}
+
 /** Draft-mode bypass: run the producer uncached but still inside the cache
  * scope, so the dynamic-API restrictions (cookies()/headers() inside
  * 'use cache' throw) apply exactly as they do for cached production. */
@@ -997,6 +1072,9 @@ function readOrProduceEntry<Args extends unknown[], Result>(
   args: Args,
   fills: unknown[],
 ): Result {
+  if (currentPrerenderScope()?.signal.aborted) {
+    return Promise.reject(new PostponeError('use cache')) as Result
+  }
   const parent = scopeStorage.getStore()
   const modernKey = hasModernCacheHandler() ? modernCacheKey(id, argsJson) : undefined
   const resumeRecord = useCacheRdcRecords().get(key)
@@ -1024,6 +1102,7 @@ function readOrProduceEntry<Args extends unknown[], Result>(
     })
   }
   const existing = entries.get(key)
+  const pendingWrite = existing?.pendingWrite
   const meta = currentRenderCacheMeta()
   const expired = existing !== undefined && entryExpired(existing)
   // Hard on-demand invalidation: a tag update (revalidateTag/updateTag) after
@@ -1043,14 +1122,58 @@ function readOrProduceEntry<Args extends unknown[], Result>(
     meta?.refreshFetches === true &&
     existing?.refreshedIn !== meta &&
     (invalidated || swrStale || expired)
-  let modernGet: Promise<unknown> | undefined
+  let modernGet: ReturnType<typeof modernCacheGet> | undefined
   if (modernKey) {
     void modernCacheRefreshTags()
     // Keep the handler read's promise: serving an existing entry awaits it, so the handler's get() -
     // whose logs are asserted - lands on the critical path like Next's, where a custom handler IS the
     // cache. A fire-and-forget read could otherwise log only after the response already flushed.
-    modernGet = modernCacheGet(modernKey)
-    if (existing && !invalidated) void modernCacheGetExpiration()
+    modernGet = requestLocalModernCacheGet(modernKey)
+    if (!invalidated) {
+      void modernGet.then(found => {
+        if (found) return modernCacheGetExpiration()
+      }, noop)
+    }
+  }
+  const produce = (): Result => {
+    const value = produceEntry(key, id, argsJson, fn, args, parent, undefined, modernKey)
+    const out = withHoleFills(value, fills)
+    // The producing entry's cacheLife is set once `value` settles (see
+    // produceEntry); `entries.get(key)` reads it back after production.
+    const producedGate = prefetchCacheGate()
+    const gated = producedGate
+      ? gatePrefetchCacheLife(out, producedGate, () => entries.get(key))
+      : out
+    return captureUseCacheRdcResult(key, modernGet ? modernGet.then(() => gated) : gated) as Result
+  }
+  const serve = (entry: UseCacheEntry, refreshStale = true): Result => {
+    if (refreshStale && (expired || swrStale) && !pendingWrite && !entry.refreshing) {
+      // TTL expiry outside an ISR regen: serve stale while refreshing in
+      // the background (Next's SWR data-cache semantics).
+      entry.refreshing = true
+      const refresh = produceEntry(key, id, argsJson, fn, args, parent, entry, modernKey)
+      const pathname = currentRequest()?.url
+      queueAfterTask(async () => {
+        await refresh
+        await entries.get(key)?.pendingWrite
+        // eslint-disable-next-line turbo/no-undeclared-env-vars
+        if (process.env.NEXT_PRIVATE_DEBUG_CACHE && pathname) {
+          const url = new URL(pathname)
+          console.log(`pending revalidates promise finished for: ${url.pathname}${url.search}`)
+        }
+      })
+    }
+    if (parent && entry.revalidateSeconds === undefined) {
+      void entry.value.then(() => propagateToParent(entry, parent), noop)
+    }
+    propagate(entry, parent)
+    const served = withHoleFills(entry.value, fills)
+    const out = modernGet ? modernGet.then(() => served) : served
+    const servedGate = prefetchCacheGate()
+    return captureUseCacheRdcResult(
+      key,
+      servedGate ? gatePrefetchCacheLife(out, servedGate, () => entry) : out,
+    ) as Result
   }
   // A regeneration render (blockingStaleFetches) must re-produce not only
   // TTL-expired entries but also soft-stale ones (revalidateTag with a
@@ -1062,35 +1185,36 @@ function readOrProduceEntry<Args extends unknown[], Result>(
     !invalidated &&
     (!(expired || swrStale) || meta?.blockingStaleFetches !== true)
   ) {
-    if ((expired || swrStale) && !existing.refreshing) {
-      // TTL expiry outside an ISR regen: serve stale while refreshing in
-      // the background (Next's SWR data-cache semantics).
-      existing.refreshing = true
-      void produceEntry(key, id, argsJson, fn, args, parent, existing, modernKey)
+    // With a modern handler installed the HANDLER is the cache: a TTL-expired local entry may only be
+    // served stale while the handler still hands the key back (a custom handler that serves stale is
+    // what drives SWR). Next's default handler drops an entry at `revalidate` under `next start`, so
+    // there the read must re-produce instead of replaying our in-process copy.
+    if (modernGet && expired) {
+      return modernGet.then(found => {
+        if (!found) return produce()
+        const latest = entries.get(key) ?? existing
+        return serve(latest, latest === existing)
+      }) as Result
     }
-    if (modernKey && parent && existing.revalidateSeconds === undefined) {
-      void existing.value.then(
-        () => propagateToParent(existing, parent),
-        () => undefined,
-      )
-    }
-    propagate(existing, parent)
-    captureUseCacheRdcEntry(key)
-    const served = withHoleFills(existing.value, fills)
-    const out = modernGet ? modernGet.then(() => served) : served
-    const servedGate = prefetchCacheGate()
-    return (servedGate ? gatePrefetchCacheLife(out, servedGate, () => existing) : out) as Result
+    return serve(existing)
   }
 
-  const value = produceEntry(key, id, argsJson, fn, args, parent, undefined, modernKey)
-  captureUseCacheRdcEntry(key)
-  const out = withHoleFills(value, fills)
-  // The producing entry's cacheLife is set once `value` settles (see
-  // produceEntry); `entries.get(key)` reads it back after production.
-  const producedGate = prefetchCacheGate()
-  return (
-    producedGate ? gatePrefetchCacheLife(out, producedGate, () => entries.get(key)) : out
-  ) as Result
+  return produce()
+}
+
+function requestLocalModernCacheGet(key: string): ReturnType<typeof modernCacheGet> {
+  const request = currentRequest() as object | undefined
+  if (!request) return modernCacheGet(key)
+  let lookups = handlerLookups.get(request)
+  if (!lookups) {
+    lookups = new Map()
+    handlerLookups.set(request, lookups)
+  }
+  const existing = lookups.get(key)
+  if (existing) return existing
+  const lookup = modernCacheGet(key)
+  lookups.set(key, lookup)
+  return lookup
 }
 
 function produceEntry<Args extends unknown[], Result>(
@@ -1103,6 +1227,8 @@ function produceEntry<Args extends unknown[], Result>(
   serveStale?: UseCacheEntry,
   modernKey?: string,
 ): Promise<unknown> {
+  const prerenderSignal = currentPrerenderScope()?.signal
+  if (prerenderSignal?.aborted) return Promise.reject(new PostponeError('use cache'))
   const scope: UseCacheScope = { tags: new Set(), functionId: id }
   // Sample the invalidation-scope inputs at production start: the hard-tag
   // sequence (read-your-writes) and the producing route (path revalidation),
@@ -1158,9 +1284,18 @@ function produceEntry<Args extends unknown[], Result>(
         rejectModernEntry = reject
       },
     )
-    void modernCacheSet(modernKey, pendingModernEntry)
+    const write = modernCacheSet(modernKey, pendingModernEntry)
+    entry.pendingWrite = write
+    void write.then(() => {
+      entry.pendingWrite = undefined
+    })
   }
-  if (!serveStale) {
+  const discardAbortedFill = () => {
+    rejectModernEntry?.(new Error('Cache fill aborted with prerender'))
+    if (entries.get(key) === entry) entries.delete(key)
+  }
+  prerenderSignal?.addEventListener('abort', discardAbortedFill, { once: true })
+  if (!serveStale && !prerenderSignal?.aborted) {
     if (entries.size >= entriesLimit) {
       const oldest = entries.keys().next().value
       if (oldest !== undefined) entries.delete(oldest)
@@ -1169,7 +1304,13 @@ function produceEntry<Args extends unknown[], Result>(
   }
   value.then(
     produced => {
+      prerenderSignal?.removeEventListener('abort', discardAbortedFill)
+      if (prerenderSignal?.aborted) {
+        discardAbortedFill()
+        return
+      }
       entry.tags = [...scope.tags]
+      entry.rootParamsRead = scope.rootParamsRead
       // Conditional-read upgrade (Stage B-3): production may have read root
       // params that were not in this entry's key (first-ever call for the id, or
       // a newly-discovered branch-dependent read). Re-store the settled entry
@@ -1185,9 +1326,10 @@ function produceEntry<Args extends unknown[], Result>(
       // A `use cache` entry with no explicit cacheLife() takes Next's `default`
       // profile (revalidate 900, expire one year, stale 300) so its route
       // emits the SWR cache-control + x-nextjs-stale-time headers.
-      entry.revalidateSeconds = scope.revalidateSeconds ?? DEFAULT_REVALIDATE_SECONDS
-      entry.expireSeconds = scope.expireSeconds ?? DEFAULT_EXPIRE_SECONDS
-      entry.staleSeconds = scope.staleSeconds ?? DEFAULT_STALE_SECONDS
+      const implicit = implicitCacheLife()
+      entry.revalidateSeconds = scope.revalidateSeconds ?? implicit.revalidateSeconds
+      entry.expireSeconds = scope.expireSeconds ?? implicit.expireSeconds
+      entry.staleSeconds = scope.staleSeconds ?? implicit.staleSeconds
       // Persisting to a modern cache handler waits for embedded nested `use cache` vnodes to render
       // (their scopes fold tags and min cacheLife into this entry - Next resolves the entry only once
       // the whole cached tree has serialized). A fallback timer guards against a tree that is never
@@ -1223,6 +1365,7 @@ function produceEntry<Args extends unknown[], Result>(
       propagate(entry, parent)
     },
     () => {
+      prerenderSignal?.removeEventListener('abort', discardAbortedFill)
       rejectModernEntry?.()
       if (serveStale) serveStale.refreshing = false
       else if (entries.get(key) === entry) entries.delete(key)
@@ -1242,7 +1385,11 @@ function cacheKeyFor(id: string, args: unknown[]): string | Promise<string | nul
     if (isPromiseLike(keyValue)) {
       return Promise.resolve(keyValue).then(
         resolved => stringifyCacheKey(id, resolved),
-        () => null,
+        // A hanging input (a postponed request API) keeps the whole call pending.
+        (error: unknown) => {
+          if (isPostpone(error)) throw error
+          return null
+        },
       )
     }
     return stringifyCacheKey(id, keyValue)

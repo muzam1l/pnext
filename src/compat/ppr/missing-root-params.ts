@@ -13,7 +13,7 @@ import type { ResolvedConfig } from '../../config'
 import type { RouteManifestEntry } from '../../types'
 import { staticParamsFor } from '../../render/renderer'
 import { PnextBuildValidationError } from '../validation/validate'
-import { scanRootParams } from './root-params-scan'
+import { scanRootParamsForFile } from './root-params-scan'
 
 /**
  * Convert a colon route pattern (`/:lang/blog/:slug`) to the bracket form Next
@@ -64,25 +64,14 @@ export async function validateRootParamsProvided(
   config: ResolvedConfig,
   routes: RouteManifestEntry[],
 ): Promise<void> {
-  const rootParams = scanRootParams(config.appPath)
-  if (rootParams.size === 0) return
-
   const pageRoutes = routes.filter(route => route.kind === 'page' && !route.interception)
 
   for (const route of pageRoutes) {
+    const rootParams = scanRootParamsForFile(config.appPath, route.file)
     const routeRootParams = route.params.filter(name => rootParams.has(name))
     if (routeRootParams.length === 0) continue
 
-    let provided: Set<string>
-    try {
-      const staticParams = await staticParamsFor(config, route)
-      provided = providedParamKeys(staticParams.allSets)
-    } catch {
-      // A generateStaticParams that throws provides nothing — treat every root
-      // param as missing rather than masking the (more relevant) config error.
-      provided = new Set<string>()
-    }
-
+    const provided = providedParamKeys((await staticParamsFor(config, route)).allSets)
     const missing = routeRootParams.filter(name => !provided.has(name))
     if (missing.length === 0) continue
 

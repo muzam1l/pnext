@@ -1,3 +1,13 @@
+import {
+  createCookiesInUseCacheError,
+  createCookiesInUnstableCacheError,
+  createHeadersInUseCacheError,
+  createHeadersInUnstableCacheError,
+  createConnectionInPublicUseCacheError,
+  createConnectionInUnstableCacheError,
+  createSearchParamsInUseCacheError,
+} from './build-flags'
+
 // Build-time `use cache` validation error collection (COMPAT).
 //
 // Three classes of `use cache` misuse must FAIL the build with Next's exact error text (the e2e suites
@@ -12,8 +22,15 @@
 // prints Next's messages and aborts. Collection is armed only for a compat build's prerender pass, so
 // the serving runtime and pure-core builds are unaffected.
 
+import { staticNavigationRuntimeDiagnostic } from '../validation/prerender-diagnostics'
+
 export type PrerenderErrorKind =
-  'hanging' | 'close-over' | 'search-params' | 'use-cache-dynamic' | 'unstable-cache-dynamic'
+  | 'hanging'
+  | 'close-over'
+  | 'search-params'
+  | 'use-cache-dynamic'
+  | 'unstable-cache-dynamic'
+  | 'validation'
 
 export interface PrerenderError {
   kind: PrerenderErrorKind
@@ -31,11 +48,33 @@ const PRERENDER_ERROR_GLOBALS = Symbol.for('pnext.compat.prerenderErrorGlobals')
 interface PrerenderErrorState {
   collected: PrerenderError[]
   armed: boolean
+  navigationRoutes: { pattern: RegExp; page: string }[]
+}
+
+export function setNavigationPrerenderRoutes(routes: { pattern: string; page: string }[]): void {
+  state().navigationRoutes = routes.map(({ pattern, page }) => ({
+    pattern: new RegExp(`^${pattern}$`),
+    page,
+  }))
+}
+
+export function assertNavigationPrerenderAccess(route: string, api: string): void {
+  const s = state()
+  if (!s.armed) return
+  const matched = s.navigationRoutes.find(candidate => candidate.pattern.test(route))
+  if (!matched) return
+  const message = staticNavigationRuntimeDiagnostic(matched.page, api)
+  recordPrerenderError({ kind: 'validation', route: matched.page, consoleBlock: message })
+  throw new Error(message)
 }
 
 function state(): PrerenderErrorState {
   const root = globalThis as Record<PropertyKey, unknown>
-  return (root[PRERENDER_ERROR_GLOBALS] ??= { collected: [], armed: false }) as PrerenderErrorState
+  return (root[PRERENDER_ERROR_GLOBALS] ??= {
+    collected: [],
+    armed: false,
+    navigationRoutes: [],
+  }) as PrerenderErrorState
 }
 
 /** Arm collection at the start of a compat build's prerender pass. */
@@ -100,10 +139,7 @@ export function routeFromCacheId(id: string): string {
 
 // --- Next's exact error strings -------------------------------------------
 
-export const USE_CACHE_HANGING_MESSAGE =
-  'Filling a cache during prerender timed out, likely because request-specific ' +
-  'arguments such as params, searchParams, cookies() or dynamic data were used ' +
-  'inside "use cache".'
+export const USE_CACHE_HANGING_MESSAGE = `A \`"use cache"\` function took too long during prerendering. The most common cause is passing unresolved request-specific arguments, such as \`params\` or \`searchParams\`, into the cached function. Resolve the data before calling the function and pass only the values you need.\nLearn more: https://nextjs.org/docs/messages/next-request-in-use-cache`
 
 export const USE_CACHE_CLOSE_OVER_FUNCTION_MESSAGE =
   'Functions cannot be passed directly to Client Components unless you ' +
@@ -114,46 +150,30 @@ export const USE_CACHE_CLOSE_OVER_FUNCTION_MESSAGE =
 export const USE_CACHE_CLOSE_OVER_FUNCTION_BLOCK =
   `\nError: ${USE_CACHE_CLOSE_OVER_FUNCTION_MESSAGE}` + '\n  [function]' + '\n   ^^^^^^^^'
 
-/**
- * Next's E838 message: a dynamic request API (`cookies()`/`headers()`/
- * `connection()`) invoked inside a function cached with `unstable_cache()`. The
- * e2e build suite substring-matches the first sentence
- * (`Route <route> used \`<api>\` inside a function cached with \`unstable_cache()\`.`);
- * the remainder mirrors Next's full runtime text.
- */
 export function unstableCacheDynamicApiMessage(
   route: string,
   api: 'cookies()' | 'headers()' | 'connection()',
 ): string {
-  return (
-    `Route ${route} used \`${api}\` inside a function cached with ` +
-    '`unstable_cache()`. Accessing Dynamic data sources inside a cache scope is ' +
-    `not supported. If you need this data inside a cached function use \`${api}\` ` +
-    'outside of the cached function and pass the required dynamic data in as an ' +
-    'argument. See more info here: ' +
-    'https://nextjs.org/docs/app/api-reference/functions/unstable_cache'
-  )
+  const factory = {
+    'cookies()': createCookiesInUnstableCacheError,
+    'headers()': createHeadersInUnstableCacheError,
+    'connection()': createConnectionInUnstableCacheError,
+  }[api]
+  return factory(route).message
 }
 
 export function useCacheDynamicApiMessage(
   route: string,
   api: 'cookies()' | 'headers()' | 'connection()',
 ): string {
-  return (
-    `Route ${route} used \`${api}\` inside "use cache". Accessing Dynamic data ` +
-    'sources inside a cache scope is not supported. If you need this data inside ' +
-    `a cached function use \`${api}\` outside of the cached function and pass the ` +
-    'required dynamic data in as an argument. See more info here: ' +
-    'https://nextjs.org/docs/messages/next-request-in-use-cache'
-  )
+  const factory = {
+    'cookies()': createCookiesInUseCacheError,
+    'headers()': createHeadersInUseCacheError,
+    'connection()': createConnectionInPublicUseCacheError,
+  }[api]
+  return factory(route).message
 }
 
 export function useCacheSearchParamsMessage(route: string): string {
-  return (
-    `Route ${route} used \`searchParams\` inside "use cache". Accessing dynamic ` +
-    'request data inside a cache scope is not supported. If you need some search ' +
-    'params inside a cached function await `searchParams` outside of the cached ' +
-    'function and pass only the required search params as arguments to the cached ' +
-    'function. See more info here: https://nextjs.org/docs/messages/next-request-in-use-cache'
-  )
+  return createSearchParamsInUseCacheError(route).message
 }

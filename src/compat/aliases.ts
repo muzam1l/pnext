@@ -136,11 +136,7 @@ export function nextCompatAliasEntries(target: CompatAliasTarget): Record<string
     // browser bundles; the APIs are server-only in Next anyway.
     'next/cache': path.join(nextRoot, target === 'client' ? 'client-cache.ts' : 'cache.ts'),
     'next/config': path.join(nextRoot, 'config.ts'),
-    // CJS so an app `require('next/constants')` loads a genuine CommonJS module: the server runtime's
-    // onLoad transform only intercepts `[jt]sx?`, so a `.cjs` external is left to Bun's native loader
-    // and stays synchronously requirable - an ESM `.ts` external forced through that transform becomes
-    // async and require() returns undefined for every named export.
-    'next/constants': path.join(nextRoot, 'constants.cjs'),
+    'next/constants': path.join(nextRoot, 'constants.ts'),
     'next/dynamic': path.join(nextRoot, 'dynamic.tsx'),
     'next/error': path.join(nextRoot, 'error.tsx'),
     'next/font': path.join(nextRoot, 'font', 'index.ts'),
@@ -230,6 +226,13 @@ export function nextCompatAliasEntries(target: CompatAliasTarget): Record<string
   })
 }
 
+export function nextRequireAliases(): Record<string, string> {
+  const nextRoot = path.resolve(import.meta.dirname, 'next')
+  return withJsExtensionAliases({
+    'next/constants': path.join(nextRoot, 'constants.cjs'),
+  })
+}
+
 function withJsExtensionAliases(aliases: Record<string, string>) {
   const entries = { ...aliases }
   for (const [specifier, target] of Object.entries(aliases)) {
@@ -245,6 +248,7 @@ function withJsExtensionAliases(aliases: Record<string, string>) {
  */
 export function compatAliasPlugin(config: CompatConfig): Plugin {
   const aliases = compatAliases(config, 'client')
+  const requireAliases = nextCompatEnabled(config) ? nextRequireAliases() : {}
   const specifiers = Object.keys(aliases)
   return {
     name: 'pnext-compat-alias',
@@ -266,7 +270,9 @@ export function compatAliasPlugin(config: CompatConfig): Plugin {
       build.onResolve(
         { filter: new RegExp(`^(${specifiers.map(escapeRegex).join('|')})$`) },
         async args => {
-          const target = aliases[args.path]
+          const target =
+            (args.kind === 'require-call' ? requireAliases[args.path] : undefined) ??
+            aliases[args.path]
           if (!target) return undefined
           if (path.isAbsolute(target)) return { path: target }
           return build.resolve(target, {

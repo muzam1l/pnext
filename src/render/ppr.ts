@@ -436,24 +436,9 @@ function taskDeadline(): { promise: Promise<never>; cancel: () => void } {
  *     prerender is complete" message so a subscribed rejection handler observes it.
  * Either way the internal `.catch` below keeps an un-subscribed copy off the unhandled-rejection channel.
  */
-/**
- * The Error a hanging request-API promise rejects with once the prerender completes. Next names the API in
- * backticks and its Node runtime prints the error as `Error: <message>`. Bun's console inspector would
- * otherwise render an Error as lowercase `error:` plus a code frame, so a Node-style `util.inspect` custom
- * hook returns the canonical form - the request-apis e2e suite substring-matches exactly that.
- */
+/** The rejection observed by request promises after a prerender completes. */
 function prerenderCompleteError(api: string): Error {
-  const message = `During prerendering, \`${api}\` rejects when the prerender is complete.`
-  const error = new Error(message)
-  Object.defineProperty(error, Symbol.for('nodejs.util.inspect.custom'), {
-    value: () => {
-      const stackTail = (error.stack ?? '').split('\n').slice(1).join('\n')
-      return stackTail ? `Error: ${message}\n${stackTail}` : `Error: ${message}`
-    },
-    enumerable: false,
-    configurable: true,
-  })
-  return error
+  return new Error(`During prerendering, \`${api}\` rejects when the prerender is complete.`)
 }
 
 /**
@@ -623,6 +608,58 @@ export async function runWithPrerenderDeterminism<T>(fn: () => Promise<T>): Prom
     Math.random = realRandom
     // eslint-disable-next-line no-global-assign
     Date = RealDate
+  }
+}
+
+interface ClockTape {
+  values: number[]
+  replay: boolean
+  index: number
+  active: boolean
+}
+
+/** The unpatched clock, for framework timing that must never ride a render's clock tape. */
+export const frameworkNow = performance.now.bind(performance)
+
+const CLOCK_TAPE_STORAGE = Symbol.for('pnext.clockTapeStorage')
+const clockTapeStorage = ((globalThis as Record<PropertyKey, unknown>)[CLOCK_TAPE_STORAGE] ??=
+  new AsyncLocalStorage<ClockTape>()) as AsyncLocalStorage<ClockTape>
+
+function tapedNow(this: { real: () => number }): number {
+  const tape = clockTapeStorage.getStore()
+  if (!tape?.active || insideUseCacheScope()) return this.real()
+  if (tape.replay) return tape.values[tape.index++] ?? this.real()
+  const now = this.real()
+  tape.values.push(now)
+  return now
+}
+
+// Installed on first use; re-wrapped if a later shim (runtime-prefetch sync IO) restored over it.
+const TAPED_NOW = Symbol.for('pnext.tapedNow')
+type TapedClock = (() => number) & { [TAPED_NOW]?: true }
+function installClockTape(): void {
+  const current = (performance as unknown as { now: TapedClock }).now
+  if (current[TAPED_NOW]) return
+  const patched = tapedNow.bind({ real: current.bind(performance) }) as TapedClock
+  patched[TAPED_NOW] = true
+  performance.now = patched
+}
+
+/**
+ * Run `fn` recording every `performance.now()` it reads into `values`, or, with `replay`, answering
+ * them from a previous recording - so two renders of the same tree see the same prerenderable clock.
+ */
+export async function runWithClockTape<T>(
+  values: number[],
+  replay: boolean,
+  fn: () => Promise<T>,
+): Promise<T> {
+  installClockTape()
+  const tape: ClockTape = { values, replay, index: 0, active: true }
+  try {
+    return await clockTapeStorage.run(tape, fn)
+  } finally {
+    tape.active = false
   }
 }
 

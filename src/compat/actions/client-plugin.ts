@@ -104,13 +104,15 @@ export function actionClientStubPlugin(): Plugin {
     name: 'pnext-action-client-stub',
     setup(build) {
       if (paths.length === 0) return
-      build.onLoad({ filter, namespace: 'file' }, async args => {
+      const load = async (args: { path: string }) => {
         if (!isActionModule(args.path)) return undefined
         return {
           contents: await stubSourceFor(args.path, clientActionState?.root),
-          loader: 'js',
+          loader: 'js' as const,
         }
-      })
+      }
+      build.onLoad({ filter, namespace: 'file' }, load)
+      build.onLoad({ filter, namespace: 'pnext-client-source' }, load)
     },
   }
 }

@@ -36,6 +36,7 @@ import {
   endPrerenderErrorCollection,
 } from '../cache/build-prerender-errors'
 import { getNextConfig } from '../next/config-loader'
+import { emitResumeDataCacheMetadata } from '../cache/resume-data-cache'
 
 // Route kinds a `use cache` page/handler can be served as.
 const CACHEABLE_ROUTE_KINDS = new Set<ResponseFinalizerContext['routeKind']>([
@@ -53,8 +54,9 @@ const useCacheHeaderFinalizer: ResponseFinalizer = ctx => {
 
   // SWR cache-control: s-maxage = revalidate, stale-while-revalidate =
   // expire − revalidate. Emitted only when a revalidate window is known and no
-  // explicit Cache-Control was already set by the app/route.
+  // explicit Cache-Control was already set by the app/route, never for a failed render.
   if (
+    ctx.status < 500 &&
     revalidateSeconds !== undefined &&
     expireSeconds !== undefined &&
     !ctx.headers.has('cache-control')
@@ -130,4 +132,7 @@ export function registerUseCacheExtensions(config: ResolvedConfig): void {
       } (see above)`,
     )
   })
+  registerBuildCompleteHooks(({ config, manifest }) =>
+    emitResumeDataCacheMetadata(config, manifest),
+  )
 }

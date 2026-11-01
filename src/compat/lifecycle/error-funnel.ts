@@ -8,6 +8,7 @@
 // Dedupe: the same request may surface an error at both the render site and the top-level catch, so a
 // per-work-unit flag ensures the user hook fires exactly once.
 
+import { runOutsideCacheScope } from '../../request/cache'
 import { getWorkUnit } from '../../request/context'
 import { getRequestRuntime } from '../../routing/request-environment'
 import { selectRouteForRequest } from '../../routing/match'
@@ -259,10 +260,13 @@ export async function reportRequestErrorToUser(
     : buildContext(error, context, path)
 
   try {
-    await hook(
-      error,
-      { path, method: requestInfo.method, headers: headersToObject(requestInfo.headers) },
-      hookContext,
+    // The hook is not part of the render: a polling fetch must not hit the render's GET dedupe.
+    await runOutsideCacheScope(() =>
+      hook(
+        error,
+        { path, method: requestInfo.method, headers: headersToObject(requestInfo.headers) },
+        hookContext,
+      ),
     )
   } catch (hookError) {
     console.error('instrumentation onRequestError failed:', hookError)
@@ -297,6 +301,6 @@ export function installUnhandledRejectionGuard(): void {
   guardInstalled = true
   process.on('unhandledRejection', (reason: unknown) => {
     if (isControlFlowError(reason)) return
-    if (markErrorLogged(reason)) console.error(reason)
+    if (markErrorLogged(reason)) console.error('⨯ unhandledRejection:', reason)
   })
 }

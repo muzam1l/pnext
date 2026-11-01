@@ -18,7 +18,8 @@
 // Registered by ../register/segment.ts, which wires the exports below into the extension registries.
 
 import type { ResolvedConfig } from '../../config'
-import type { RouteManifestEntry } from '../../types'
+import { paramSetMatches } from '../static-params'
+import type { RouteManifestEntry, RouteParamValue } from '../../types'
 import { nextCompatEnabled } from '../../compat/aliases'
 import {
   getRenderExtensions,
@@ -29,6 +30,7 @@ import {
   withRouteRuntime,
 } from '../../extensions'
 import { getRequestRuntime } from '../../routing/request-environment'
+import { redirectInterceptor } from '../actions/extensions'
 import { takeCacheLifeStash } from '../cache/use-cache'
 import { matchInterception, parseNavState, selectRouteForRequest } from '../../routing/match'
 import {
@@ -152,7 +154,16 @@ function staleTimeSecondsFor(isStatic: boolean): number {
 /** The segment-prefetch header value, or null when this isn't a segment prefetch. */
 function segmentPrefetchTarget(request: Request): string | null {
   if (request.headers.get(RSC_HEADER) !== '1') return null
+  // A runtime prefetch (`next-router-prefetch: 2`) asks for the whole route body.
+  if (runtimePrefetchRequest(request)) return '/_index'
   return request.headers.get(NEXT_ROUTER_SEGMENT_PREFETCH_HEADER)
+}
+
+function runtimePrefetchRequest(request: Request): boolean {
+  return (
+    request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) === '2' &&
+    !request.headers.has(NEXT_ROUTER_SEGMENT_PREFETCH_HEADER)
+  )
 }
 
 let segmentRevalidationVersion = 0
@@ -208,6 +219,9 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
   const method = request.method.toUpperCase()
   if (method !== 'GET' && method !== 'HEAD') return undefined
   if (segment === null && request.headers.has('x-pnext-soft-nav')) return undefined
+  // next.config redirects precede every RSC response, as on the full-render path.
+  const redirect = await redirectInterceptor(request, ctx)
+  if (redirect) return redirect
 
   const runtime = getRequestRuntime()
   if (!runtime) return undefined
@@ -233,7 +247,7 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
 
   // The `_rsc` cache-buster is a CDN key, not an app param: it never reaches
   // route matching.
-  const selection = selectRouteForRequest(runtime.routes, matchPathname, undefined)
+  const selection = selectRouteForRequest(runtime.routes, matchPathname, undefined, request.headers)
 
   // A pnext-router prefetch carries the origin's nav state. When an
   // interception entry targets this URL from that origin, the segment/RSC
@@ -245,7 +259,7 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
   if (
     prefetchNav &&
     ((prefetchNav.children &&
-      matchInterception(runtime.routes, matchPathname, prefetchNav.children)) ||
+      matchInterception(runtime.routes, matchPathname, prefetchNav.children, request.headers)) ||
       (selection?.route.kind === 'page' &&
         (selection.route.slotDirs?.length || selection.route.synthetic)))
   ) {
@@ -449,8 +463,7 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
     // and marked so the requesting client still treats it as a shell (the
     // navigation fetches the dynamic continuation).
     const partialPrefetchDowngrade =
-      request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) !== '1' &&
-      routePartialPrefetch(selection.route)
+      !request.headers.has(NEXT_ROUTER_PREFETCH_HEADER) && routePartialPrefetch(selection.route)
     const partialPrefetch =
       request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) === '1' || partialPrefetchDowngrade
     const runtimePrefetch = routeUsesRuntimePrefetch(selection.route)
@@ -512,9 +525,11 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
       // callers. Both mean the whole-route body.
       (segment === ROUTE_SEGMENT_PATH || segment === '/_index') &&
       !partialPrefetchDowngrade &&
-      routeRuntimePrefetchRender(selection.route)
+      (runtimePrefetchRequest(request) || routeRuntimePrefetchRender(selection.route))
     ) {
-      const fallbackParams = appShellFallbackParams(selection.route)
+      // A runtime prefetch (`2`) is this URL's own: its params resolve even under App Shells.
+      const fallbackParams =
+        !runtimePrefetchRequest(request) && appShellFallbackParams(selection.route)
       const instant = await renderInstantPrefetchShell({
         config,
         selection,
@@ -581,6 +596,7 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
         // itself stays `postponed` on the wire: it is request-sampled, so it must never become
         // CDN-cacheable nor commit through the whole-document caches.
         if (!instant.postponed) response.headers.set('x-pnext-runtime-complete', '1')
+        if (runtimePrefetchRequest(request)) response.headers.set('cache-control', 'no-store')
         return withRewriteHeaders(response, rewriteHeaders)
       }
     }
@@ -1074,7 +1090,7 @@ function routeParamPrerendered(
     const keys = Object.keys(set)
     return (
       keys.length === Object.keys(params).length &&
-      keys.every(key => String(set[key]) === String(params[key]))
+      paramSetMatches(set, params as Record<string, RouteParamValue>, keys)
     )
   })
 }
@@ -1121,8 +1137,10 @@ function subShellVary(
   params: Record<string, unknown>,
 ): ResponseVaryParams | undefined {
   const shell = route.pprSubShells?.find(candidate =>
-    Object.entries(candidate.concreteParams).every(
-      ([name, value]) => String(value) === String(params[name]),
+    paramSetMatches(
+      candidate.concreteParams,
+      params as Record<string, RouteParamValue>,
+      Object.keys(candidate.concreteParams),
     ),
   )
   const names = Object.keys(shell?.concreteParams ?? {}).sort()
@@ -1169,7 +1187,9 @@ function routeExplicitRuntimePrefetch(route: RouteManifestEntry): boolean {
 function routeRuntimePrefetchRender(route: RouteManifestEntry): boolean {
   const config = route.segmentConfig
   if (config?.unstableInstant === false) return false
-  return config?.unstableInstant === true || config?.prefetch === 'allow-runtime'
+  // Stable `instant` alone keeps a full prefetch full (Next 16.4); `unstable_instant` or a prefetch export opts in.
+  if (config?.unstableInstant === true && !config.stableInstant) return true
+  return config?.prefetch === 'allow-runtime'
 }
 
 function routeUsesRuntimePrefetch(route: RouteManifestEntry): boolean {
@@ -1495,6 +1515,7 @@ async function regenerateStaleSegment({
       route: selection.route,
       params: selection.params,
       url,
+      boundedRegen: true,
     })
     if (shell !== null) {
       await writeFile(file, shell)
@@ -1512,6 +1533,7 @@ async function regenerateStaleSegment({
           params: selection.params,
           url,
           runtimeRegen: true,
+          boundedRegen: true,
         }),
       ),
     {

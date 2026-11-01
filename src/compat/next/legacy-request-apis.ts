@@ -86,7 +86,7 @@ function warnSyncAccess(expression: string, subject: string, noun: 'value' | 'pr
   warned.add(key)
   console.warn(
     `${route ? `Route "${route}" ` : 'This route '}used ${expression}. ` +
-      `\`${subject}\` should be awaited before using its ${noun}. ` +
+      `\`${subject}\` returns a Promise and must be unwrapped with \`await\` or \`React.use()\` before accessing its ${noun}. ` +
       'Learn more: https://nextjs.org/docs/messages/sync-dynamic-apis',
   )
 }

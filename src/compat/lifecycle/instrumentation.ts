@@ -29,15 +29,9 @@ import { build } from '../../utils/esbuild'
 import type { ResolvedConfig } from '../../config'
 import { resolveExternalLoadTarget } from '../../resolve/imports'
 import { compatAliases, reactServerLayerAliases } from '../aliases'
+import { nextPageExtensions } from '../next/config-loader'
+import { getOtelApi } from '../otel/api'
 import { productionRelease } from '../../runtime/production'
-
-const INSTRUMENTATION_BASENAMES = [
-  'instrumentation.ts',
-  'instrumentation.mts',
-  'instrumentation.js',
-  'instrumentation.mjs',
-  'instrumentation.tsx',
-]
 
 /**
  * The instrumentation bundle keeps node_modules external, so every bare specifier it emits is resolved
@@ -114,6 +108,12 @@ export function getUserOnRequestError(): OnRequestErrorHook | undefined {
   return loaded?.onRequestError
 }
 
+/** Test-only reset: the gate is first-caller-wins, and one test process boots many apps. */
+export function resetInstrumentationForTest(): void {
+  loaded = undefined
+  readyGate = undefined
+}
+
 /** Resolve once instrumentation register() has completed (or there is none). */
 export function instrumentationReady(): Promise<void> {
   return readyGate ?? Promise.resolve()
@@ -121,7 +121,8 @@ export function instrumentationReady(): Promise<void> {
 
 function findInstrumentation(config: ResolvedConfig): string | undefined {
   for (const root of instrumentationLookupRoots(config)) {
-    for (const name of INSTRUMENTATION_BASENAMES) {
+    for (const ext of nextPageExtensions()) {
+      const name = `instrumentation.${ext}`
       const candidate = path.join(root, name)
       if (existsSync(candidate)) return candidate
     }
@@ -237,7 +238,7 @@ export function loadInstrumentation(config: ResolvedConfig): void {
   if (readyGate) return
   const released = productionRelease(config)
   if (released) {
-    readyGate = registerReleased(released.instrumentation)
+    readyGate = registerReleased(config, released.instrumentation)
     return
   }
   const file = findInstrumentation(config)
@@ -253,8 +254,7 @@ export function loadInstrumentation(config: ResolvedConfig): void {
 
       // eslint-disable-next-line turbo/no-undeclared-env-vars
       if (!process.env.NEXT_RUNTIME) process.env.NEXT_RUNTIME = 'nodejs'
-      loaded = await importInstrumentation(file, config)
-      await loaded.register?.()
+      await registerNodeInstrumentation(config, () => importInstrumentation(file, config))
       if (appHasEdgeEntities(config)) await runEdgeRegisterPass(file, config)
     } catch (error) {
       console.error('instrumentation register() failed:', error)
@@ -262,20 +262,89 @@ export function loadInstrumentation(config: ResolvedConfig): void {
   })()
 }
 
+async function registerNodeInstrumentation(
+  config: ResolvedConfig,
+  load: () => Promise<InstrumentationModule>,
+): Promise<void> {
+  const now = () => performance.timeOrigin + performance.now()
+  const loadStart = now()
+  let loadEnd: number | undefined
+  let registerStart: number | undefined
+  let failure: unknown
+  try {
+    loaded = await load()
+    loadEnd = now()
+    if (loaded.register) {
+      registerStart = now()
+      await loaded.register()
+    }
+  } catch (error) {
+    failure = error
+    throw error
+  } finally {
+    const end = now()
+    const api = getOtelApi(config.root)
+    if (api) {
+      const emit = (type: string, name: string, start: number, finish: number, error?: unknown) => {
+        const span = api.trace.getTracer('next.js', '0.0.1').startSpan(
+          name,
+          {
+            startTime: start,
+            attributes: {
+              'next.span_category': 'nextjs',
+              'next.span_type': type,
+              'next.span_name': name,
+            },
+          },
+          api.ROOT_CONTEXT,
+        )
+        if (error !== undefined) {
+          span.recordException(error)
+          if (error instanceof Error) span.setAttribute('error.type', error.name)
+          span.setStatus({
+            code: api.SpanStatusCode.ERROR,
+            message: error instanceof Error ? error.message : undefined,
+          })
+        } else {
+          span.setStatus({ code: api.SpanStatusCode.UNSET })
+        }
+        span.end(finish)
+      }
+      emit(
+        'Instrumentation.loadModule',
+        'load instrumentation module',
+        loadStart,
+        loadEnd ?? end,
+        loadEnd === undefined ? failure : undefined,
+      )
+      if (registerStart !== undefined) {
+        emit('Instrumentation.register', 'register instrumentation', registerStart, end, failure)
+      }
+    }
+  }
+}
+
 /** A release's prebuilt instrumentation: register() on the node instance, then the edge instance. */
-async function registerReleased(instrumentation: { file?: string; edge?: string } | undefined) {
+async function registerReleased(
+  config: ResolvedConfig,
+  instrumentation: { file?: string; edge?: string } | undefined,
+) {
   if (!instrumentation?.file) return
   try {
     // eslint-disable-next-line turbo/no-undeclared-env-vars
     if (!process.env.NEXT_RUNTIME) process.env.NEXT_RUNTIME = 'nodejs'
-    loaded = (await import(pathToFileURL(instrumentation.file).href)) as InstrumentationModule
-    await loaded.register?.()
+    await registerNodeInstrumentation(
+      config,
+      () => import(pathToFileURL(instrumentation.file!).href),
+    )
     if (instrumentation.edge) {
+      const nodeGlobals = globalDescriptors()
       await withEdgeRuntime(async () => {
         const edgeInstance = (await import(
           pathToFileURL(instrumentation.edge!).href
         )) as InstrumentationModule
         await edgeInstance.register?.()
+        installRuntimeScopedGlobals(nodeGlobals, globalDescriptors())
       }, 'instrumentation register() (edge pass) failed:')
     }
   } catch (error) {
@@ -289,9 +358,11 @@ async function registerReleased(instrumentation: { file?: string; edge?: string 
  * global registration and keeps the first.
  */
 async function runEdgeRegisterPass(file: string, config: ResolvedConfig): Promise<void> {
+  const nodeGlobals = globalDescriptors()
   await withEdgeRuntime(async () => {
     const edgeInstance = await importInstrumentation(file, config, '.edge')
     await edgeInstance.register?.()
+    installRuntimeScopedGlobals(nodeGlobals, globalDescriptors())
   }, 'instrumentation register() (edge pass) failed:')
 }
 
@@ -316,6 +387,64 @@ async function withEdgeRuntime(task: () => Promise<void>, failure: string): Prom
   }
 }
 
+type GlobalDescriptorMap = Map<PropertyKey, PropertyDescriptor>
+
+function globalDescriptors(): GlobalDescriptorMap {
+  const descriptors: GlobalDescriptorMap = new Map()
+  for (const key of Reflect.ownKeys(globalThis)) {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, key)
+    if (descriptor) descriptors.set(key, descriptor)
+  }
+  return descriptors
+}
+
+function descriptorsEqual(
+  a: PropertyDescriptor | undefined,
+  b: PropertyDescriptor | undefined,
+): boolean {
+  return (
+    a?.value === b?.value &&
+    a?.get === b?.get &&
+    a?.set === b?.set &&
+    a?.enumerable === b?.enumerable &&
+    a?.configurable === b?.configurable &&
+    a?.writable === b?.writable
+  )
+}
+
+function edgeRuntimeActive(): boolean {
+  // eslint-disable-next-line turbo/no-undeclared-env-vars
+  return process.env.NEXT_RUNTIME === 'edge'
+}
+
+function installRuntimeScopedGlobals(node: GlobalDescriptorMap, edge: GlobalDescriptorMap): void {
+  const keys = new Set([...node.keys(), ...edge.keys()])
+  for (const key of keys) {
+    const nodeDescriptor = node.get(key)
+    const edgeDescriptor = edge.get(key)
+    if (descriptorsEqual(nodeDescriptor, edgeDescriptor)) continue
+    if (
+      (nodeDescriptor !== undefined && !nodeDescriptor.configurable) ||
+      (edgeDescriptor !== undefined && !edgeDescriptor.configurable)
+    ) {
+      continue
+    }
+    if (!('value' in (nodeDescriptor ?? {})) && nodeDescriptor !== undefined) continue
+    if (!('value' in (edgeDescriptor ?? {})) && edgeDescriptor !== undefined) continue
+    let nodeValue: unknown = nodeDescriptor?.value as unknown
+    let edgeValue: unknown = edgeDescriptor?.value as unknown
+    Object.defineProperty(globalThis, key, {
+      configurable: true,
+      enumerable: nodeDescriptor?.enumerable ?? edgeDescriptor?.enumerable ?? false,
+      get: (): unknown => (edgeRuntimeActive() ? edgeValue : nodeValue),
+      set: (value: unknown) => {
+        if (edgeRuntimeActive()) edgeValue = value
+        else nodeValue = value
+      },
+    })
+  }
+}
+
 const SOURCE_FILE_RE = /\.(?:ts|tsx|js|jsx|mjs|mts|cjs|cts)$/
 // `export const runtime = 'edge'` (app router) or `config = { runtime:
 // 'edge' | 'experimental-edge' }` (pages router / API routes).
@@ -331,7 +460,7 @@ function appHasEdgeEntities(config: ResolvedConfig): boolean {
   const roots = [config.root, path.join(config.root, 'src')]
   for (const root of roots) {
     for (const name of ['middleware', 'proxy']) {
-      for (const ext of ['ts', 'js', 'mts', 'mjs']) {
+      for (const ext of nextPageExtensions()) {
         if (existsSync(path.join(root, `${name}.${ext}`))) return true
       }
     }

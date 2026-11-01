@@ -1,5 +1,5 @@
-import { existsSync, readFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
+import { readFileSync } from 'node:fs'
+import { createRequire, SourceMap } from 'node:module'
 import path from 'node:path'
 import { format } from 'node:util'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -30,9 +30,11 @@ interface ModernCacheHandler {
 interface ModernCacheHandlerState {
   handler?: ModernCacheHandler
   installedFor?: string
+  sourceMap?: SourceMap
 }
 
 const MODERN_CACHE_HANDLER_STATE = Symbol.for('pnext.compat.modernCacheHandler')
+const DEFAULT_HANDLER_ID = '<default>'
 
 function state(): ModernCacheHandlerState {
   const global = globalThis as typeof globalThis & {
@@ -41,20 +43,36 @@ function state(): ModernCacheHandlerState {
   return (global[MODERN_CACHE_HANDLER_STATE] ??= {})
 }
 
-export function installModernCacheHandlers(root: string): void {
+export async function installModernCacheHandlers(root: string): Promise<void> {
   const configured = defaultCacheHandlerPath()
   const current = state()
   if (!configured) {
-    current.handler = undefined
-    current.installedFor = undefined
+    if (current.installedFor === DEFAULT_HANDLER_ID) return
+    current.handler = createDefaultExternalHandler()
+    current.installedFor = DEFAULT_HANDLER_ID
+    current.sourceMap = undefined
     return
   }
   const filePath = resolveHandlerPath(configured, root)
   if (current.installedFor === filePath) return
-  const loaded = loadHandler(filePath, root)
-  if (!loaded) return
+  const loaded = await loadHandler(filePath, root)
+  if (!loaded) {
+    current.handler = undefined
+    current.installedFor = undefined
+    throw new TypeError(`Cache handler ${filePath} must export a handler object`)
+  }
   current.handler = loaded
   current.installedFor = filePath
+  const encodedMap = /\/\/# sourceMappingURL=data:application\/json;base64,(\S+)/.exec(
+    readFileSync(filePath, 'utf8'),
+  )?.[1]
+  current.sourceMap = encodedMap
+    ? new SourceMap(
+        JSON.parse(Buffer.from(encodedMap, 'base64').toString()) as ConstructorParameters<
+          typeof SourceMap
+        >[0],
+      )
+    : undefined
 }
 
 export function hasModernCacheHandler(): boolean {
@@ -81,8 +99,8 @@ export async function modernCacheGet(
   if (!handler || !get) return undefined
   try {
     return await withNodeConsoleFormat(() => get.call(handler, key, softTags))
-  } catch {
-    return undefined
+  } catch (error) {
+    throw normalizeHandlerError(error, 'get')
   }
 }
 
@@ -95,9 +113,34 @@ export async function modernCacheSet(
   if (!handler || !set) return
   try {
     await withNodeConsoleFormat(() => set.call(handler, key, pendingEntry))
-  } catch {
-    // best-effort
+  } catch (error) {
+    // eslint-disable-next-line turbo/no-undeclared-env-vars
+    if (!process.env.__NEXT_DEV_SERVER) console.error(normalizeHandlerError(error, 'set'))
   }
+}
+
+function normalizeHandlerError(error: unknown, method: 'get' | 'set'): unknown {
+  const handlerPath = state().installedFor
+  if (
+    !(error instanceof Error) ||
+    !error.stack ||
+    !handlerPath ||
+    handlerPath === DEFAULT_HANDLER_ID
+  ) {
+    return error
+  }
+  const escaped = handlerPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const frame = new RegExp(`\\s+at ${method} \\((?:file://)?${escaped}:(\\d+):(\\d+)\\)`)
+  error.stack = error.stack
+    .replace(frame, (_match, line: string, column: string) => {
+      const entry = state().sourceMap?.findEntry(Number(line) - 1, Number(column) - 1)
+      if (entry && 'originalSource' in entry && entry.originalSource) {
+        return `\n    at Object.${method} (${path.basename(entry.originalSource)}:${entry.originalLine + 1}:${entry.originalColumn + 1})`
+      }
+      return `\n    at Object.${method} (${path.basename(handlerPath)}:${line}:${Math.max(1, Number(column) - 4)})`
+    })
+    .replace(/\n\s+at withNodeConsoleFormat \(/, '\n    at <unknown> (')
+  return error
 }
 
 export async function modernCacheGetExpiration(
@@ -152,7 +195,7 @@ export function modernCacheKey(id: string, argsJson: string): string {
   // suites match them with `([0-9a-f]{2})+` — an odd-length (leading-zero
   // trimmed) hash would never match.
   const hash = Bun.hash.wyhash(`${id}:${argsJson}`).toString(16).padStart(16, '0')
-  return JSON.stringify([buildId, hash, JSON.parse(argsJson)])
+  return JSON.stringify([hash, JSON.parse(argsJson), [buildId]])
 }
 
 export function modernCacheEntry(input: {
@@ -182,6 +225,7 @@ export function clearModernCacheHandlerForTest(): void {
   const current = state()
   current.handler = undefined
   current.installedFor = undefined
+  current.sourceMap = undefined
 }
 
 function defaultCacheHandlerPath(): string | undefined {
@@ -194,22 +238,24 @@ function defaultCacheHandlerPath(): string | undefined {
 
 function resolveHandlerPath(configured: string, root: string): string {
   const resolved = configured.startsWith('file:') ? fileURLToPath(configured) : configured
-  if (path.isAbsolute(resolved)) return resolved
-  return path.resolve(root, resolved)
+  const filePath = path.resolve(root, resolved)
+  try {
+    return createRequire(pathToFileURL(`${root}/index.js`).href).resolve(filePath)
+  } catch {
+    return filePath
+  }
 }
 
-function loadHandler(filePath: string, root: string): ModernCacheHandler | undefined {
-  if (!existsSync(filePath)) return undefined
+async function loadHandler(
+  filePath: string,
+  root: string,
+): Promise<ModernCacheHandler | undefined> {
   try {
+    return pickHandler(await import(pathToFileURL(filePath).href))
+  } catch (error) {
+    if (filePath.endsWith('.mjs') || !isNextDistMissing(error)) throw error
     const require = createRequire(pathToFileURL(`${root}/index.js`).href)
-    try {
-      return pickHandler(require(filePath))
-    } catch (error) {
-      if (!isNextDistMissing(error)) return undefined
-      return loadCommonJsHandlerWithNextStubs(filePath, require)
-    }
-  } catch {
-    return undefined
+    return loadCommonJsHandlerWithNextStubs(filePath, require)
   }
 }
 
@@ -217,39 +263,35 @@ function loadCommonJsHandlerWithNextStubs(
   filePath: string,
   rootRequire: NodeRequire,
 ): ModernCacheHandler | undefined {
-  try {
-    const module = { exports: {} as unknown }
-    const localRequire = (specifier: string): unknown => {
-      if (specifier === 'next/dist/server/lib/cache-handlers/default.external') {
-        return { default: createDefaultExternalHandler() }
-      }
-      if (specifier.startsWith('next/dist/')) return {}
-      if (specifier.startsWith('./') || specifier.startsWith('../')) {
-        return rootRequire(path.resolve(path.dirname(filePath), specifier))
-      }
-      return rootRequire(specifier)
+  const module = { exports: {} as unknown }
+  const localRequire = (specifier: string): unknown => {
+    if (specifier === 'next/dist/server/lib/cache-handlers/default.external') {
+      return { default: createDefaultExternalHandler() }
     }
-    const source = readFileSync(filePath, 'utf8')
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval
-    const evaluate = new Function(
-      'require',
-      'module',
-      'exports',
-      '__filename',
-      '__dirname',
-      source,
-    ) as (
-      require: (specifier: string) => unknown,
-      module: { exports: unknown },
-      exports: unknown,
-      filename: string,
-      dirname: string,
-    ) => void
-    evaluate(localRequire, module, module.exports, filePath, path.dirname(filePath))
-    return pickHandler(module.exports)
-  } catch {
-    return undefined
+    if (specifier.startsWith('next/dist/')) return {}
+    if (specifier.startsWith('./') || specifier.startsWith('../')) {
+      return rootRequire(path.resolve(path.dirname(filePath), specifier))
+    }
+    return rootRequire(specifier)
   }
+  const source = readFileSync(filePath, 'utf8')
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval
+  const evaluate = new Function(
+    'require',
+    'module',
+    'exports',
+    '__filename',
+    '__dirname',
+    source,
+  ) as (
+    require: (specifier: string) => unknown,
+    module: { exports: unknown },
+    exports: unknown,
+    filename: string,
+    dirname: string,
+  ) => void
+  evaluate(localRequire, module, module.exports, filePath, path.dirname(filePath))
+  return pickHandler(module.exports)
 }
 
 function isNextDistMissing(error: unknown): boolean {
@@ -265,15 +307,62 @@ function pickHandler(mod: unknown): ModernCacheHandler | undefined {
   return candidate && typeof candidate === 'object' ? candidate : undefined
 }
 
-function createDefaultExternalHandler(): ModernCacheHandler {
+export function createDefaultExternalHandler(): ModernCacheHandler {
   const entries = new Map<string, ModernCacheEntry>()
+  const pendingSets = new Map<string, Promise<void>>()
   const tagExpirations = new Map<string, number>()
+  // eslint-disable-next-line turbo/no-undeclared-env-vars
+  const debug = process.env.NEXT_PRIVATE_DEBUG_CACHE
+    ? console.debug.bind(console, 'DefaultCacheHandler:')
+    : undefined
   return {
-    get(cacheKey) {
-      return entries.get(cacheKey)
+    async get(cacheKey) {
+      const pending = pendingSets.get(cacheKey)
+      if (pending) {
+        debug?.('get', cacheKey, 'pending')
+        await pending
+      }
+      const entry = entries.get(cacheKey)
+      if (!entry) {
+        debug?.('get', cacheKey, 'not found')
+        return undefined
+      }
+      // eslint-disable-next-line turbo/no-undeclared-env-vars
+      const maxAge = process.env.__NEXT_DEV_SERVER ? Math.max(entry.expire, 300) : entry.revalidate
+      if (realNow() >= entry.timestamp + maxAge * 1000) {
+        debug?.('get', cacheKey, 'expired')
+        return undefined
+      }
+      const [value, saved] = entry.value.tee()
+      entry.value = saved
+      debug?.('get', cacheKey, 'found')
+      return { ...entry, value }
     },
     async set(cacheKey, pendingEntry) {
-      entries.set(cacheKey, await pendingEntry)
+      debug?.('set', cacheKey, 'start')
+      let settle: (() => void) | undefined
+      const pending = new Promise<void>(resolve => {
+        settle = resolve
+      })
+      pendingSets.set(cacheKey, pending)
+      try {
+        const entry = await pendingEntry
+        // eslint-disable-next-line turbo/no-undeclared-env-vars
+        if (!process.env.__NEXT_DEV_SERVER && entry.expire === 0) {
+          debug?.('set', cacheKey, 'skipped dynamic entry')
+          return
+        }
+        const [value, saved] = entry.value.tee()
+        entry.value = saved
+        await drainStream(value)
+        entries.set(cacheKey, entry)
+        debug?.('set', cacheKey, 'done')
+      } catch (error) {
+        debug?.('set', cacheKey, 'failed', error)
+      } finally {
+        settle?.()
+        pendingSets.delete(cacheKey)
+      }
     },
     refreshTags() {
       return undefined
@@ -288,6 +377,11 @@ function createDefaultExternalHandler(): ModernCacheHandler {
       for (const tag of tags) tagExpirations.set(tag, now)
     },
   }
+}
+
+async function drainStream(stream: ReadableStream<Uint8Array>): Promise<void> {
+  const reader = stream.getReader()
+  while (!(await reader.read()).done) continue
 }
 
 function implicitSoftTags(): string[] {

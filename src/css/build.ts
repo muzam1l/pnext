@@ -125,13 +125,14 @@ export async function runPostcssOffThread(
   cssFile: string,
   options: { dev?: boolean },
   from?: string,
+  dependencies?: string[],
 ) {
   const dev = options.dev ?? false
   const { root } = config
   const outDir = scanOutDir(config, dev)
-  const sent = send(id => ({ kind: 'process', id, root, dev, outDir, cssFile, from }))
+  const sent = send(id => ({ kind: 'process', id, root, dev, outDir, cssFile, from, dependencies }))
   if (sent) return sent
-  return runPostcss(root, cssFile, { dev, outDir }, from)
+  return runPostcss(root, cssFile, { dev, outDir }, from, dependencies)
 }
 
 /**
@@ -175,6 +176,20 @@ export function globalCssSources(
 // (via globalCssHref) whether the app has global CSS at all. Memoize per root+appPath; dev clears
 // this on save (invalidateDevCaches), prod sources never change in-process.
 const globalCssSourceCache = new Map<string, string[]>()
+let sourcesVersion = 0
+
+export function globalCssSourcesVersion() {
+  return sourcesVersion
+}
+
+export function memoizedGlobalCssSources(
+  config: Pick<ResolvedConfig, 'root' | 'appPath' | 'workspaceRoot'>,
+) {
+  return (
+    globalCssSourceCache.get(`${config.root}\0${config.appPath}\0${config.workspaceRoot ?? ''}`) ??
+    []
+  )
+}
 
 /**
  * Restart half of the walk above: the store persists the answer keyed by every
@@ -200,6 +215,7 @@ export function globalCssSourcesForPaths(root: string, appPath: string, workspac
   const stored = globalCssStore?.load(key)
   if (stored) {
     globalCssSourceCache.set(key, stored)
+    sourcesVersion++
     return stored
   }
 
@@ -217,6 +233,7 @@ export function globalCssSourcesForPaths(root: string, appPath: string, workspac
 
   const resolved = [...sources].map(file => path.resolve(file))
   globalCssSourceCache.set(key, resolved)
+  sourcesVersion++
   // The answer depends on every file the walk READ (a new `import './x.css'`
   // anywhere in the layout graph changes its importer's bytes) and on every
   // path it found ABSENT (restoring one while the server was down would add an
@@ -228,6 +245,7 @@ export function globalCssSourcesForPaths(root: string, appPath: string, workspac
 /** Drop the memoized layout-graph walk (dev save invalidation). */
 export function clearGlobalCssSourceCache() {
   globalCssSourceCache.clear()
+  sourcesVersion++
 }
 
 function collectGlobalCssSources(
@@ -300,7 +318,7 @@ export async function buildGlobalCss(config: ResolvedConfig, options: CssBuildOp
   )
 
   const postcss = hasPostcssConfig(config.root)
-  await log.step('global css: esbuild bundle', () =>
+  const { metafile } = await log.step('global css: esbuild bundle', () =>
     build({
       stdin: {
         contents: stdinImports(config.root, sources),
@@ -310,6 +328,7 @@ export async function buildGlobalCss(config: ResolvedConfig, options: CssBuildOp
       },
       outfile,
       bundle: true,
+      metafile: postcss,
       minify: !options.dev,
       conditions: ['style', 'browser'],
       assetNames: 'files/[name]-[hash]',
@@ -335,8 +354,12 @@ export async function buildGlobalCss(config: ResolvedConfig, options: CssBuildOp
   )
   if (postcss) {
     await rewriteTailwindConfigDirectives(outfile, sources)
+    // Every bundled file, nested @imports included; the stdin entry is keyed by its sourcefile.
+    const bundled = Object.keys(metafile?.inputs ?? {})
+      .filter(input => input !== 'global.css')
+      .map(input => path.resolve(input))
     await log.step('global css: postcss', () =>
-      runPostcssOffThread(config, outfile, options, sources[0]),
+      runPostcssOffThread(config, outfile, options, sources[0], bundled),
     )
   }
 

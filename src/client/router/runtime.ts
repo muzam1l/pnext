@@ -20,6 +20,7 @@ import {
 import {
   exportDocumentFetcher,
   loadingShellPredictionPolicy,
+  navigationHistoryPolicy,
   prefetchStaleTimePolicy,
   prefetchStaleTimeMs,
   revalidationPrefetchDelayMs,
@@ -42,6 +43,7 @@ import type {
   EntryModule,
   LinkPrefetchMode,
   LoadingShellPrediction,
+  NavigationApi,
   NavigationScrollAction,
   PrefetchedPage,
   PrefetchOptions,
@@ -111,20 +113,42 @@ export function routePatternMatchesPathname(
   pathname: string,
   catchAllOptional = false,
 ): boolean {
+  return routeParamsForPathname(route, pathname, catchAllOptional) !== undefined
+}
+
+function routeParamsForPathname(
+  route: string,
+  pathname: string,
+  catchAllOptional = false,
+): Record<string, string | string[]> | undefined {
   const pattern = route.split('/').filter(Boolean)
-  const target = pathname.split('/').filter(Boolean)
+  const target = pathname.split('/').filter(Boolean).map(decodePathSegment)
+  const params: Record<string, string | string[]> = {}
   let cursor = 0
   for (const segment of pattern) {
-    if (/^:[\w$]+\*$/.test(segment)) {
+    const catchAll = /^:([\w$]+)\*$/.exec(segment)
+    if (catchAll) {
       // Catch-all consumes the rest; `[...slug]` requires ≥1 remaining segment.
-      return catchAllOptional || target.length - cursor >= 1
+      const rest = target.slice(cursor)
+      if (!catchAllOptional && rest.length === 0) return undefined
+      if (rest.length > 0) params[catchAll[1]!] = rest.map(encodeURIComponent)
+      return params
     }
     const value = target[cursor++]
-    if (value === undefined) return false
-    if (/^:[\w$]+$/.test(segment)) continue
-    if (segment !== value) return false
+    if (value === undefined) return undefined
+    const dynamic = /^:([\w$]+)$/.exec(segment)
+    if (dynamic) params[dynamic[1]!] = encodeURIComponent(value)
+    else if (segment !== value) return undefined
   }
-  return cursor === target.length
+  return cursor === target.length ? params : undefined
+}
+
+function decodePathSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment)
+  } catch {
+    return segment
+  }
 }
 
 /**
@@ -134,7 +158,12 @@ export function routePatternMatchesPathname(
 export function isRewriteDocument(html: string, pathname: string): boolean {
   const state = routeStateFromHtml(html)
   if (!state?.route) return false
-  return !routePatternMatchesPathname(state.route, pathname, state.catchAllOptional)
+  const params = routeParamsForPathname(state.route, pathname, state.catchAllOptional)
+  return (
+    params === undefined ||
+    (Object.keys(state.params ?? {}).length > 0 &&
+      stableParams(params) !== stableParams(state.params))
+  )
 }
 
 export function routeParamBoundaryChanged(
@@ -1657,6 +1686,7 @@ function saveScrollPosition() {
 
 // Defined by compat.next builds, whose router policies replace core's scroll and refresh ones.
 declare const __PNEXT_NEXT_ROUTER__: boolean | undefined
+declare const __PNEXT_DEFER_LINKLESS_ROUTER__: boolean | undefined
 
 // Core's scroll policy when compat installs none: a new page starts at the top, a traversal
 // returns to where its entry was left.
@@ -1746,6 +1776,17 @@ function takeBfDoc(key: string): BfDocEntry | null {
   }
   touchCacheEntry(bfDocCache, key, entry)
   return entry
+}
+
+/**
+ * Can a bfcache document stand in for a full prefetch with zero network? Only when it is
+ * COMPLETE and the server did not classify it as dynamic. A document the server staged (a
+ * PPR shell) or windowed (`use cache`) publishes a non-static classification, and one still
+ * holding an unfilled stream hole is a partial prefetch shell — both go back to the wire.
+ */
+function bfDocServesFullPrefetch(page: PrefetchedPage): boolean {
+  if (documentStaticHintFromHtml(page.html)?.isStatic === false) return false
+  return !streamHasPendingHole(page.html)
 }
 
 // Per-URL STATIC freshness: the last prefetch response's staleTime for this URL.
@@ -2216,7 +2257,7 @@ function evictSegmentCache(options: { pageSegmentsOnly?: boolean } = {}): void {
 export function evictClientRouterCache(options: { rearmVisiblePrefetches?: boolean } = {}): void {
   bumpRouterCacheEpoch()
   revalidationPrefetchGeneration += 1
-  revalidationPrefetchBlocked = true
+  revalidationPrefetchBlocked = options.rearmVisiblePrefetches !== false
   learnedRouteTrees.clear()
   routeTreesEvicted.clear()
   segmentDocumentCache.clear()
@@ -2247,7 +2288,7 @@ export function rearmVisiblePrefetches(): void {
     // A test host may tear the window down before the timer fires.
     if (typeof window === 'undefined') return
     for (const element of prefetchedElements) {
-      if (!element.isConnected) {
+      if (!element.isConnected || element.ownerDocument !== document) {
         prefetchedElements.delete(element)
         continue
       }
@@ -2891,7 +2932,7 @@ export function prefetchRoute(
     // commits without a fetch. Never for a `currentUrl` seed - the bfcache holds the very
     // document that seed is running for, and the point is to obtain the bytes it does NOT have.
     const bfDoc = takeBfDoc(key)
-    if (bfDoc) {
+    if (bfDoc && bfDocServesFullPrefetch(bfDoc.page)) {
       const page = Promise.resolve(bfDoc.page)
       const state = currentNavState()
       prefetchCache.set(cacheKey, {
@@ -3757,7 +3798,7 @@ async function fetchPageFrameNavigation(
   const staleTimeSeconds = staleTimeHeader === null ? undefined : Number(staleTimeHeader)
   const page = (html: string): PrefetchedPage => ({
     html,
-    finalUrl: url.href,
+    finalUrl: stripRscQuery(response.url) || url.href,
     ok: true,
     ...(Number.isFinite(staleTimeSeconds) ? { staleTimeSeconds } : {}),
   })
@@ -4995,14 +5036,32 @@ export function navStateKey(state: DocumentNavState): string {
 // abandons the moment a newer navigation supersedes it.
 let navigationSequence = 0
 let suppressImmediateRefresh = false
-
+let nextTransitionPrefetchIntent: 'full' | null = null
 /** Current navigation generation, exposed so DOM-level paint tests retain the stale-work guard. */
 export function currentNavigationSequence(): number {
   return navigationSequence
 }
 
-export async function softNavigate(href: string, options: SoftNavigateOptions = {}) {
+let settleLatestNavigation: (() => void) | undefined
+
+// The latest attempt holds the settled signal until it ends however it ends; a newer one releases
+// the attempt it supersedes at once, whatever that attempt's abandoned fetch still does.
+export function softNavigate(href: string, options?: SoftNavigateOptions): Promise<void> {
+  settleLatestNavigation?.()
+  let settle!: () => void
+  routerState.navigationSettled = new Promise(resolve => (settle = resolve))
+  settleLatestNavigation = settle
+  return runSoftNavigation(href, options).finally(() => {
+    settle()
+    if (settleLatestNavigation !== settle) return
+    settleLatestNavigation = undefined
+    routerState.navigationSettled = undefined
+  })
+}
+
+async function runSoftNavigation(href: string, options: SoftNavigateOptions = {}) {
   emitNavigationStart()
+  navigationHistoryPolicy?.start(Boolean(options.replace || options.pop))
   const departingEntrySrc = entryScriptSrc(document)
   // The entry being left (on popstate, history already points at the target,
   // so the live document's entry id is the tracked active one).
@@ -5064,12 +5123,23 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
       ? entryRestorePage
       : undefined)
   // Client-instrumentation transition hook (Next's onRouterTransitionStart).
-  ;(
-    window as { __PNEXT_ON_ROUTER_TRANSITION_START__?: (href: string, kind: string) => void }
-  ).__PNEXT_ON_ROUTER_TRANSITION_START__?.(
-    url.href,
-    options.pop ? 'traverse' : options.replace ? 'replace' : 'push',
-  )
+  const onRouterTransitionStart = (
+    window as {
+      __PNEXT_ON_ROUTER_TRANSITION_START__?: (
+        href: string,
+        kind: string,
+        intent: 'full' | null,
+      ) => void
+    }
+  ).__PNEXT_ON_ROUTER_TRANSITION_START__
+  if (onRouterTransitionStart) {
+    onRouterTransitionStart(
+      url.href,
+      options.pop ? 'traverse' : options.replace ? 'replace' : 'push',
+      nextTransitionPrefetchIntent,
+    )
+  }
+  nextTransitionPrefetchIntent = null
   // A refresh (a self-navigation to the current URL, replace + no scroll) is the client
   // surface of router.refresh() and of a server-action revalidatePath/Tag. It bypasses every
   // client cache and evicts this URL's entries so later prefetches re-fetch. A same-URL LINK
@@ -5145,6 +5215,8 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
     }
     const move = () => {
       if (options.replace) history.replaceState(shellState, '', url.href)
+      else if (navigationHistoryPolicy)
+        navigationHistoryPolicy.push(shellState, url.href, sequence, silent)
       else history.pushState(shellState, '', url.href)
     }
     if (silent) withSilentLocationChange(move)
@@ -5566,6 +5638,8 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
     // across a navigation. pnext's swap DETACHES preserved subtrees to graft them into the new
     // body, and detaching blurs - remember the focused node so it can be refocused.
     focusedBeforeSwap = document.activeElement
+    // The destination becomes observable at the body swap, so its history entry must exist first.
+    navigationHistoryPolicy?.commit(sequence)
     swapBody(
       doc,
       [...preservedIslands, ...restoredIslands],
@@ -5591,7 +5665,9 @@ export async function softNavigate(href: string, options: SoftNavigateOptions = 
         targetUrl.pathname !== previousPathname && !parallelSlotsChanged
           ? options.scroll
           : slotOnlyNav
-            ? false
+            ? url.hash && document.getElementById(decodePathSegment(url.hash.slice(1)))
+              ? options.scroll
+              : false
             : options.scroll,
     }
     // Resolve the changed segment while the freshly swapped document still has
@@ -5907,6 +5983,7 @@ export function commitLinkNavigation({ link, url, replace, scroll }: LinkClickTa
     for (const setPending of hints) setPending(true)
     linkStatus = [hints, sequence]
   }
+  nextTransitionPrefetchIntent = 'full'
   void softNavigate(
     url.href,
     samePage ? { replace, scroll, refreshLike: true, pageRefresh: true } : { replace, scroll },
@@ -6093,19 +6170,28 @@ function scanEagerPrefetchLinks(root: Element) {
     }
     visibleLinkObserver ??= new IntersectionObserver(entries => {
       for (const entry of entries) {
-        if (!entry.isIntersecting) {
-          visiblePrefetchElements.delete(entry.target)
-          // The link left the viewport (scrolled/hidden) — cancel its pending
-          // prefetch task: queued work is dropped, an in-flight task stops
-          // before its next phase, and the pending cache entry is evicted so
-          // re-entering the viewport reschedules the prefetch.
-          const task = prefetchTasksByElement.get(entry.target)
-          if (task) cancelPrefetchTask(task)
-          continue
-        }
-        visiblePrefetchElements.add(entry.target)
-        prefetchLinkElement(entry.target)
+        if (entry.isIntersecting) continue
+        visiblePrefetchElements.delete(entry.target)
+        // The link left the viewport (scrolled/hidden) — cancel its pending
+        // prefetch task: queued work is dropped, an in-flight task stops
+        // before its next phase, and the pending cache entry is evicted so
+        // re-entering the viewport reschedules the prefetch.
+        const task = prefetchTasksByElement.get(entry.target)
+        if (task) cancelPrefetchTask(task)
       }
+      // Cache recency stays in document order (the LRU evicts the top first, like Next's).
+      const scheduled: PrefetchFetchTask[] = []
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue
+        visiblePrefetchElements.add(entry.target)
+        const previous = prefetchTasksByElement.get(entry.target)
+        prefetchLinkElement(entry.target)
+        const task = prefetchTasksByElement.get(entry.target)
+        if (task && task !== previous) scheduled.push(task)
+      }
+      // The scheduler is newer-first: renumber the batch so the document-top link runs first.
+      for (let index = scheduled.length - 1; index >= 0; index--)
+        scheduled[index]!.sortId = ++prefetchSortIdCounter
     })
     visibleLinkObserver.observe(link)
     if (isElementVisible(link)) {
@@ -6116,14 +6202,16 @@ function scanEagerPrefetchLinks(root: Element) {
 }
 
 function isElementVisible(element: Element): boolean {
+  const view = element.ownerDocument.defaultView
+  if (!view) return false
   const rect = element.getBoundingClientRect()
   return (
     rect.width > 0 &&
     rect.height > 0 &&
     rect.bottom > 0 &&
     rect.right > 0 &&
-    rect.top < window.innerHeight &&
-    rect.left < window.innerWidth
+    rect.top < view.innerHeight &&
+    rect.left < view.innerWidth
   )
 }
 
@@ -6144,15 +6232,35 @@ export function installRouterFull() {
     if ('scrollRestoration' in history) history.scrollRestoration = 'manual'
     routerState.activeRouteKey = locationKey()
   }
+  // After a missed traversal onto a router entry, the document on screen belongs to another entry.
+  const navigation = (window as { navigation?: NavigationApi }).navigation
+  const activation = navigation?.activation?.entry
+  const missed =
+    activation !== undefined &&
+    routerState.installedEntryKey !== undefined &&
+    routerState.installedEntryKey !== activation.key &&
+    typeof historyState().__pnextEntry === 'string'
   // Seed the hard-loaded entry's ids BEFORE any island mounts — the hub already
-  // did that (see ./index.ts installRouter); this tier picks up from there.
-  storeNavState()
+  // did that (see ./index.ts installRouter); this tier picks up from there. A missed traversal's
+  // entry keeps the state it was saved with: the replay restores from it.
+  if (!missed) storeNavState()
   routerState.settleLink = settleLinkStatus
   // Bind every delayed hard-load operation to the document and history entry that installed this
   // runtime. `load` can fire after a fast soft navigation has already committed; consulting the
   // then-current location/state would file the original source under the destination entry key.
-  const hardLoadRouteKey = locationKey()
-  const hardLoadPathname = location.pathname
+  // Only a deferred install can trail a shallow pushState; an idle one keys the live URL.
+  const hardLoadKey =
+    typeof __PNEXT_DEFER_LINKLESS_ROUTER__ !== 'undefined' &&
+    __PNEXT_DEFER_LINKLESS_ROUTER__ &&
+    routerState.settledHtml !== undefined
+      ? routerState.activeRouteKey
+      : undefined
+  const hardLoadUrl = new URL(
+    hardLoadKey && hardLoadKey !== locationKey() ? hardLoadKey : location.href,
+    location.href,
+  )
+  const hardLoadRouteKey = hardLoadUrl.pathname + hardLoadUrl.search
+  const hardLoadPathname = hardLoadUrl.pathname
   let hardLoadHtml =
     (window as { __PNEXT_SHELL_HTML__?: string }).__PNEXT_SHELL_HTML__ ||
     `<!doctype html>${document.documentElement.outerHTML}`
@@ -6165,7 +6273,7 @@ export function installRouterFull() {
   if (hardLoadEntrySrc) hardLoadHtml += `<script type="module" src="${hardLoadEntrySrc}"></script>`
   const hardLoadRestoreSource: PrefetchedPage = {
     html: hardLoadHtml,
-    finalUrl: location.href,
+    finalUrl: hardLoadUrl.href,
     ok: true,
     p: (window as typeof window & { __PNEXT_PROPS__?: unknown }).__PNEXT_PROPS__,
   }
@@ -6178,7 +6286,7 @@ export function installRouterFull() {
   if (activityBfcacheEnabled() && !hardLoadStaticStage)
     void prefetchRoute(location.href, { currentUrl: true })
   // Entry-document identity is needed as soon as navigation can start, not at window.load.
-  cacheEntryDocument(hardLoadRestoreSource)
+  if (!missed) cacheEntryDocument(hardLoadRestoreSource)
   const hardLoadEntryId = historyState().__pnextEntry
   // The source snapshot is already entry-bound above. Defer only navigation-cache seeding until
   // load, when the original response has completed its browser lifecycle.
@@ -6186,7 +6294,10 @@ export function installRouterFull() {
     // A fast navigation can commit before the original window load event. The live DOM then belongs
     // to another entry and must not be filed as this hard load's settled segment payload.
     if (historyState().__pnextEntry !== hardLoadEntryId) return
-    const settledHtml = `<!doctype html>${document.documentElement.outerHTML}`
+    const settledHtml =
+      (typeof __PNEXT_DEFER_LINKLESS_ROUTER__ !== 'undefined' && __PNEXT_DEFER_LINKLESS_ROUTER__
+        ? routerState.settledHtml
+        : undefined) ?? `<!doctype html>${document.documentElement.outerHTML}`
     const hardLoadHint = documentStaticHintFromHtml(settledHtml)
     const hardLoadRuntimePrefetch = htmlRuntimePrefetch(settledHtml)
     // A hard HTML load carries no `x-nextjs-stale-time` response header, so
@@ -6238,8 +6349,10 @@ export function installRouterFull() {
       void prefetchRoute(hardLoadRestoreSource.finalUrl, { full: true, currentUrl: true })
     }
   }
-  if (document.readyState === 'complete') captureHardLoad()
-  else window.addEventListener('load', captureHardLoad, { once: true })
+  if (!missed) {
+    if (document.readyState === 'complete') captureHardLoad()
+    else window.addEventListener('load', captureHardLoad, { once: true })
+  }
 
   document.addEventListener('click', onLinkClick)
   document.addEventListener('pointerover', onLinkIntent, true)
@@ -6269,4 +6382,11 @@ export function installRouterFull() {
   if (typeof __PNEXT_NEXT_ROUTER__ === 'undefined' && !navigationScrollAction)
     setNavigationScrollAction(coreNavigationScroll)
   watchEagerPrefetchLinks()
+  if (!missed) return
+  const rendered = new URL(activation.url!)
+  routerState.activeRouteKey = routerState.observedLocationKey = rendered.pathname + rendered.search
+  // Replay only onto the traversed entry, not one a third party pushed since.
+  if (routerState.installedEntryKey !== navigation!.currentEntry?.key) return
+  routerState.renderedEntryId = undefined
+  onPopState()
 }

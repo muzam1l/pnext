@@ -3,7 +3,7 @@
 // ../register/pages-api.ts, which wires the exports below into the extension registries.
 
 import { type Dirent, existsSync, readFileSync, readdirSync } from 'node:fs'
-import { Writable } from 'node:stream'
+import { Readable, Writable } from 'node:stream'
 import path from 'node:path'
 import {
   devServerModuleHref,
@@ -12,7 +12,7 @@ import {
 } from '../../runtime/load'
 import { productionRelease } from '../../runtime/production'
 import type { ResolvedConfig } from '../../config'
-import { getRequestExtensions, type RequestInterceptor } from '../../extensions'
+import { getRequestExtensions, withRouteRuntime, type RequestInterceptor } from '../../extensions'
 import { getRequestRuntime } from '../../routing/request-environment'
 import { selectRouteForRequest } from '../../routing/match'
 import { setWorkUnitRoute } from '../../request/context'
@@ -252,8 +252,12 @@ export const pagesApiInterceptor: RequestInterceptor = async (request, { config 
   // handlers get the IncomingMessage-shaped shim.
   const handlerRequest =
     runtime === 'edge' ? toNextRequest(request) : createPagesApiRequest(request, url)
-  const finished = withPagesApiHandlerSpan(url.pathname, () =>
-    Promise.resolve(imported.default!(handlerRequest, responder.res)),
+  // The handler observes its declared runtime (NEXT_RUNTIME + the edge globals), as app route
+  // handlers do through the serve pipeline's withRouteRuntime.
+  const finished = withRouteRuntime(runtime, () =>
+    withPagesApiHandlerSpan(url.pathname, () =>
+      Promise.resolve(imported.default!(handlerRequest, responder.res)),
+    ),
   ).catch(error => responder.fail(error))
   // A handler that starts writing (res.write / pipeline) streams: the response returns at the first write
   // and the body flows through until end or disconnect - a client disconnect destroys `res`, surfacing as
@@ -323,21 +327,15 @@ function apiRuntime(file: string): string | undefined {
 
 function createPagesApiRequest(request: Request, url: URL) {
   const nextRequest = toNextRequest(request)
-  return {
-    ...nextRequest,
+  const readable = request.body ? Readable.fromWeb(request.body as never) : Readable.from([])
+  return Object.assign(readable, {
     method: request.method,
     url: `${url.pathname}${url.search}`,
     headers: Object.fromEntries(request.headers),
     query: Object.fromEntries(url.searchParams),
     cookies: cookiesFromHeader(request.headers.get('cookie')),
     nextUrl: nextRequest.nextUrl,
-    text() {
-      return request.text()
-    },
-    json() {
-      return request.json()
-    },
-  }
+  })
 }
 
 function createPagesApiResponse(request: Request) {

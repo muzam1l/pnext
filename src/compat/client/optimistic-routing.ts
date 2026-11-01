@@ -13,6 +13,7 @@
 //     sibling URL somewhere else entirely, or vary on search params.
 
 import type { RouteParamValue } from '../../types'
+import { restampSharedParams, sameParams } from './segment-cache'
 
 interface RouteState {
   // Bracket-free colon form: `:id` for a dynamic segment, `:slug*` for a
@@ -61,11 +62,16 @@ export function predictNextLoadingShell(
     // A shell's own URL must fit its route pattern before it can teach the
     // route trie. This catches rewrites, including a dynamic response served
     // for a known static sibling.
-    if (!matchRoute(state, pathname)) continue
+    const storedParams = matchRoute(state, pathname)
+    if (
+      !storedParams ||
+      (Object.keys(state.params).length > 0 && !sameParams(storedParams, state.params))
+    )
+      continue
     const params = matchRoute(state, url.pathname)
     if (params) {
       return {
-        html: reifyShellParams(html, state.params, params),
+        html: restampSharedParams(html, params),
         route: {
           route: state.route,
           params,
@@ -118,7 +124,7 @@ function matchRoute(
       if (state.catchAllOptional) {
         // `[[...slug]]`: matches the base path plus any nested tail.
         const rest = target.slice(cursor)
-        if (rest.length > 0) params[name] = rest
+        if (rest.length > 0) params[name] = rest.map(encodeURIComponent)
         return params
       }
       // `[...slug]`: a catch-all learned from a parallel slot must not predict a
@@ -127,79 +133,15 @@ function matchRoute(
       if (!Array.isArray(state.params[name])) return undefined
       const rest = target.slice(cursor)
       if (rest.length === 0) return undefined
-      params[name] = rest
+      params[name] = rest.map(encodeURIComponent)
       return params
     }
     const value = target[cursor++]
     if (value === undefined) return undefined
-    if (dynamic) params[dynamic[1]!] = value
+    if (dynamic) params[dynamic[1]!] = encodeURIComponent(value)
     else if (segment !== value) return undefined
   }
   return cursor === target.length ? params : undefined
-}
-
-function reifyShellParams(
-  html: string,
-  previous: Record<string, RouteParamValue>,
-  params: Record<string, RouteParamValue>,
-): string {
-  if (typeof DOMParser === 'undefined') return html
-  const doc = new DOMParser().parseFromString(html, 'text/html')
-  materializeClientMarkers(doc)
-  for (const root of doc.querySelectorAll<HTMLElement>('[data-pnext-params]')) {
-    const raw = root.getAttribute('data-pnext-params')
-    if (!raw) continue
-    try {
-      const scoped = JSON.parse(raw) as Record<string, RouteParamValue>
-      if (sameParams(scoped, previous))
-        root.setAttribute('data-pnext-params', JSON.stringify(params))
-    } catch {
-      // A malformed island scope cannot safely be reified.
-    }
-  }
-  return `<!doctype html>${doc.documentElement.outerHTML}`
-}
-
-function materializeClientMarkers(doc: Document): void {
-  const comments: Comment[] = []
-  const walker = doc.createTreeWalker(doc, NodeFilter.SHOW_COMMENT)
-  while (walker.nextNode()) comments.push(walker.currentNode as Comment)
-  for (const start of comments.reverse()) {
-    const match = /^(pnext-client|pnext-static-children|pnext-page):([^>]*)$/.exec(start.data)
-    const kind = match?.[1]
-    const encoded = match?.[2]
-    if (!kind || !encoded || !start.parentNode) continue
-    const container = doc.createElement('div')
-    const tag = kind === 'pnext-page' ? 'div' : kind
-    container.innerHTML = `<${tag} ${encoded}></${tag}>`
-    const island = container.firstElementChild
-    if (!island) continue
-    let node = start.nextSibling
-    while (node && !(node.nodeType === Node.COMMENT_NODE && node.nodeValue === `/${kind}`)) {
-      const next = node.nextSibling
-      island.append(node)
-      node = next
-    }
-    if (!node) continue
-    start.replaceWith(island)
-    node.remove()
-  }
-}
-
-function sameParams(
-  left: Record<string, RouteParamValue>,
-  right: Record<string, RouteParamValue>,
-): boolean {
-  const leftKeys = Object.keys(left)
-  const rightKeys = Object.keys(right)
-  if (leftKeys.length !== rightKeys.length) return false
-  return leftKeys.every(key => {
-    const a = left[key]
-    const b = right[key]
-    return Array.isArray(a)
-      ? Array.isArray(b) && a.length === b.length && a.every((value, index) => value === b[index])
-      : a === b
-  })
 }
 
 function decodeSegment(segment: string) {

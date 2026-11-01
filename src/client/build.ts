@@ -635,7 +635,8 @@ export async function buildClientEntries({
   // Every route's client sources start their transform and React Compiler pass here, in one batch on
   // oxc's threadpool, while esbuild is still booting and walking the graph. A caller-warmed pipeline
   // has them in flight already; warming twice is a Map hit, so the same call covers both.
-  const pipeline = warmed ?? createClientSourcePipeline(config, dev === true)
+  // No dev split rewrite: a batch cannot emit the client-dyn outputs it would name.
+  const pipeline = warmed ?? createClientSourcePipeline(config)
   pipeline.warmRoutes(entries.map(entry => entry.route))
   await ensureDir(outDir)
   const groups = surfaceGroups(config, entries, actions)
@@ -693,6 +694,8 @@ export async function buildClientEntries({
     )
   }
   clientProfile.report('client stage')
+  // pnext analyze reads chunk composition from this; renames map esbuild's names to shipped ones.
+  return dev ? undefined : { metafile: merged, renames }
 }
 
 /**
@@ -925,6 +928,23 @@ function routeClientSources(routes: RouteManifestEntry[]) {
 // Record each entry's static chunk closure on the route so rendered pages can
 // modulepreload it — without this the browser discovers the chunk list only
 // after the entry itself downloads, serializing the two round trips.
+const frameworkSource = path.resolve(import.meta.dirname, '..') + path.sep
+
+/** A chunk built only from pnext's own source (plus preact): framework runtime, not app code. */
+function frameworkOutput(output: Metafile['outputs'][string] | undefined) {
+  const inputs = Object.keys(output?.inputs ?? {})
+  return (
+    inputs.length > 0 &&
+    inputs.every(input => {
+      const file = path.resolve(input)
+      return (
+        file.startsWith(frameworkSource) ||
+        file.includes(`${path.sep}node_modules${path.sep}preact${path.sep}`)
+      )
+    })
+  )
+}
+
 function assignClientEntryImports(
   entries: { route: RouteManifestEntry; entryName: string }[],
   metafile: Metafile,
@@ -947,6 +967,7 @@ function assignClientEntryImports(
     if (!entryOutput) continue
     const staticImports = new Set<string>()
     const dynamicImports = new Set<string>()
+    const runtimeAssets = new Set<string>()
     const visited = new Set([`${entryOutput}:static`])
     const queue = [{ output: entryOutput, dynamic: false }]
     // eslint-disable-next-line @typescript-eslint/prefer-for-of
@@ -979,11 +1000,14 @@ function assignClientEntryImports(
           .split(path.sep)
           .join('/')
         ;(dynamic ? dynamicImports : staticImports).add(publicRelative)
+        if (dynamic && frameworkOutput(outputs[imported.path])) runtimeAssets.add(publicRelative)
       }
     }
     if (staticImports.size > 0) route.clientEntryImports = [...staticImports]
     for (const asset of staticImports) dynamicImports.delete(asset)
     if (dynamicImports.size > 0) route.clientDynamicImports = [...dynamicImports]
+    const runtimeImports = [...runtimeAssets].filter(asset => dynamicImports.has(asset))
+    if (runtimeImports.length > 0) route.clientRuntimeImports = runtimeImports
   }
 }
 
@@ -1075,6 +1099,8 @@ function baseClientBuildOptions(config: ResolvedConfig, dev = false): BuildOptio
     conditions: ['browser', 'style'],
     define: {
       ...publicEnvDefines(),
+      __PNEXT_DEFER_LINKLESS_ROUTER__: 'false',
+      __PNEXT_ROUTER_POLICY_SETTERS__: 'false',
       // compiler.define / defineServer (compat); defineServer keys fold to
       // `undefined` client-side so fallback branches stay reachable.
       ...extensions.clientDefines(),
@@ -1473,6 +1499,8 @@ function coreStaticAssetModule(
  * App-convention .js/.mjs may contain JSX (jsxImportSource is preact), so those parse with the jsx
  * loader; scoped to the source roots, so third-party node_modules .js keeps esbuild's default loader.
  */
+const clientSourceNamespace = 'pnext-client-source'
+
 function createClientSourcePipeline(config: ResolvedConfig, dev = false, routeId?: string) {
   const sourceRewrite = nextCompatEnabled(config)
   const compiler = getCompatModeExtensions().reactCompilerOptions(config)
@@ -1592,6 +1620,35 @@ function createClientSourcePipeline(config: ResolvedConfig, dev = false, routeId
       return {
         name: 'pnext-client-source',
         setup(build) {
+          if (config.workspaceRootExplicit) {
+            build.onResolve({ filter }, args => {
+              if (!path.isAbsolute(args.path)) return undefined
+              return { path: path.resolve(args.path), namespace: clientSourceNamespace }
+            })
+            build.onResolve({ filter: /^\./, namespace: clientSourceNamespace }, args => {
+              const resolved = resolveImport(
+                config.root,
+                args.importer,
+                args.path,
+                config.workspaceRoot,
+              )
+              if (!resolved || !filter.test(resolved)) {
+                return resolved ? { path: resolved } : undefined
+              }
+              return { path: resolved, namespace: clientSourceNamespace }
+            })
+            build.onLoad({ filter: /.*/, namespace: clientSourceNamespace }, async args => {
+              const resolved = path.resolve(args.path)
+              const transformed = await prepare(resolved)
+              return {
+                ...(transformed ?? {
+                  contents: loaded.get(resolved) ?? (await readSourceText(resolved)),
+                  loader: clientSourceLoader(resolved),
+                }),
+                resolveDir: path.dirname(resolved),
+              }
+            })
+          }
           // namespace: 'file' — an onLoad without a namespace matches EVERY
           // namespace, which would hijack virtual modules (e.g. the server-action
           // client stub) whose paths end in .js and feed back the original source.
@@ -1912,8 +1969,13 @@ function resolveTraceImport(root: string, fromFile: string, specifier: string) {
 }
 
 function resolveTraceFile(file: string) {
+  const sourceFile = file.startsWith(`${clientSourceNamespace}:`)
+    ? file.slice(clientSourceNamespace.length + 1)
+    : file
   return canonicalTraceFile(
-    path.isAbsolute(file) ? path.resolve(file) : path.resolve(process.cwd(), file),
+    path.isAbsolute(sourceFile)
+      ? path.resolve(sourceFile)
+      : path.resolve(process.cwd(), sourceFile),
   )
 }
 
@@ -2294,16 +2356,34 @@ function chunkLabelsFromMetafile(metafile: Metafile) {
   for (const [outputPath, output] of Object.entries(metafile.outputs)) {
     const basename = path.basename(outputPath)
     if (!basename.startsWith('chunk-') || !basename.endsWith('.js')) continue
-    const weights = new Map<string, number>()
+    const packages = new Map<string, number>()
+    const families = new Map<string, number>()
     for (const [input, { bytesInOutput }] of Object.entries(output.inputs)) {
       const label = chunkInputLabel(input)
       if (!label) continue
-      weights.set(label, (weights.get(label) ?? 0) + bytesInOutput)
+      packages.set(label.name, (packages.get(label.name) ?? 0) + bytesInOutput)
+      families.set(label.family, (families.get(label.family) ?? 0) + bytesInOutput)
     }
-    const top = [...weights.entries()].sort((a, b) => b[1] - a[1])[0]
-    if (top) labels.set(basename, top[0])
+    const label = dominantLabel(packages, families)
+    if (label) labels.set(basename, label)
   }
   return labels
+}
+
+/**
+ * What makes up at least half the chunk: one package, one scope (`@floating-ui/*`), or the top two
+ * packages; otherwise none, and the chunk is named neutrally. Never a package that is a minority.
+ */
+function dominantLabel(packages: Map<string, number>, families: Map<string, number>) {
+  const rank = (weights: Map<string, number>) => [...weights.entries()].sort((a, b) => b[1] - a[1])
+  const [first, second] = rank(packages)
+  const [family] = rank(families)
+  if (!first || !family) return undefined
+  const total = [...packages.values()].reduce((sum, bytes) => sum + bytes, 0)
+  if (first[1] * 2 >= total) return first[0]
+  if (family[1] * 2 >= total) return family[0]
+  if (second && (first[1] + second[1]) * 2 >= total) return `${first[0]}_${second[0]}`
+  return undefined
 }
 
 function chunkInputLabel(input: string) {
@@ -2311,15 +2391,18 @@ function chunkInputLabel(input: string) {
   const packageIndex = posix.lastIndexOf('node_modules/')
   if (packageIndex !== -1) {
     const parts = posix.slice(packageIndex + 'node_modules/'.length).split('/')
-    const name = parts[0]?.startsWith('@') ? `${parts[0]}-${parts[1] ?? ''}` : parts[0]
-    return sanitizeChunkLabel(name ?? '')
+    const scoped = parts[0]?.startsWith('@')
+    const name = sanitizeChunkLabel(scoped ? `${parts[0]}-${parts[1] ?? ''}` : (parts[0] ?? ''))
+    const family = scoped ? sanitizeChunkLabel(parts[0]!) : name
+    return name && family ? { name, family } : undefined
   }
-  return sanitizeChunkLabel(
+  const name = sanitizeChunkLabel(
     posix
       .split('/')
       .at(-1)
       ?.replace(/\.[^.]+$/, '') ?? '',
   )
+  return name ? { name, family: name } : undefined
 }
 
 function sanitizeChunkLabel(label: string) {

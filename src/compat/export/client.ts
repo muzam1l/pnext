@@ -15,7 +15,7 @@
 // rewrite of the page also cover the data request. A host-level REDIRECT typically does not, so - like
 // Next - a HEAD probe resolves the page's final URL first.
 
-import { setExportDocumentFetcher } from '../../client/router/policies'
+import type { ExportDocumentFetcher } from '../../client/router/policies'
 
 /** The exported segment file carrying a route's complete document. */
 const SEGMENT_FILE = '__next._full.txt'
@@ -26,12 +26,11 @@ interface ExportedDocument {
   finalUrl: string
 }
 
-// Registered at MODULE scope rather than from installNavCompat(): the router
-// issues the document's first prefetches before the compat entry finishes its
-// install sequence, and those would otherwise fall through to a server that
-// isn't there. Module initialization runs before any of it, and the marker is
-// an inline script in <head>, so it is already set by the time this evaluates.
-if (outputExportMode()) setExportDocumentFetcher(fetchExportedDocument)
+// Installed by the deferred navigation tier, which finishes before the runtime issues its first
+// prefetch; the marker is an inline script in <head>, so it is already set by then.
+export function installExportDocumentFetcher(set: (fetcher: ExportDocumentFetcher) => void) {
+  if (outputExportMode()) set(fetchExportedDocument)
+}
 
 /** Whether the running document was served out of an export tree. */
 function outputExportMode(): boolean {

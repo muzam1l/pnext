@@ -13,6 +13,7 @@ import {
 } from '../../render/island-context'
 import { blockJavascriptUrl } from '../../client/router'
 import { isUnrecognizedActionError } from '../actions/unrecognized-error'
+import { assertRouterQueueImplemented } from '../actions/shared'
 import {
   forbidden,
   notFound,
@@ -117,11 +118,13 @@ export function useRouter(): AppRouterInstance {
   cachedRouter ??= {
     push: (href, options) => {
       if (blockJavascriptUrl(href)) return
+      assertRouterQueueImplemented()
       suppressSameTickRefresh()
       router.push(href as never, options as never)
     },
     replace: (href, options) => {
       if (blockJavascriptUrl(href)) return
+      assertRouterQueueImplemented()
       suppressSameTickRefresh()
       router.replace(href as never, options as never)
     },
@@ -131,12 +134,14 @@ export function useRouter(): AppRouterInstance {
     },
     refresh: () => {
       if (refreshSuppressed) return
+      assertRouterQueueImplemented()
       router.refresh()
     },
     back: () => router.back(),
     forward: () => router.forward(),
     experimental_gesturePush: (href, options) => {
       if (blockJavascriptUrl(href)) return
+      assertRouterQueueImplemented()
       suppressSameTickRefresh()
       // A gesture commits the target route optimistically: the address bar moves as soon as the gesture
       // starts, ahead of the render landing. Start the navigation FIRST (its synchronous prologue reads

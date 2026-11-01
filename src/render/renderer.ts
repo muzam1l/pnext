@@ -47,6 +47,9 @@ import {
   getSuspenseExtensions,
   nextCompatEnabled,
   reactCompatEnabled,
+  type SlotHead,
+  type SlotHeadBranch,
+  type SlotHeadPolicy,
 } from './hooks'
 import {
   getCssExtensions,
@@ -72,13 +75,21 @@ import {
   isNotFoundError,
   isRedirectError,
   isUnauthorizedError,
+  notFound,
 } from '../api/navigation'
 import { Suspense } from '../api/suspense'
-import { currentRequest, getWorkUnit, runWithRequest } from '../request/context'
+import {
+  currentRequest,
+  getWorkUnit,
+  recordServerTiming,
+  runWithRequest,
+  serverTimingEnabled,
+} from '../request/context'
 import {
   awaitAtTaskBoundary,
   cacheComponents,
   completePrerender,
+  frameworkNow,
   currentPrerenderScope,
   hangingPromise,
   isCachedComponent,
@@ -92,6 +103,7 @@ import {
   markRuntimeApiOnAwait,
   PostponeError,
   runInPrerender,
+  runWithClockTape,
   runWithCsrBailout,
   runWithPrerenderDeterminism,
   runWithRuntimePrefetchSyncIoAbort,
@@ -103,9 +115,10 @@ import {
   findConventionFiles,
   findGlobalError,
   findLayouts,
+  matchInterception,
   serverActionsUnsupportedMessage,
 } from '../routing/match'
-import { matchSegments, pathnameSegments, slotDirectoriesIn } from '../routing/slots'
+import { isSlotSegment, matchSegments, pathnameSegments, slotDirectoriesIn } from '../routing/slots'
 import { getRequestRuntime } from '../routing/request-environment'
 import { toNextRequest } from '../api/server'
 import { assertNotTainted, isElementLike, serializeProps } from '../utils/serialize'
@@ -159,6 +172,7 @@ import {
   type RenderBufferFrame,
 } from './resource-hints'
 import {
+  hasHeadMetadataFiles,
   staticMetadataForPath,
   staticMetadataForPathFromFiles,
   staticMetadataForRoute,
@@ -185,6 +199,7 @@ import {
   runInLayoutSegmentScope,
   runInParamsScope,
   slotBoundarySymbol,
+  enterSlotMarker,
   type ResolvedSlotMatch,
   type SlotContext,
 } from './slots'
@@ -213,7 +228,6 @@ import type {
   Viewport,
 } from '../types'
 
-const useCacheJoinerPromiseSymbol = Symbol.for('pnext.compat.useCacheJoinerPromise')
 // Prop marking a loading.js Suspense boundary that has ANOTHER loading boundary deeper in the
 // tree: it resolves THROUGH in the streaming shell so the DEEPEST fallback is what the shell
 // shows. A STRING key, not a symbol: preact's `h()` copies props with `for...in`, which skips
@@ -322,6 +336,7 @@ function installRawTextRendering() {
   const diffOptions = preactOptions as { __b?: (vnode: VNode) => void }
   const previousDiff = diffOptions.__b
   diffOptions.__b = vnode => {
+    applyPrerenderSuspenseCatch(vnode)
     applyHoistable(vnode)
     previousDiff?.(vnode)
   }
@@ -571,6 +586,14 @@ interface RenderOptions {
   nav?: RenderNavOptions
   /** Collects each slot's resolved source path during layout application. */
   slotStateOut?: Record<string, string>
+  /** Boundary tree rendered in place of the slot an error escaped from. */
+  slotFallback?: { dir: string; tree: ComponentChildren }
+  /** Slot dirs whose markers the server-tree resolver reached. */
+  renderedSlots?: Set<string>
+  /** Metadata outlets rendered slots carry, keyed by slot dir: each wraps the slot's content. */
+  slotOutlets?: Map<string, (content: ComponentChildren) => ComponentChildren>
+  /** The slot whose outlet threw the error being rendered. */
+  boundarySlot?: ErrorSlot
   /**
    * Request-time shell regeneration (stale-shell rebake, segment refresh): same partial prerender
    * but with REAL Date/Math.random - the deterministic clock exists for byte-stable builds, and
@@ -674,6 +697,8 @@ interface LayoutRender {
   metadataMissedFlush: boolean
   slotMatches: ResolvedSlotMatch[]
   viewport: Viewport[]
+  /** Dirs of children-chain layouts that define head tags. */
+  headDirs: string[]
   documentLayoutFile?: string
 }
 
@@ -842,12 +867,17 @@ async function importModule(file: string, options: ModuleLoadOptions) {
 }
 
 async function importClientModule(file: string, options: ModuleLoadOptions) {
-  if (options.clientModuleLoader) return options.clientModuleLoader(file)
-  if (options.moduleLoader) return options.moduleLoader(file)
-  const href = await clientModuleHref(file, options)
-  if (options.dev) return importDevModule<Record<string, unknown>>(href)
-  await drainPreplanBuilds()
-  return importModuleOnce<Record<string, unknown>>(href)
+  const finish = getRenderSpanExtensions().onClientModuleLoad?.()
+  try {
+    if (options.clientModuleLoader) return await options.clientModuleLoader(file)
+    if (options.moduleLoader) return await options.moduleLoader(file)
+    const href = await clientModuleHref(file, options)
+    if (options.dev) return await importDevModule<Record<string, unknown>>(href)
+    await drainPreplanBuilds()
+    return await importModuleOnce<Record<string, unknown>>(href)
+  } finally {
+    finish?.()
+  }
 }
 
 /** A synthetic route's CSS: in a release, the stylesheet its build emitted; else a source scan. */
@@ -922,6 +952,8 @@ interface RenderTreeExtra {
   pageFile?: string
   runtimePageMetadata?: boolean
   preferSlotMetadata?: boolean
+  /** The children page itself defines head tags (exports). */
+  pageDefinesHead?: boolean
   /**
    * Stream the viewport's theme-color with the request-time metadata chunk instead of emitting it
    * in the document head. Set only when the not-found boundary's metadata is deferred to request
@@ -1278,6 +1310,8 @@ function styleName(name: string) {
 
 interface RenderProfile {
   label: string
+  /** Steps land in the response's Server-Timing instead of the dev trace. */
+  timing?: boolean
 }
 
 interface ProfileRenderOptions {
@@ -1286,6 +1320,7 @@ interface ProfileRenderOptions {
 }
 
 function renderProfile(options: ProfileRenderOptions): RenderProfile | undefined {
+  if (serverTimingEnabled()) return { label: options.route.route, timing: true }
   if (!traceEnabled('server') || !options.dev) return undefined
   return { label: options.route.route }
 }
@@ -1296,7 +1331,7 @@ async function profileRenderStep<T>(
   task: () => Promise<T>,
 ) {
   if (!profile) return task()
-  const start = performance.now()
+  const start = frameworkNow()
   try {
     return await task()
   } finally {
@@ -1310,7 +1345,7 @@ function profileRenderSyncStep<T>(
   task: () => T,
 ) {
   if (!profile) return task()
-  const start = performance.now()
+  const start = frameworkNow()
   try {
     return task()
   } finally {
@@ -1320,13 +1355,14 @@ function profileRenderSyncStep<T>(
 
 /** Span timing for regions that can't be wrapped in a callback (mark → log). */
 function profileRenderMark(profile: RenderProfile | undefined) {
-  return profile ? performance.now() : 0
+  return profile ? frameworkNow() : 0
 }
 
 function profileRenderSince(profile: RenderProfile | undefined, label: string, start: number) {
   if (!profile) return
+  if (profile.timing) return recordServerTiming(label, frameworkNow() - start)
   recordDevProfileLine(
-    `dev-profile render ${profile.label} ${label} in ${formatProfileDuration(performance.now() - start)}`,
+    `dev-profile render ${profile.label} ${label} in ${formatProfileDuration(frameworkNow() - start)}`,
   )
 }
 
@@ -1347,9 +1383,93 @@ interface RenderRequestOptions {
 }
 
 interface StaticParamsModule {
-  params?: (ctx?: {
-    params: Record<string, RouteParamValue>
-  }) => Promise<Record<string, RouteParamValue>[]> | Record<string, RouteParamValue>[]
+  params?: (ctx?: { params: Record<string, RouteParamValue> }) => unknown
+}
+
+function compatNextConfig(): Record<string, unknown> {
+  const store = (globalThis as Record<PropertyKey, unknown>)[
+    Symbol.for('pnext.compat.nextConfigStore')
+  ] as { value?: Record<string, unknown> } | undefined
+  return store?.value ?? {}
+}
+
+const GENERATE_STATIC_PARAMS_DOCS =
+  'See more info here: https://nextjs.org/docs/messages/generate-static-params'
+
+export function generatedStaticParamsValueType(value: unknown): string {
+  return value === null ? 'null' : typeof value
+}
+
+export function generatedStaticParamsRequiredParams(
+  route: Pick<RouteManifestEntry, 'params' | 'catchAll'>,
+): string[] {
+  return [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
+}
+
+export function generatedStaticParamsInvalidValueMessage(page: string, type: string): string {
+  return `Invalid value returned from generateStaticParams for "${page}". Expected an array, but received type ${type}. ${GENERATE_STATIC_PARAMS_DOCS}`
+}
+
+export function generatedStaticParamsEmptyMessage(page: string): string {
+  return `Page "${page}" returned an empty array from "generateStaticParams()". With "output: export", at least one route must be generated. ${GENERATE_STATIC_PARAMS_DOCS}`
+}
+
+export function generatedStaticParamsInvalidEntryMessage(
+  page: string,
+  index: number,
+  type: string,
+): string {
+  return `Invalid value at index ${index} returned from generateStaticParams for "${page}". Expected an object, but received type ${type}. ${GENERATE_STATIC_PARAMS_DOCS}`
+}
+
+export function generatedStaticParamsIncompleteMessage(page: string, missing: string[]): string {
+  return `Page "${page}" returned incomplete params from "generateStaticParams()". With "output: export", every params object must include all dynamic route parameters. Missing: ${missing.map(name => `"${name}"`).join(', ')}. ${GENERATE_STATIC_PARAMS_DOCS}`
+}
+
+function validateGeneratedStaticParams(
+  route: RouteManifestEntry,
+  result: unknown,
+  checkComplete = true,
+): asserts result is Record<string, unknown>[] {
+  const config = compatNextConfig()
+  const outputExport = config.output === 'export'
+  const page = route.route || '/'
+  if (!Array.isArray(result)) {
+    if (!outputExport) return
+    throw new Error(
+      generatedStaticParamsInvalidValueMessage(page, generatedStaticParamsValueType(result)),
+    )
+  }
+  if (result.length === 0) {
+    if (cacheComponents()) {
+      throw new Error(
+        'When using Cache Components, all `generateStaticParams` functions must return at least one result. ' +
+          'This is to ensure that we can perform build-time validation that there is no other dynamic accesses that would cause a runtime error.\n\n' +
+          'Learn more: https://nextjs.org/docs/messages/empty-generate-static-params',
+      )
+    }
+    if (outputExport) {
+      throw new Error(generatedStaticParamsEmptyMessage(page))
+    }
+    return
+  }
+  if (!outputExport || !checkComplete) return
+  const required = generatedStaticParamsRequiredParams(route)
+  for (const [index, params] of result.entries()) {
+    if (!params || typeof params !== 'object' || Array.isArray(params)) {
+      throw new Error(
+        generatedStaticParamsInvalidEntryMessage(
+          page,
+          index,
+          generatedStaticParamsValueType(params),
+        ),
+      )
+    }
+    const missing = required.filter(name => (params as Record<string, unknown>)[name] === undefined)
+    if (missing.length > 0) {
+      throw new Error(generatedStaticParamsIncompleteMessage(page, missing))
+    }
+  }
 }
 
 /**
@@ -1368,6 +1488,16 @@ export function settledPromise<T>(value: T): Promise<T> {
   return promise
 }
 
+/** Concrete values reach page props URL-encoded, like every prerendered param; keys stay raw. */
+function encodedParams(params: Record<string, RouteParamValue>): Record<string, RouteParamValue> {
+  return Object.fromEntries(
+    Object.entries(params).map(([key, value]) => [
+      key,
+      Array.isArray(value) ? value.map(encodeURIComponent) : encodeURIComponent(value),
+    ]),
+  )
+}
+
 function createPageProps(options: RenderRequestOptions): PageProps {
   // Sub-shell prerender (Stage C-4): a leading prefix of params is concrete; the
   // remaining route params hang. `params` resolves to a proxy where a concrete
@@ -1375,7 +1505,7 @@ function createPageProps(options: RenderRequestOptions): PageProps {
   // reading a concrete param renders buildtime while reading an unfilled one
   // postpones its boundary. searchParams still hangs (dynamic).
   if (options.fallbackConcreteParams) {
-    const concrete = options.fallbackConcreteParams
+    const concrete = encodedParams(options.fallbackConcreteParams)
     const keys = options.fallbackParamKeys ?? Object.keys(concrete)
     return {
       params: Promise.resolve(subShellParamsProxy(concrete, keys)),
@@ -1388,8 +1518,8 @@ function createPageProps(options: RenderRequestOptions): PageProps {
   // shell), while a top-level await blocks the prerender (no fallback shell).
   if (options.fallbackParams) {
     return {
-      params: hangingPromise('params'),
       searchParams: hangingPromise('searchParams'),
+      params: hangingPromise('params'),
       request: options.request ? pageRequest(options.request) : undefined,
     }
   }
@@ -1538,17 +1668,27 @@ async function serializablePageProps(props: PageProps, omitSearchParams = false)
   }
 }
 
+/** Segment modules (layouts, pages) evaluated as the build does, in the given order. */
+export async function loadSegmentModules(config: ResolvedConfig, files: string[]) {
+  const modules: { file: string; module: Record<string, unknown> }[] = []
+  for (const file of files) {
+    const href = await moduleHref(file, { config })
+    await drainPreplanBuilds()
+    modules.push({ file, module: (await import(href)) as Record<string, unknown> })
+  }
+  return modules
+}
+
+/** The route's layout chain and page, root first. */
+export function routeSegmentFiles(config: ResolvedConfig, route: RouteManifestEntry) {
+  return [...findLayouts(config.appPath, route.file).filter(conventionFileExists), route.file]
+}
+
 export async function staticParamsFor(config: ResolvedConfig, route: RouteManifestEntry) {
-  const moduleFiles = [
-    ...findLayouts(config.appPath, route.file).filter(conventionFileExists),
-    route.file,
-  ]
   let paramSets: Record<string, RouteParamValue>[] = [{}]
   const allSets: Record<string, RouteParamValue>[] = []
-  for (const file of moduleFiles) {
-    const staticHref = await moduleHref(file, { config })
-    await drainPreplanBuilds()
-    const imported = (await import(staticHref)) as Record<string, unknown>
+  const modules = await loadSegmentModules(config, routeSegmentFiles(config, route))
+  for (const { file, module: imported } of modules) {
     const module = getStaticParamsExtensions().normalizeModule(imported) as StaticParamsModule
     const generate = module.params
     if (typeof generate !== 'function') continue
@@ -1559,20 +1699,29 @@ export async function staticParamsFor(config: ResolvedConfig, route: RouteManife
       // parent segment (e.g. `params.lang === 'fr' ? [...] : [...]`). The
       // top-level layout receives `{}`.
       const results = await generate({ params: parent })
-      if (!Array.isArray(results)) continue
-      for (const params of results) {
+      getStaticParamsExtensions().validateResult?.(config, route, file, results, false)
+      validateGeneratedStaticParams(route, results, false)
+      for (const params of results as Record<string, RouteParamValue>[]) {
         const combined = { ...parent, ...params }
         allSets.push(combined)
         next.push(combined)
       }
     }
-    if (next.length > 0) paramSets = next
+    paramSets = next
   }
+  getStaticParamsExtensions().validateResult?.(config, route, route.file, paramSets, true)
+  validateGeneratedStaticParams(route, paramSets)
   const fullKeys = new Set(route.params)
   if (route.catchAll) fullKeys.add(route.catchAll)
   return {
     paths: paramSets.filter(params => [...fullKeys].every(key => params[key] !== undefined)),
     allSets,
+    paramMatching: await getStaticParamsExtensions().resolveParamMatching(
+      config,
+      route,
+      modules,
+      paramSets,
+    ),
   }
 }
 
@@ -1634,15 +1783,29 @@ export async function renderPageWithStatus(
       runWithFontScope(() =>
         runWithCacheScope(async () => {
           const render = async () => {
-            const page = await pageRender(options, false)
+            const scope: PrerenderOutcomeScope = {
+              outcomes: [],
+              compat: nextCompatEnabled(options.config),
+              nextId: 0,
+            }
+            const page = await prerenderOutcomeScope.run(scope, () => pageRender(options, false))
             const location =
               page.headers && !(page.headers instanceof Headers) && !Array.isArray(page.headers)
                 ? page.headers.location
                 : undefined
+            const status = page.status ?? 200
+            // Render order decides: the first redirect wins, else the first access fallback.
+            const outcomes =
+              status < 500 && status !== 200
+                ? [...scope.outcomes, { status, location }]
+                : scope.outcomes
+            const outcome =
+              status >= 500 ? undefined : (outcomes.find(item => item.location) ?? outcomes[0])
+            const finalLocation = outcome ? outcome.location : location
             return {
               html: renderDocument(page),
-              status: page.status ?? 200,
-              ...(location ? { location } : {}),
+              status: outcome?.status ?? status,
+              ...(finalLocation ? { location: finalLocation } : {}),
             }
           }
           const staticGeneration =
@@ -1710,13 +1873,18 @@ export async function renderPageResponse(options: RenderOptions) {
     method === 'GET' &&
     !skipPprForSoftNav &&
     !isHtmlLimitedBotRequest(options) &&
-    // A DOM bot (Googlebot) bypasses static-shell-only serving: it blocks on and
-    // receives the fully resolved dynamic stream instead of a shell it would have
-    // to resume, so dynamic APIs (Math.random) never trip an SSG bailout for it.
-    !isDomBotRequest(options) &&
     !/(?:^|;\s*)__prerender_bypass=/.test(options.request?.headers.get('cookie') ?? '')
   ) {
     const prebuilt = await loadPprShell(options.config, options.route, options.url)
+    // A blocking policy waits for the concrete prefix; a shell without it is never served first.
+    if (
+      prebuilt &&
+      pprUpgrade?.foreground &&
+      !Object.keys(pprUpgrade.concreteParams).every(key => key in (prebuilt.concreteParams ?? {}))
+    ) {
+      const shell = await promoteShell(options, pprUpgrade, false)
+      if (shell) return renderPprResponse(options, shell)
+    }
     if (prebuilt) {
       // Soft tag staleness (revalidateTag with a profile): Next's SWR
       // semantics — this response still serves the stale shell, while a
@@ -1731,10 +1899,15 @@ export async function renderPageResponse(options: RenderOptions) {
     // and persists the new shell plus sidecar.
     const regenerated = await regenerateStalePprShell(options)
     if (regenerated) return renderPprResponse(options, regenerated)
-    // Shell miss on an upgrade-eligible route: warm the more-specific route shell in the background
-    // so a subsequent request serves the promoted shell. This response still falls through to the
-    // plain dynamic render below.
-    if (pprUpgrade !== undefined) schedulePprShellUpgrade(options)
+    if (pprUpgrade !== undefined) {
+      if (pprUpgrade.foreground || !hasParamFreeRootLayout(options.config)) {
+        const shell = await promoteShell(options, pprUpgrade, false)
+        if (shell) return renderPprResponse(options, shell)
+      }
+      // Param-free roots may keep serving the generic fallback while the
+      // specialized shell warms; dynamic roots cannot share that fallback.
+      schedulePprShellUpgrade(options)
+    }
   }
 
   await seedPrerenderSidecar(options)
@@ -1745,13 +1918,7 @@ export async function renderPageResponse(options: RenderOptions) {
     () =>
       runWithFontScope(() =>
         runWithCacheScope(async () => {
-          // A DOM bot (Googlebot) blocks on the full dynamic tree instead of
-          // streaming holes, so the resolved page (and its flight payload) is
-          // complete inline — a JS-executing crawler never has to resume a shell.
-          const page = await pageRender(
-            options,
-            canStreamRoute(options) && !isDomBotRequest(options),
-          )
+          const page = await pageRender(options, canStreamRoute(options))
           if (page.headers) {
             const location = readLocationHeader(page.headers)
             return new Response(method === 'HEAD' ? null : (location ?? null), {
@@ -1867,7 +2034,6 @@ interface PromotedShell {
 }
 
 const pprShellUpgrades = new Map<string, PromotedShell>()
-const pendingPprShellUpgrades = new Set<string>()
 // Upgrade keys whose promoted region resolves NON-DETERMINISTIC (request-time) bytes into the
 // static shell - a fallback route that reads its concrete param inside the postponed boundary
 // and also produces per-render content there (a fresh OTEL span id, Math.random, Date). Caching
@@ -2395,8 +2561,12 @@ async function loadPprShell(
     // bytes forever. Dropping the stale entry also re-opens promotion (schedulePprShellUpgrade
     // skips any key already in this map), so the fallthrough render warms a fresh shell.
     if (upgraded) {
-      if (bakedAtIsStale(upgraded.promotedAt)) pprShellUpgrades.delete(upgrade.key)
-      else return upgraded.shell
+      pprShellUpgrades.delete(upgrade.key)
+      if (!bakedAtIsStale(upgraded.promotedAt)) {
+        // Re-insert: eviction drops the least recently served entry first.
+        pprShellUpgrades.set(upgrade.key, upgraded)
+        return upgraded.shell
+      }
     }
   }
   // Sub-shell selection (Stage C.2): pick the deepest prebuilt sub-shell whose
@@ -2446,68 +2616,73 @@ export function schedulePprShellUpgrade(
   options: Pick<RenderOptions, 'config' | 'route' | 'url'>,
 ): void {
   const upgrade = pprShellUpgradeFor(options.config, options.route, options.url)
-  if (
-    !upgrade ||
-    pprShellUpgrades.has(upgrade.key) ||
-    pendingPprShellUpgrades.has(upgrade.key) ||
-    rejectedPprShellUpgrades.has(upgrade.key)
-  )
+  if (!upgrade || pprShellUpgrades.has(upgrade.key) || rejectedPprShellUpgrades.has(upgrade.key)) {
     return
-  pendingPprShellUpgrades.add(upgrade.key)
-  void (async () => {
+  }
+  void promoteShell(options, upgrade, true).catch(() => undefined)
+}
+
+// In-flight promotions, shared by foreground and background callers so one
+// concrete prefix renders once however many requests race for it.
+const pendingPromotions = new Map<string, Promise<PrebuiltShell | null>>()
+const PROMOTED_SHELL_LIMIT = 256
+
+function rememberPromotedShell(key: string, shell: PrebuiltShell): void {
+  if (pprShellUpgrades.size >= PROMOTED_SHELL_LIMIT) {
+    pprShellUpgrades.delete(pprShellUpgrades.keys().next().value!)
+  }
+  pprShellUpgrades.set(key, { shell, promotedAt: Date.now() })
+}
+
+function promoteShell(
+  options: Pick<RenderOptions, 'config' | 'route' | 'url'>,
+  upgrade: NonNullable<ReturnType<typeof pprShellUpgradeFor>>,
+  background: boolean,
+): Promise<PrebuiltShell | null> {
+  const pending = pendingPromotions.get(upgrade.key)
+  if (pending) return pending
+  const promotion = (async () => {
     // A runtime shell upgrade renders against the live server without the build-time resume sidecar
     // seeded in this process. Seed it first, so cache-backed fills resolve from the captured
     // snapshots instead of refetching.
-    try {
-      await getRenderExtensions().prerenderSidecar.seed(prerenderSidecarContext(options))
-    } catch {
-      // A missing/failed sidecar seed only forces the upgrade render to refetch;
-      // it never blocks the promotion.
+    if (background) {
+      try {
+        await getRenderExtensions().prerenderSidecar.seed(prerenderSidecarContext(options))
+      } catch {
+        // A missing/failed sidecar seed only forces the upgrade render to refetch.
+      }
     }
-    const prebuilt = await renderSubShell({
-      ...options,
-      concreteParams: upgrade.concreteParams,
-      paramKeys: upgrade.paramKeys,
-      runtimeRegen: true,
-      // Keep the build-time task-boundary postpone discipline: promote the
-      // concrete params into the shell, but leave any boundary that depends on
-      // uncached request-time I/O a hole (resumed live per request) instead of
-      // freezing a request-specific result in pprShellUpgrades.
-      boundedRegen: true,
-    })
-    if (prebuilt) {
-      // A PPR route already has a base shell that RESUMES its holes live on every request.
-      // Promoting a concrete param must only add param-derived static content on top of that - it
-      // must never bake request-time content (a fresh OTEL span id, Math.random, Date) into the
-      // static shell in place of the resume. Confirm the promoted shell is reproducible before
-      // caching it: re-render once more (no sidecar persist) and diff the bytes; on a mismatch
-      // drop the promotion and remember the rejection so the double render is not retried.
-      // A NON-PPR route has no base shell to fall back to - its runtime prerender IS the cache
-      // entry, so it is cached as-is with no determinism gate.
-      let cacheable = true
-      if (options.route.ppr) {
-        const confirm = await renderSubShell({
+    // `performance.now()` is prerenderable, so the confirm render replays the first one's clock.
+    const clock: number[] = []
+    const render = (probeShell: boolean) =>
+      runWithClockTape(clock, probeShell, () =>
+        renderSubShell({
           ...options,
           concreteParams: upgrade.concreteParams,
           paramKeys: upgrade.paramKeys,
           runtimeRegen: true,
+          // Keep the build-time task-boundary postpone discipline: promote the concrete params into
+          // the shell, but leave any boundary that depends on uncached request-time I/O a hole.
           boundedRegen: true,
-          probeShell: true,
-        })
-        cacheable = confirm?.shell === prebuilt.shell
-      }
-      if (cacheable) {
-        pprShellUpgrades.set(upgrade.key, {
-          shell: { ...prebuilt, concreteParams: upgrade.concreteParams },
-          promotedAt: Date.now(),
-        })
-      } else {
-        rejectedPprShellUpgrades.add(upgrade.key)
-      }
+          ...(probeShell ? { probeShell } : {}),
+        }),
+      )
+    const prebuilt = await render(false)
+    if (!prebuilt) return null
+    const shell = { ...prebuilt, concreteParams: upgrade.concreteParams }
+    // A PPR route's base shell RESUMES its holes live. A background promotion must never bake
+    // request-time content (a span id, Math.random, Date) into the static shell in place of that
+    // resume: confirm the promoted shell is reproducible before caching it; on a mismatch remember
+    // the rejection so the double render is not retried.
+    if (background && options.route.ppr && (await render(true))?.shell !== prebuilt.shell) {
+      rejectedPprShellUpgrades.add(upgrade.key)
+      return shell
     }
-  })()
-    .catch(() => undefined)
-    .finally(() => pendingPprShellUpgrades.delete(upgrade.key))
+    rememberPromotedShell(upgrade.key, shell)
+    return shell
+  })().finally(() => pendingPromotions.delete(upgrade.key))
+  pendingPromotions.set(upgrade.key, promotion)
+  return promotion
 }
 
 const paramFreeRootLayoutCache = new Map<string, boolean>()
@@ -2550,20 +2725,25 @@ export function isPprShellUpgradeEligible(
   return pprShellUpgradeFor(config, route, url) !== undefined
 }
 
-function pprShellUpgradeFor(config: ResolvedConfig, route: RouteManifestEntry, url?: URL) {
-  if (!url || !route.prerenderedParams?.length) return undefined
-  if (!hasParamFreeRootLayout(config)) return undefined
+function pprShellUpgradeFor(_config: ResolvedConfig, route: RouteManifestEntry, url?: URL) {
+  // An explicit promotion policy names the concrete prefix and whether the request waits for it;
+  // otherwise the longest generated prefix is promoted in the background under partial prefetching.
+  const policy = getRenderExtensions().paramPromotion(route)
+  if (!policy?.foreground && compatNextConfig().partialPrefetching !== true) return undefined
+  if (!url || (!policy && !route.prerenderedParams?.length)) return undefined
   const actual = matchRouteParams(route, url.pathname)
   if (!actual) return undefined
   const paramKeys = [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
-  const length = Math.max(
-    0,
-    ...route.prerenderedParams.map(params => {
-      let count = 0
-      while (count < paramKeys.length && params[paramKeys[count]!] !== undefined) count++
-      return count
-    }),
-  )
+  const length =
+    policy?.length ??
+    Math.max(
+      0,
+      ...(route.prerenderedParams ?? []).map(params => {
+        let count = 0
+        while (count < paramKeys.length && params[paramKeys[count]!] !== undefined) count++
+        return count
+      }),
+    )
   if (length === 0) return undefined
   const concreteParams: Record<string, RouteParamValue> = {}
   for (let index = 0; index < length; index++) {
@@ -2576,6 +2756,7 @@ function pprShellUpgradeFor(config: ResolvedConfig, route: RouteManifestEntry, u
     concreteParams,
     paramKeys,
     key: `${route.id}:${JSON.stringify(concreteParams)}`,
+    foreground: policy?.foreground ?? false,
   }
 }
 
@@ -2916,7 +3097,14 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
     // children tree may still match it (e.g. a sibling catch-all): resolve
     // dynamically, falling back to the nearest `default.*`, else nothing.
     let pageFile: string | undefined = options.route.file
-    if (options.route.synthetic) {
+    let implicitChildren = false
+    if (options.route.namedSlotsOnly) {
+      pageFile = undefined
+      // The pre-explicit-children model hands the layout a children branch after all.
+      implicitChildren = getRenderExtensions().implicitSlotChildren()
+      if (implicitChildren)
+        options = { ...options, route: { ...options.route, namedSlotsOnly: false } }
+    } else if (options.route.synthetic) {
       if (options.route.childrenDefault) {
         pageFile = options.route.childrenDefault
       } else {
@@ -2957,7 +3145,7 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
             profileRenderStep(profile, 'import page module', () => importModule(pageFile, options)),
           )) as PageModule)
         : undefined
-    let Page = pageModule?.default
+    let Page = implicitChildren ? ImplicitNotFoundChildren : pageModule?.default
     // A client-by-re-export page imported through the SERVER graph can come back as a
     // client-reference STUB: the chain crosses a server module whose client import the server
     // layer stubbed, and the stub renders `children ?? null`, so the no-JS document would ship an
@@ -2992,6 +3180,7 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
       Boolean(Page && (Page as unknown as ClientComponent)[clientReferenceSymbol]) ||
       Boolean(pageFile && options.route.clientReferences.some(ref => ref.file === pageFile))
     if (Page && pageIsClientReference) {
+      if (pageFile) getRenderSpanExtensions().onClientComponent?.(pageFile)
       // A `route.client` page carries no client reference (it hydrates directly at `#pnext-page`,
       // not as an island). Tag it so the server tree resolver SSRs it through the preact renderer
       // instead of server-invoking it, which has no hooks dispatcher. Leave its identity intact -
@@ -3088,6 +3277,7 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
     // PPR/fallback passes (a use() on a hanging promise must not mark it read).
     if (
       Page &&
+      !implicitChildren &&
       !pageIsClientReference &&
       !pageIsAsyncComponent &&
       !options.partial &&
@@ -3156,12 +3346,15 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
               ? Boolean(metadataExtensions.hasRuntimeMetadata?.(pageModuleRecord))
               : false,
             preferSlotMetadata: true,
+            pageDefinesHead: Boolean(pageModuleRecord && definesHead(pageModuleRecord)),
           },
         ),
       ),
     )
     return rendered
   } catch (error) {
+    const outletSlot = error && typeof error === 'object' ? slotOutletErrors.get(error) : undefined
+    if (outletSlot) options = { ...options, boundarySlot: outletSlot }
     // A partial prerender (PPR shell / runtime shell upgrade) must never bake a
     // control-flow outcome into a shell: notFound()/redirect() are per-request
     // results, and a promoted shell replays them with the shell's own 200 status
@@ -3264,16 +3457,16 @@ async function renderAuthInterruptPage(
   stream: boolean,
   kind: 'forbidden' | 'unauthorized',
 ) {
-  const { status, title, message } = authInterruptDefaults[kind]
-  const fallbackTree = httpAccessFallbackTree(status, message)
-  const file = nearestConventionFile(options, `${kind}.tsx`)
+  const { status: errorStatus, title, message } = authInterruptDefaults[kind]
+  const status = slotErrorAfterCommit(options) ? 200 : errorStatus
+  const fallbackTree = httpAccessFallbackTree(errorStatus, message)
+  const file = nearestAccessBoundary(options, `${kind}.tsx`)
   const boundaryOptions = optionsForNotFoundBoundary(options, file)
   if (!file || !conventionFileExists(file)) {
     return renderTreeOrFallback(
-      boundaryOptions,
-      fallbackTree,
+      ...placeBoundary(boundaryOptions, file, fallbackTree),
       stream,
-      { title: `${status}: ${message}` },
+      { title: `${errorStatus}: ${message}` },
       { status },
     )
   }
@@ -3281,16 +3474,18 @@ async function renderAuthInterruptPage(
   const Component = markServerReference(module.default)
   if (!Component) {
     return renderTreeOrFallback(
-      boundaryOptions,
-      fallbackTree,
+      ...placeBoundary(boundaryOptions, file, fallbackTree),
       stream,
-      { title: `${status}: ${message}` },
+      { title: `${errorStatus}: ${message}` },
       { status },
     )
   }
   return renderTreeOrFallback(
-    boundaryOptions,
-    h('div', pageRootProps, h(Component as unknown as ComponentType<Record<string, never>>, {})),
+    ...placeBoundary(
+      boundaryOptions,
+      file,
+      h('div', pageRootProps, h(Component as unknown as ComponentType<Record<string, never>>, {})),
+    ),
     stream,
     (await readModuleMetadata(module)) ?? { title },
     { status },
@@ -3547,44 +3742,285 @@ async function renderDocumentRedirect(
   }
 }
 
-async function resolveSelectedSlotMetadata(
+// A missing children branch's built-in default: not found, but only where the layout renders it.
+const ImplicitNotFoundChildren = (): never => notFound()
+
+function definesHead(module: Record<string, unknown>) {
+  return ['metadata', 'generateMetadata', 'viewport', 'generateViewport'].some(
+    key => module[key] !== undefined,
+  )
+}
+
+function once<T>(start: () => Promise<T>): () => Promise<T> {
+  let promise: Promise<T> | undefined
+  return () => {
+    if (!promise) {
+      promise = start()
+      promise.catch(() => undefined)
+    }
+    return promise
+  }
+}
+
+interface SlotLayer {
+  file: string
+  kind: 'layout' | 'page'
+  module: Record<string, unknown>
+}
+
+async function slotLayers(options: RenderOptions, match: ResolvedSlotMatch): Promise<SlotLayer[]> {
+  const layers: SlotLayer[] = []
+  for (const file of match.layoutFiles) {
+    layers.push({ file, kind: 'layout', module: await importModule(file, options) })
+  }
+  if (match.pageFile) {
+    layers.push({
+      file: match.pageFile,
+      kind: 'page',
+      module: await importModule(match.pageFile, options),
+    })
+  }
+  return layers
+}
+
+function slotProps(options: RenderOptions, match: ResolvedSlotMatch): PageProps {
+  return {
+    ...createPageProps(options),
+    params: Promise.resolve({ ...(options.params ?? {}), ...match.params }),
+  }
+}
+
+async function readSlotMetadata(
+  options: RenderOptions,
+  layers: SlotLayer[],
+  props: PageProps,
+  parentEntries: MetadataEntry[],
+): Promise<MetadataEntry[]> {
+  const entries: MetadataEntry[] = []
+  for (const { file, kind, module } of layers) {
+    const resolved = await readRenderModuleMetadata(
+      options,
+      module,
+      props,
+      mergeMetadataEntries(parentEntries, entries),
+      file,
+      options.staticModuleMetadata?.[file]?.metadata,
+    )
+    if (resolved) entries.push({ metadata: resolved, dir: dirname(file), kind })
+  }
+  return entries
+}
+
+/** Inspect a slot branch's head definitions; its metadata and viewport generators start on first read. */
+async function readSlotBranch(
+  options: RenderOptions,
+  match: ResolvedSlotMatch,
+  parentEntries: MetadataEntry[],
+  childrenDefinesHead: (fork: string) => boolean,
+): Promise<SlotHeadBranch> {
+  const props = slotProps(options, match)
+  const extensions = getActiveMetadataExtensions(options.config)
+  const depthOf = (dir: string) => relative(match.slotDir, dir).split(sep).filter(Boolean).length
+  const layers = await slotLayers(options, match)
+  let hasSource = false
+  let runtime = false
+  let definitionDepth = -1
+  for (const { file, kind, module } of layers) {
+    const moduleRuntime = Boolean(extensions.hasRuntimeMetadata?.(module))
+    runtime ||= moduleRuntime
+    hasSource ||= moduleRuntime || module.metadata !== undefined
+    if (definesHead(module)) {
+      definitionDepth = Math.max(
+        definitionDepth,
+        depthOf(dirname(file)) + (kind === 'page' ? 1 : 0),
+      )
+    }
+  }
+  const pageDir = match.pageFile ? dirname(match.pageFile) : match.slotDir
+  for (let dir = pageDir; ; dir = dirname(dir)) {
+    if (hasHeadMetadataFiles(dir)) definitionDepth = Math.max(definitionDepth, depthOf(dir))
+    if (dir === match.slotDir) break
+  }
+  return {
+    slotDir: match.slotDir,
+    hasSource,
+    runtime,
+    definitionDepth,
+    pageDepth: depthOf(pageDir),
+    childrenDefinesHead: childrenDefinesHead(dirname(match.slotDir)),
+    metadata: once(() => readSlotMetadata(options, layers, props, parentEntries)),
+    viewport: once(async () => {
+      const viewports: Viewport[] = []
+      for (const { module } of layers) {
+        const viewport = await (extensions.readModuleViewport
+          ? extensions.readModuleViewport(module, props)
+          : readModuleViewport(module))
+        if (viewport) viewports.push(viewport)
+      }
+      return viewports
+    }),
+  }
+}
+
+/** Core's slot head: the first branch defining metadata, read in order; its errors propagate. */
+async function firstSlotHead(
   options: RenderOptions,
   matches: ResolvedSlotMatch[],
   parentEntries: MetadataEntry[],
-): Promise<{ entries: MetadataEntry[]; runtime: boolean }> {
+): Promise<SlotHead> {
+  const extensions = getActiveMetadataExtensions(options.config)
   for (const match of matches) {
-    const entries: MetadataEntry[] = []
-    let runtime = false
-    let hasSource = false
-    const props = {
-      ...createPageProps(options),
-      params: Promise.resolve({ ...(options.params ?? {}), ...match.params }),
-    }
-    const files = [
-      ...match.layoutFiles.map(file => ({ file, kind: 'layout' as const })),
-      ...(match.pageFile ? [{ file: match.pageFile, kind: 'page' as const }] : []),
-    ]
-    for (const { file, kind } of files) {
-      const module = await importModule(file, options)
-      const extensions = getActiveMetadataExtensions(options.config)
-      const moduleRuntime = Boolean(extensions.hasRuntimeMetadata?.(module))
-      runtime ||= moduleRuntime
-      hasSource ||= moduleRuntime || module.metadata !== undefined
-      const metadata = await readRenderModuleMetadata(
-        options,
-        module,
-        props,
-        mergeMetadataEntries(parentEntries, entries),
-        file,
-        options.staticModuleMetadata?.[file]?.metadata,
-      )
-      if (metadata) {
-        entries.push({ metadata, dir: dirname(file), kind })
-      }
-    }
-    if (hasSource) return { entries, runtime }
+    const layers = await slotLayers(options, match)
+    const runtime = layers.some(layer => Boolean(extensions.hasRuntimeMetadata?.(layer.module)))
+    const hasSource = runtime || layers.some(layer => layer.module.metadata !== undefined)
+    const entries = await readSlotMetadata(
+      options,
+      layers,
+      slotProps(options, match),
+      parentEntries,
+    )
+    if (hasSource) return { entries, viewport: [], runtime }
   }
-  return { entries: [], runtime: false }
+  return { entries: [], viewport: [], runtime: false }
+}
+
+// Whether the children branch defines head tags below a slot's owner layout: a layout or page export,
+// or a metadata image file, on its path past the fork.
+function childrenHeadBelow(
+  options: RenderOptions,
+  layoutRender: LayoutRender,
+  extra: RenderTreeExtra,
+): (fork: string) => boolean {
+  if (options.route.namedSlotsOnly) return () => false
+  const leaf = extra.pageMetadataDir ?? dirname(options.route.file)
+  return fork => {
+    const below = (dir: string) =>
+      dir.startsWith(`${fork}${sep}`) && !relative(fork, dir).split(sep).some(isSlotSegment)
+    // The page sits under its own dir's layout, so a page at the fork is still below it.
+    if (extra.pageDefinesHead && (leaf === fork || below(leaf))) return true
+    if (layoutRender.headDirs.some(below)) return true
+    for (let dir = leaf; below(dir); dir = dirname(dir)) {
+      if (hasHeadMetadataFiles(dir)) return true
+    }
+    return false
+  }
+}
+
+async function planSlotHead(
+  options: RenderOptions,
+  layoutRender: LayoutRender,
+  extra: RenderTreeExtra,
+): Promise<SlotHeadPolicy> {
+  const fallback = () => firstSlotHead(options, layoutRender.slotMatches, layoutRender.metadata)
+  const policy = await getActiveMetadataExtensions(options.config).slotHead?.({
+    namedSlotsOnly: Boolean(options.route.namedSlotsOnly),
+    routerPayload: routerPayload(options),
+    fallback,
+    analyze: async () => {
+      const childrenDefinesHead = childrenHeadBelow(options, layoutRender, extra)
+      const branches: SlotHeadBranch[] = []
+      for (const match of layoutRender.slotMatches) {
+        branches.push(
+          await readSlotBranch(options, match, layoutRender.metadata, childrenDefinesHead),
+        )
+      }
+      return branches
+    },
+    logError: error => logUnrenderedSlotError(options, error),
+  })
+  return policy ?? { outlets: new Map(), head: fallback }
+}
+
+/** Where an escaped error came from: a slot dir and the file its boundaries are found from. */
+interface ErrorSlot {
+  dir: string
+  file: string
+}
+
+const slotOutletErrors = new WeakMap<object, ErrorSlot>()
+
+function logUnrenderedSlotError(options: RenderOptions, error: unknown) {
+  if (isRenderControlFlowError(error)) return
+  logDevError(options, resolveThrownError(error, nextCompatEnabled(options.config)))
+}
+
+// A rendered slot's metadata outlet, holding the slot's content. A blocking document lets a rejection
+// take the normal error/status path; once the response committed, the slot's own boundary (HTTP-access
+// or error.*) replaces the content, and one with no boundary throws on, attributed to the slot.
+const SlotOutlet = async (props: {
+  outlet: Promise<unknown>
+  options: RenderOptions
+  slot: ErrorSlot
+  /** The response has committed (streamed shell or navigation): the slot's boundary takes it. */
+  committed: boolean
+  children?: ComponentChildren
+}): Promise<ComponentChildren> => {
+  try {
+    await props.outlet
+    return props.children ?? null
+  } catch (error) {
+    if (!props.committed) {
+      if (error && typeof error === 'object') slotOutletErrors.set(error, props.slot)
+      throw error
+    }
+    const kind = isNotFoundError(error)
+      ? 'not-found'
+      : isForbiddenError(error)
+        ? 'forbidden'
+        : isUnauthorizedError(error)
+          ? 'unauthorized'
+          : undefined
+    const options = { ...props.options, boundarySlot: props.slot }
+    if (kind) return slotAccessBoundary(options, kind)
+    const file = isRedirectError(error) ? undefined : nearestConventionFile(options, 'error.tsx')
+    const resolved = resolveThrownError(error, nextCompatEnabled(options.config))
+    const boundary = file ? await errorBoundaryElement(options, file, resolved) : undefined
+    if (boundary) {
+      logDevError(options, resolved)
+      return boundary
+    }
+    if (error && typeof error === 'object') slotOutletErrors.set(error, props.slot)
+    throw error
+  }
+}
+
+async function slotAccessBoundary(
+  options: RenderOptions,
+  kind: 'not-found' | 'forbidden' | 'unauthorized',
+): Promise<ComponentChildren> {
+  const file = nearestAccessBoundary(options, `${kind}.tsx`)
+  if (file) {
+    const reference = conventionDefaultReference(options, file)
+    const Component = reference
+      ? clientReferenceStub(reference)
+      : markServerReference(((await importModule(file, options)) as PageModule).default)
+    if (Component) return h(Component as ComponentType<Record<string, never>>, {})
+  }
+  if (kind === 'not-found') return defaultNotFoundTree()
+  const { status, message } = authInterruptDefaults[kind]
+  return httpAccessFallbackTree(status, message)
+}
+
+/**
+ * Each rendered slot's outlet wraps its content. Where metadata streams it suspends (fallback-free) so
+ * the shell commits first; where metadata blocks it holds the shell.
+ */
+function slotOutletWrappers(
+  options: RenderOptions,
+  matches: ResolvedSlotMatch[],
+  outlets: Map<string, Promise<unknown>>,
+): Map<string, (content: ComponentChildren) => ComponentChildren> {
+  const committed = routerPayload(options) || shouldRenderRuntimeMetadataInBody(options, true)
+  const Outlet = markServerReference(SlotOutlet) as ComponentType<Record<string, unknown>>
+  const wrappers = new Map<string, (content: ComponentChildren) => ComponentChildren>()
+  for (const [dir, outlet] of outlets) {
+    const slot = { dir, file: matches.find(match => match.slotDir === dir)?.pageFile ?? dir }
+    wrappers.set(dir, content => {
+      const node = h(Outlet, { outlet, options, slot, committed }, content)
+      return committed ? h(Suspense, { fallback: null }, node) : node
+    })
+  }
+  return wrappers
 }
 
 /**
@@ -3610,10 +4046,23 @@ async function renderTreeInFrame(
   clearDeferredScripts()
   const profile = renderProfile(options)
   const slotStateOut: Record<string, string> = options.slotStateOut ?? {}
-  options = { ...options, slotStateOut }
-  const layoutRender = await profileRenderStep(profile, 'apply layouts', () =>
-    applyLayouts(options, tree),
+  options = {
+    ...options,
+    slotStateOut,
+    renderedSlots: new Set<string>(),
+  }
+  const layoutRender = await getRenderSpanExtensions().withComponentTreeSpan(() =>
+    profileRenderStep(profile, 'apply layouts', () => applyLayouts(options, tree)),
   )
+  const slotHead =
+    extra.preferSlotMetadata && layoutRender.slotMatches.length > 0
+      ? await profileRenderStep(profile, 'slot branches', () =>
+          planSlotHead(options, layoutRender, extra),
+        )
+      : undefined
+  if (slotHead) {
+    options.slotOutlets = slotOutletWrappers(options, layoutRender.slotMatches, slotHead.outlets)
+  }
   const clientComponents: ClientComponentMap =
     options.clientComponents ?? new Map<string, ComponentType<Record<string, unknown>>>()
   if (options.clientComponentsPreload) {
@@ -3717,11 +4166,11 @@ async function renderTreeInFrame(
   if ((extra.status ?? 200) >= 500) {
     document.htmlProps = { ...document.htmlProps, 'data-pnext-ssr-error': '' }
   }
-  const slotMetadata = extra.preferSlotMetadata
+  const slotMetadata = slotHead
     ? await profileRenderStep(profile, 'slot metadata', () =>
-        resolveSelectedSlotMetadata(options, layoutRender.slotMatches, layoutRender.metadata),
+        slotHead.head(options.renderedSlots ?? new Set()),
       )
-    : { entries: [], runtime: false }
+    : { entries: [], viewport: [], runtime: false }
   const runtimeMetadata =
     layoutRender.runtimeMetadata || Boolean(extra.runtimePageMetadata) || slotMetadata.runtime
   const metadataMayStream = shouldRenderRuntimeMetadataInBody(options, runtimeMetadata)
@@ -3851,6 +4300,7 @@ async function renderTreeInFrame(
         options.route.file,
         options.url.pathname,
         file => importModule(file, options),
+        slotHead?.onSlotFileError,
       ),
     ))
   const composeMetadata = (pageMeta: Metadata) => {
@@ -3926,7 +4376,11 @@ async function renderTreeInFrame(
       ),
     )
   }
-  const viewport = mergeViewport(...layoutRender.viewport, extra.viewport ?? {})
+  const viewport = mergeViewport(
+    ...layoutRender.viewport,
+    ...slotMetadata.viewport,
+    extra.viewport ?? {},
+  )
   if (options.partial?.mode === 'request' && options.partial.metadataDynamic) {
     options.partial.chunks.push(
       [
@@ -3951,10 +4405,12 @@ async function renderTreeInFrame(
   // Dynamic-import chunks ship as Next does: `preload as=script` at low
   // fetchpriority, emitted after the render-blocking stylesheet so they stay
   // off the critical path.
+  // The framework runtime chunks load on demand; only a route with links preloads them.
+  const runtimeImports = new Set(options.route.softLinks ? [] : options.route.clientRuntimeImports)
   const dynamicModulePreloads = profileRenderSyncStep(profile, 'dynamic preloads', () =>
-    (options.route.clientDynamicImports ?? []).map(asset =>
-      withAssetPrefix(options.config, clientAssetPath(options.config, asset)),
-    ),
+    (options.route.clientDynamicImports ?? [])
+      .filter(asset => !runtimeImports.has(asset))
+      .map(asset => withAssetPrefix(options.config, clientAssetPath(options.config, asset))),
   )
   const deferredScripts = profileRenderSyncStep(profile, 'deferred scripts', () =>
     renderDeferredScriptRuntime(takeDeferredScripts()),
@@ -4260,6 +4716,9 @@ function navigationStateScript(options: RenderOptions, slots: Record<string, str
     // reused for a navigation from another host, nor as the direct target).
     ...(hostRender ? { hostRender: true } : {}),
   }
+  const routes = hostRender ? getRequestRuntime()?.routes : undefined
+  const intercepted = routes && matchInterception(routes, options.url.pathname, children)
+  if (intercepted) state.interceptedRoute = intercepted.route.route
   const json = JSON.stringify(state).replace(/</g, '\\u003c')
   return `<script id="__PNEXT_NAV_STATE__" type="application/json">${json}</script>`
 }
@@ -4482,17 +4941,17 @@ async function renderNotFoundPage(
     skipNoindex?: boolean
   } = {},
 ) {
-  const status = extra.status ?? 404
+  // A slot's error lands after the shell commits.
+  const status = extra.status ?? (slotErrorAfterCommit(options) ? 200 : 404)
   // Server-action 404s carry no fallback robots (Next's NonIndex skip).
   const fallbackRobots = extra.skipNoindex ? {} : { robots: 'noindex' }
   // forceDefault: globalNotFound is enabled but no global-not-found.* exists —
   // skip the app's not-found.* boundary and render the built-in default 404.
-  const file = extra.forceDefault ? undefined : nearestConventionFile(options, 'not-found.tsx')
+  const file = extra.forceDefault ? undefined : nearestAccessBoundary(options, 'not-found.tsx')
   const notFoundOptions = optionsForNotFoundBoundary(options, file)
   if (!file) {
     const page = await renderTreeOrFallback(
-      notFoundOptions,
-      defaultNotFoundTree(),
+      ...placeBoundary(notFoundOptions, file, defaultNotFoundTree()),
       stream,
       { title: '404: This page could not be found.', ...fallbackRobots },
       { status },
@@ -4519,8 +4978,7 @@ async function renderNotFoundPage(
   }
   if (!NotFound) {
     const page = await renderTreeOrFallback(
-      notFoundOptions,
-      defaultNotFoundTree(),
+      ...placeBoundary(notFoundOptions, file, defaultNotFoundTree()),
       stream,
       { title: '404: This page could not be found.', ...fallbackRobots },
       { status },
@@ -4555,8 +5013,11 @@ async function renderNotFoundPage(
       ? await metaExt.readModuleViewport(moduleRecord, metaProps)
       : await readModuleViewport(module)
   const page = await renderTreeOrFallback(
-    notFoundOptions,
-    h('div', pageRootProps, h(NotFound as unknown as ComponentType<Record<string, never>>, {})),
+    ...placeBoundary(
+      notFoundOptions,
+      file,
+      h('div', pageRootProps, h(NotFound as unknown as ComponentType<Record<string, never>>, {})),
+    ),
     stream,
     // On the skip path a baked `<title>Not found</title>` would precede the
     // streamed metadata chunk in document order and win `document.title`.
@@ -4601,11 +5062,16 @@ function optionsForNotFoundBoundary(
 }
 
 function withNextFlightText(page: PageRender) {
-  const payload = JSON.stringify(page.body).replace(/</g, '\\u003c')
-  return {
-    ...page,
-    routeScript: `${page.routeScript}<script>self.__next_f=self.__next_f||[]</script><script>self.__next_f.push([1,${payload}])</script>`,
+  const flight = (body: string) =>
+    `<script>self.__next_f=self.__next_f||[]</script><script>self.__next_f.push([1,${JSON.stringify(body).replace(/</g, '\\u003c')}])</script>`
+  if (page.streamChunks.length === 0) {
+    return { ...page, routeScript: `${page.routeScript}${flight(page.body)}` }
   }
+  // A boundary under a loading fallback streams in after the shell: its flight text follows it.
+  page.streamChunks.push(
+    Promise.all([...page.streamChunks]).then(chunks => flight(chunks.join(''))),
+  )
+  return page
 }
 
 async function renderErrorPage(options: RenderOptions, error: unknown, stream: boolean) {
@@ -4615,40 +5081,13 @@ async function renderErrorPage(options: RenderOptions, error: unknown, stream: b
   if (!file) return renderGenericErrorPage(options, resolvedError, stream)
 
   try {
-    const clientDirective = await conventionUsesClient(file)
-    const module = (
-      clientDirective ? await importClientModule(file, options) : await importModule(file, options)
-    ) as ErrorModule
-    interface ErrorComponentProps {
-      error: Error
-      reset?: () => void
-      unstable_retry?: () => void
-    }
-    const ErrorPage = module.default
-    if (!ErrorPage) return renderGenericErrorPage(options, resolvedError, stream)
-    const ErrorComponent = clientDirective
-      ? errorClientComponent(options, file, ErrorPage as ComponentType<ErrorComponentProps>)
-      : (markServerReference(ErrorPage) as unknown as ComponentType<ErrorComponentProps>)
-    const errorProps = serializableError(
-      resolvedError,
-      Boolean(options.dev),
-      nextCompatEnabled(options.config),
-    )
-    const reset = errorResetCallback()
+    const boundary = await errorBoundaryElement(options, file, resolvedError)
+    if (!boundary) return renderGenericErrorPage(options, resolvedError, stream)
     // Awaited inside the try on purpose: a bare `return` hands the rejection to
     // the caller, and an error boundary that fails to render answered with a
     // bodiless 500 instead of the generic error document.
     return await renderTree(
-      options,
-      h(
-        'div',
-        pageRootProps,
-        h(ErrorComponent, {
-          error: errorProps,
-          reset,
-          unstable_retry: reset,
-        }),
-      ),
+      ...placeBoundary(options, file, h('div', pageRootProps, boundary)),
       stream,
       { title: 'Error' },
       { status: 500 },
@@ -4656,6 +5095,30 @@ async function renderErrorPage(options: RenderOptions, error: unknown, stream: b
   } catch {
     return renderGenericErrorPage(options, resolvedError, stream)
   }
+}
+
+/** The error.* boundary component rendered for `error`, or undefined when the file exports none. */
+async function errorBoundaryElement(options: RenderOptions, file: string, error: Error) {
+  const clientDirective = await conventionUsesClient(file)
+  const module = (
+    clientDirective ? await importClientModule(file, options) : await importModule(file, options)
+  ) as ErrorModule
+  interface ErrorComponentProps {
+    error: Error
+    reset?: () => void
+    unstable_retry?: () => void
+  }
+  const ErrorPage = module.default
+  if (!ErrorPage) return undefined
+  const ErrorComponent = clientDirective
+    ? errorClientComponent(options, file, ErrorPage as ComponentType<ErrorComponentProps>)
+    : (markServerReference(ErrorPage) as unknown as ComponentType<ErrorComponentProps>)
+  const reset = errorResetCallback()
+  return h(ErrorComponent, {
+    error: serializableError(error, Boolean(options.dev), nextCompatEnabled(options.config)),
+    reset,
+    unstable_retry: reset,
+  })
 }
 
 function errorResetCallback() {
@@ -4890,8 +5353,49 @@ async function conventionUsesClient(file: string) {
   return served ? served.client.has(file) : hasUseClientDirective(await readText(file))
 }
 
+// A named-slot-only route's own render error lands after its shell commits; an outlet's reaching here
+// came from a blocking document and keeps the normal status.
+function slotErrorAfterCommit(options: RenderOptions) {
+  return Boolean(options.route.namedSlotsOnly && !options.boundarySlot)
+}
+
+// The slot an error escaped from: one whose outlet threw it, or a named-slot-only route's own.
+function errorSlot(options: RenderOptions): ErrorSlot | undefined {
+  if (options.boundarySlot) return options.boundarySlot
+  const dir = options.route.namedSlotsOnly ? options.route.syntheticSlotDir : undefined
+  return dir ? { dir, file: options.route.file } : undefined
+}
+
+// A not-found/forbidden/unauthorized boundary wraps only its layout's children branch, so an error from
+// a slot reaches the nearest one inside the slot or above the slot's owner layout.
+function nearestAccessBoundary(options: RenderOptions, name: string) {
+  const slot = errorSlot(options)
+  if (!slot) return nearestConventionFile(options, name)
+  const owner = `${dirname(slot.dir)}${sep}`
+  return [...findConventionFiles(options.config.appPath, slot.file, name)].reverse().find(file => {
+    const dir = `${dirname(file)}${sep}`
+    return (
+      (dir.startsWith(`${slot.dir}${sep}`) || !dir.startsWith(owner)) && conventionFileExists(file)
+    )
+  })
+}
+
+// The slot's layout has no children to replace: a boundary at or below the owner renders in the slot.
+function placeBoundary(
+  options: RenderOptions,
+  file: string | undefined,
+  tree: ComponentChildren,
+): [RenderOptions, ComponentChildren] {
+  const slot = errorSlot(options)
+  if (!slot || (file && !`${dirname(file)}${sep}`.startsWith(`${dirname(slot.dir)}${sep}`))) {
+    return [options, tree]
+  }
+  return [{ ...options, slotFallback: { dir: slot.dir, tree } }, h('div', pageRootProps)]
+}
+
 function nearestConventionFile(options: RenderOptions, name: string) {
-  return [...findConventionFiles(options.config.appPath, options.route.file, name)]
+  const from = options.boundarySlot?.file ?? options.route.file
+  return [...findConventionFiles(options.config.appPath, from, name)]
     .reverse()
     .find(conventionFileExists)
 }
@@ -4985,6 +5489,23 @@ function preloadClientReferences(options: RenderOptions, profile: RenderProfile 
 
 function mergeClientComponents(target: ClientComponentMap, source: ClientComponentMap) {
   for (const [id, component] of source) target.set(id, component)
+}
+
+/**
+ * Import a page route's layouts, page and SSR client references without rendering, so a fresh server
+ * instance's first request skips that import pass. Failures stay quiet: that request re-imports and
+ * reports them.
+ */
+export async function warmPageModules(config: ResolvedConfig, route: RouteManifestEntry) {
+  await registerServerRuntime(config, route.sourceFiles)
+  const options: ModuleLoadOptions = { config, route }
+  const files = [...findLayouts(config.appPath, route.file), route.file].filter(existsSync)
+  await Promise.allSettled([
+    ...route.clientReferences
+      .filter(ssrClientReference)
+      .map(reference => importClientModule(reference.file, options)),
+    ...files.map(file => importModule(file, options)),
+  ])
 }
 
 function markableClientReferences(options: RenderOptions) {
@@ -5238,7 +5759,8 @@ class IslandBoundary extends Component<IslandBoundaryProps, { failed: boolean; e
 
   render(props: IslandBoundaryProps, state: { failed: boolean; error: unknown }) {
     if (state.failed) {
-      if (isPostpone(state.error) && props.csrFallback !== undefined) {
+      // Outside a prerender a postpone has no hole to record: the island renders client-only.
+      if (isPostpone(state.error) && (props.csrFallback !== undefined || !isPrerendering())) {
         return h(
           'pnext-client',
           { ...props.islandProps, 'data-pnext-ssr-failed': '' },
@@ -5416,18 +5938,25 @@ function withIslandBoundaryError(
   return { ...node, props: { ...node.props, [ISLAND_BOUNDARY_ERROR_PROP]: marker } }
 }
 
-async function resolveServerTree(node: unknown, state: ResolveState): Promise<ComponentChildren> {
-  if (node == null || typeof node !== 'object') return node as ComponentChildren
-  if (Array.isArray(node)) return Promise.all(node.map(child => resolveServerTree(child, state)))
-  if (!isVNode(node)) return node as ComponentChildren
+async function resolveServerTree(input: unknown, state: ResolveState): Promise<ComponentChildren> {
+  if (input == null || typeof input !== 'object') return input as ComponentChildren
+  if (Array.isArray(input)) return Promise.all(input.map(child => resolveServerTree(child, state)))
+  if (!isVNode(input)) return input as ComponentChildren
+  let node = input
 
   if (isSuspenseVNode(node)) {
     if (state.partial) return resolvePartialSuspense(node, state, state.partial)
+    const scope = prerenderOutcomeScope.getStore()
     if (isCsrBailoutPrerender()) {
       const fallback = await resolveServerTree(node.props.fallback, state)
-      return resolveServerTree(node.props.children, { ...state, csrBailoutFallback: fallback })
+      const children = resolveServerTree(node.props.children, {
+        ...state,
+        csrBailoutFallback: fallback,
+      })
+      return scope ? catchPrerenderSuspense(scope, node, state, children, fallback) : children
     }
-    return resolveServerTree(node.props.children, state)
+    const children = resolveServerTree(node.props.children, state)
+    return scope ? catchPrerenderSuspense(scope, node, state, children) : children
   }
 
   if (typeof node.type !== 'function') {
@@ -5451,6 +5980,7 @@ async function resolveServerTree(node: unknown, state: ResolveState): Promise<Co
       resolveServerTree(node.props.children, state),
     )
   }
+  node = enterSlotMarker(node, state.options.renderedSlots, state.options.slotOutlets)
   // A parallel-route slot marker (render/slots.ts): arm the build task boundary
   // while resolving the slot subtree, so a slot that resolves in a task becomes
   // a hole (Next parity) without affecting any other <Suspense>.
@@ -5576,6 +6106,95 @@ async function resolveCachedServerComponent(
     }
     throw error
   }
+}
+
+/** A control-flow outcome a prerender's Suspense boundary caught; see renderPageWithStatus. */
+interface PrerenderOutcome {
+  status: number
+  location?: string
+}
+
+interface PrerenderOutcomeScope {
+  outcomes: PrerenderOutcome[]
+  compat: boolean
+  nextId: number
+}
+
+const prerenderOutcomeScope = new AsyncLocalStorage<PrerenderOutcomeScope>()
+
+function prerenderOutcome(error: unknown, compat: boolean): PrerenderOutcome | undefined {
+  if (isRedirectError(error)) return { status: error.status, location: error.location }
+  if (isNotFoundError(error)) return { status: 404 }
+  if (!compat) return undefined
+  if (isForbiddenError(error)) return { status: 403 }
+  if (isUnauthorizedError(error)) return { status: 401 }
+  return undefined
+}
+
+// A prerender keeps its shell when a boundary catches control flow: record the outcome, show the
+// fallback, and for notFound swap in the not-found UI once the document loads.
+async function catchPrerenderSuspense(
+  scope: PrerenderOutcomeScope,
+  node: ServerVNode,
+  state: ResolveState,
+  children: Promise<ComponentChildren>,
+  resolvedFallback?: ComponentChildren,
+): Promise<ComponentChildren> {
+  try {
+    return await children
+  } catch (error) {
+    const outcome = prerenderOutcome(error, scope.compat)
+    if (!outcome) throw error
+    scope.outcomes.push(outcome)
+    const id = `prerender-${scope.nextId++}`
+    const fallback = resolvedFallback ?? (await resolveServerTree(node.props.fallback, state))
+    if (!isNotFoundError(error)) return fallback
+    const replacement = renderSuspenseReplacement(
+      id,
+      await renderStreamNotFoundBoundary(state),
+      state.options,
+      documentNonce(state.options.request),
+    )
+    return h(
+      Fragment,
+      null,
+      h('pnext-suspense', { 'data-pnext-suspense': id }, fallback),
+      h('div', {
+        style: { display: 'contents' },
+        dangerouslySetInnerHTML: { __html: replacement },
+      }),
+    )
+  }
+}
+
+// The island-side twin of catchPrerenderSuspense: wraps a client Suspense's children during a
+// prerender. Suspensions are re-thrown to the Suspense; caught control flow renders the fallback.
+class PrerenderSuspenseCatch extends Component<
+  { fallback?: ComponentChildren; children?: ComponentChildren },
+  { caught?: boolean }
+> {
+  static getDerivedStateFromError(error: unknown) {
+    return isPromise(error) ? null : { caught: true }
+  }
+
+  componentDidCatch(error: unknown) {
+    const scope = prerenderOutcomeScope.getStore()
+    const outcome = scope && !isPromise(error) && prerenderOutcome(error, scope.compat)
+    if (!outcome) throw error
+    scope.outcomes.push(outcome)
+  }
+
+  render(props: { fallback?: ComponentChildren; children?: ComponentChildren }) {
+    return this.state.caught ? props.fallback : props.children
+  }
+}
+
+function applyPrerenderSuspenseCatch(vnode: VNode): void {
+  if (!prerenderOutcomeScope.getStore()) return
+  if (typeof vnode.type !== 'function' || !isSuspenseVNode(vnode)) return
+  const props = vnode.props as { fallback?: ComponentChildren; children?: ComponentChildren }
+  if ((props.children as VNode | undefined)?.type === PrerenderSuspenseCatch) return
+  props.children = h(PrerenderSuspenseCatch, { fallback: props.fallback }, props.children)
 }
 
 /** Navigation control flow (redirect/notFound/forbidden/unauthorized) — never a failure. */
@@ -6070,13 +6689,14 @@ function reportStreamRenderError(error: unknown, state: StreamState): void {
 }
 
 function resolveServerTreeForStream(
-  node: unknown,
+  input: unknown,
   state: StreamState,
 ): ComponentChildren | Promise<ComponentChildren> {
-  if (node == null || typeof node !== 'object') return node as ComponentChildren
-  if (Array.isArray(node))
-    return settleChildren(node.map(child => resolveServerTreeForStream(child, state)))
-  if (!isVNode(node)) return node as ComponentChildren
+  if (input == null || typeof input !== 'object') return input as ComponentChildren
+  if (Array.isArray(input))
+    return settleChildren(input.map(child => resolveServerTreeForStream(child, state)))
+  if (!isVNode(input)) return input as ComponentChildren
+  let node = input
 
   if (isSuspenseVNode(node)) {
     // Snapshot BEFORE recursing: reaching the `<html>` element deeper in this same synchronous call
@@ -6106,7 +6726,7 @@ function resolveServerTreeForStream(
       return Promise.resolve(children)
     }
     if (!isPromise(children)) return children
-    if (isUseCacheJoinerPromise(children)) return children
+    if (getRenderExtensions().streamingPromise?.shouldAwait(children)) return children
     return streamSuspenseBoundary(node, children, state)
   }
 
@@ -6124,12 +6744,16 @@ function resolveServerTreeForStream(
       resolveServerTreeForStream(node.props.children, state),
     )
     if (isPromise(children)) {
-      return children.then(resolved => elementVNode(node, resolved, state))
+      return inheritStreamingPromise(
+        children,
+        children.then(resolved => elementVNode(node, resolved, state)),
+      )
     }
     return elementVNode(node, children, state)
   }
 
   const component = node.type
+  node = enterSlotMarker(node, state.options.renderedSlots, state.options.slotOutlets)
   // Per-slot params scope marker: re-establish the slot's params while resolving
   // its subtree so nested islands capture them (see resolveServerTree above).
   if ((component as { [paramsScopeSymbol]?: true })[paramsScopeSymbol]) {
@@ -6206,17 +6830,25 @@ function resolveServerTreeForStream(
   }
   if (isPromise(result)) {
     const resolved = result.then(value => resolveServerTreeForStream(value, state))
-    if (isUseCacheJoinerPromise(result)) {
-      ;(resolved as unknown as Record<symbol, unknown>)[useCacheJoinerPromiseSymbol] = true
-    }
-    return resolved
+    return inheritStreamingPromise(result, resolved)
   }
   return resolveServerTreeForStream(result, state)
 }
 
 function settleChildren(children: (ComponentChildren | Promise<ComponentChildren>)[]) {
-  const pending = children.filter(isPromise)
-  return pending.length > 0 ? Promise.all(children.map(child => Promise.resolve(child))) : children
+  if (!children.some(isPromise)) return children
+  const settled = Promise.all(children.map(child => Promise.resolve(child)))
+  const streaming = getRenderExtensions().streamingPromise
+  if (streaming) {
+    const pending = children.filter(isPromise)
+    if (pending.every(streaming.shouldAwait)) streaming.inherit(pending[0]!, settled)
+  }
+  return settled
+}
+
+function inheritStreamingPromise<T>(source: Promise<unknown>, result: Promise<T>): Promise<T> {
+  getRenderExtensions().streamingPromise?.inherit(source, result)
+  return result
 }
 
 async function settleRoot(node: ComponentChildren | Promise<ComponentChildren>) {
@@ -6252,10 +6884,6 @@ async function* completed<T>(promises: Promise<T>[]) {
 
 function isPromise<T>(value: T | Promise<T>): value is Promise<T> {
   return typeof value === 'object' && value !== null && 'then' in value
-}
-
-function isUseCacheJoinerPromise(value: Promise<unknown>): boolean {
-  return Boolean((value as unknown as Record<symbol, unknown>)[useCacheJoinerPromiseSymbol])
 }
 
 function isVNode(value: unknown): value is ServerVNode {
@@ -6785,6 +7413,7 @@ async function ensureClientComponent(reference: ClientReference, state: ResolveS
   // Non-SSR references only need registration for the client entry; importing
   // the module would run client code (ssr: false may touch browser globals).
   if (!ssrClientReference(resolvedReference)) return
+  getRenderSpanExtensions().onClientComponent?.(resolvedReference.file)
   if (state.clientComponents.has(resolvedReference.id)) return
   const module = await importClientModule(resolvedReference.file, state.options)
   const component = clientComponentExport(
@@ -7335,7 +7964,7 @@ export function clientIslandMarkerBootstrapSource(mode: PageSlotMarkerMode = 'ma
 // notFound() thrown inside a streamed Suspense boundary: render the nearest not-found convention
 // file in place of the boundary's content, same as the top-level 404 path, but as a plain fragment
 // (the document shell already flushed) plus the noindex tag Next always emits.
-async function renderStreamNotFoundBoundary(state: StreamState): Promise<string> {
+async function renderStreamNotFoundBoundary(state: ActionSerializeState): Promise<string> {
   const body = await renderVNodeToString(
     h(Fragment, null, await streamNotFoundBoundaryTree(state)),
     state,
@@ -7346,9 +7975,9 @@ async function renderStreamNotFoundBoundary(state: StreamState): Promise<string>
 // The not-found boundary's tree (convention file or built-in fallback) plus the
 // noindex tag Next always emits for it. Shared by the out-of-order chunk path
 // (stringified) and the in-place suspending path (rendered as vnodes).
-async function streamNotFoundBoundaryTree(state: StreamState): Promise<ComponentChildren> {
+async function streamNotFoundBoundaryTree(state: ActionSerializeState): Promise<ComponentChildren> {
   const options = state.options
-  const file = nearestConventionFile(options, 'not-found.tsx')
+  const file = nearestAccessBoundary(options, 'not-found.tsx')
   const module = file ? ((await importModule(file, options)) as PageModule) : undefined
   const NotFound = module?.default
   const tree = NotFound
@@ -7538,6 +8167,7 @@ async function applyLayouts(
   const viewport: Viewport[] = []
   const layoutProps = createPageProps(options)
   const layouts: LoadedLayout[] = []
+  const headDirs: string[] = []
   // Cheap leaf span for the page (leaf) segment-module resolution, nested under
   // the render-body span alongside the per-layout segment spans below.
   getRenderSpanExtensions().emitResolveSegmentSpan('__PAGE__')
@@ -7642,13 +8272,11 @@ async function applyLayouts(
       if (!options.moduleLoader && !conventionFileExists(layoutPath)) continue
       const layoutModule = (await importModule(layoutPath, options)) as LayoutModule
       markServerReference(layoutModule.default)
-      // Cheap leaf span for the segment-module resolution (nested under the
-      // render-body span). Root layout dir == appPath has no segment label.
       {
         const layoutDir = dirname(layoutPath)
-        if (layoutDir !== options.config.appPath) {
-          getRenderSpanExtensions().emitResolveSegmentSpan(basename(layoutDir))
-        }
+        getRenderSpanExtensions().emitResolveSegmentSpan(
+          layoutDir === options.config.appPath ? '' : basename(layoutDir),
+        )
       }
       const metadataExtensions = getActiveMetadataExtensions(options.config)
       const layoutModuleRecord = layoutModule as Record<string, unknown>
@@ -7682,6 +8310,7 @@ async function applyLayouts(
           : await readModuleViewport(layoutModule)
       if (layoutViewport) viewport.push(layoutViewport)
       layouts.push({ file: layoutPath, module: layoutModule })
+      if (definesHead(layoutModuleRecord)) headDirs.push(dirname(layoutPath))
     }
   })
 
@@ -7886,6 +8515,7 @@ async function applyLayouts(
     metadataMissedFlush,
     slotMatches: slotContext.matches,
     viewport,
+    headDirs,
     documentLayoutFile,
   }
 }

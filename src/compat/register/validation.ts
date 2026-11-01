@@ -17,7 +17,14 @@ import {
 } from '../../extensions'
 import type { RouteManifestEntry } from '../../types'
 import { writeBuildFlags } from '../cache/build-flags'
-import { validateBuild } from '../validation/validate'
+import {
+  validateBuild,
+  validateGeneratedStaticParams,
+  validatePrerenderRoutes,
+} from '../validation/validate'
+import { setStaticParamsExtensions } from '../../render/hooks'
+import { readSourceSync } from '../../resolve/source-text'
+import { recordPrerenderError } from '../cache/build-prerender-errors'
 import {
   diagnoseCacheComponentsPrerender,
   diagnosticLeadsWithErrorLine,
@@ -32,6 +39,27 @@ export function registerValidationExtensions(config: ResolvedConfig): void {
   if (registered) return
   if (!nextCompatEnabled(config)) return
   registered = true
+  setStaticParamsExtensions({
+    validateResult: (config, route, file, result, checkComplete) => {
+      if (!nextCompatEnabled(config)) return
+      try {
+        validateGeneratedStaticParams(
+          config,
+          { ...route, file },
+          readSourceSync(file) ?? '',
+          result,
+          checkComplete,
+        )
+      } catch (error) {
+        recordPrerenderError({
+          kind: 'validation',
+          route: route.route || '/',
+          consoleBlock: (error as Error).message,
+        })
+        throw error
+      }
+    },
+  })
 
   const step: BuildStep = async ctx => {
     // Runtime compat gate: the extension registry is process-global, so once any compat.next build
@@ -39,9 +67,11 @@ export function registerValidationExtensions(config: ResolvedConfig): void {
     // including pure-core fixtures that legitimately have no root layout. Re-check enablement per build so
     // validation only runs for the app that actually enabled compat.next.
     if (!nextCompatEnabled(ctx.config)) return
-    await ctx.log.step('validate build', () =>
-      Promise.resolve(validateBuild(ctx.config, ctx.routes as RouteManifestEntry[])),
-    )
+    await ctx.log.step('validate build', async () => {
+      const routes = ctx.routes as RouteManifestEntry[]
+      validateBuild(ctx.config, routes, ctx.prerender)
+      if (ctx.prerender !== false) await validatePrerenderRoutes(ctx.config, routes)
+    })
   }
   // Gate step: validation diagnostics must beat any error the invalid app would
   // otherwise raise first from bundling or the not-found prerender.

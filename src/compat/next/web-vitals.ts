@@ -14,6 +14,8 @@ export interface NextWebVitalsMetric {
   startTime: number
   value: number
   label: 'web-vital' | 'custom'
+  /** The document URL the metric was measured on (web-vitals 5's field, which Next reports). */
+  navigationURL: string
 }
 
 export function useReportWebVitals(reportWebVitalsFn: (metric: NextWebVitalsMetric) => void): void {
@@ -25,6 +27,7 @@ export function useReportWebVitals(reportWebVitalsFn: (metric: NextWebVitalsMetr
   }, [reportWebVitalsFn])
 
   useEffect(() => {
+    const navigationURL = performance.getEntriesByType('navigation')[0]?.name ?? location.href
     const report = (metric: Metric): void => {
       reporterRef.current({
         id: metric.id,
@@ -32,6 +35,7 @@ export function useReportWebVitals(reportWebVitalsFn: (metric: NextWebVitalsMetr
         startTime: metric.entries[0]?.startTime ?? 0,
         value: metric.value,
         label: 'web-vital',
+        navigationURL,
       })
     }
 

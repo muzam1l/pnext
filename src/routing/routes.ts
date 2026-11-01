@@ -19,12 +19,14 @@ import {
 } from './match'
 import {
   childrenDefaultFile,
+  declaresChildren,
   interceptionMarkerLevels,
   interceptionMarkerOf,
   isGroupSegment,
   isSlotSegment,
   slotConventionFile,
   slotDirectoriesIn,
+  unrenderableSlots,
 } from './slots'
 import type {
   ClientEntryReason,
@@ -259,6 +261,7 @@ export interface RouteFacts {
   segmentConfig?: RouteSegmentConfig
   needsRouterEntry?: true
   clientEntryReasons?: ClientEntryReason[]
+  softLinks?: true
 }
 
 const deferredFields = [
@@ -278,6 +281,7 @@ const deferredFields = [
   'segmentConfig',
   'needsRouterEntry',
   'clientEntryReasons',
+  'softLinks',
 ] as const satisfies readonly (keyof RouteFacts)[]
 
 /** Path-only entry fields; everything in RouteFacts is layered on lazily. */
@@ -555,7 +559,7 @@ function metadataRouteFacts(
   )
   return {
     mode: inferRouteMode(parts, usesRequest, segmentConfig),
-    hasStaticParams: Boolean(parts.metadataRoute.generatedParam),
+    hasStaticParams: Boolean(parts.metadataRoute.generatedParam) || hasStaticParamsExport(source),
     usesRequest,
     client: false,
     clientReferences: [],
@@ -724,7 +728,7 @@ function routerEntryFact(
     slotInterceptor: boolean
     table: TableFlags
   },
-): { needsRouterEntry?: true; clientEntryReasons?: ClientEntryReason[] } {
+): { needsRouterEntry?: true; clientEntryReasons?: ClientEntryReason[]; softLinks?: true } {
   if (options.kind !== 'page') return {}
   const reasons: ClientEntryReason[] = []
   // Slot interceptors never render standalone (the origin page hosts them);
@@ -738,8 +742,9 @@ function routerEntryFact(
   // pages that otherwise would not. The remaining reasons gate feature regions INSIDE the entry (the action
   // runtime), so they are scanned for every page - a page's inline `'use server'` action is usually handed to
   // an island it also renders.
+  const softLinks = routeUsesLinkComponent(context, options.sourceFiles)
   if (!options.client && options.clientReferences.length === 0) {
-    if (routeUsesLinkComponent(context, options.sourceFiles)) reasons.push('link')
+    if (softLinks) reasons.push('link')
   } else if (routeUsesNavigation(context, options.sourceFiles)) {
     // The complement of the branch above: a page that already ships an entry
     // never needed a reason before, so nothing here changes whether the entry
@@ -748,7 +753,11 @@ function routerEntryFact(
   }
   reasons.push(...routeClientEntryReasons(context, options.sourceFiles))
   if (reasons.length === 0) return {}
-  return { needsRouterEntry: true, clientEntryReasons: [...new Set(reasons)] }
+  return {
+    needsRouterEntry: true,
+    clientEntryReasons: [...new Set(reasons)],
+    ...(softLinks ? { softLinks: true as const } : {}),
+  }
 }
 
 /**
@@ -902,6 +911,9 @@ function appendSlotDerivedRoutes(
     }
 
     if (patterns.has(parts.pattern)) continue
+    // A catch-all slot page only implies a URL when every sibling slot on the
+    // way can render for it; otherwise the entry would never render a whole page.
+    if (parts.catchAll && unrenderableSlots(appPath, parts.route).length > 0) continue
     patterns.add(parts.pattern)
 
     const childrenDefault = childrenDefaultFile(candidate.ownerDir, candidate.innerNames)
@@ -948,6 +960,9 @@ function appendSlotDerivedRoutes(
           synthetic: true,
           syntheticSlotDir: candidate.slotDir,
           ...(childrenDefault ? { childrenDefault } : {}),
+          ...(anchor === candidate.file && !declaresChildren(candidate.ownerDir)
+            ? { namedSlotsOnly: true }
+            : {}),
           ...(forbiddenPaths.length > 0 ? { forbiddenFiles: forbiddenPaths } : {}),
           ...(unauthorizedPaths.length > 0 ? { unauthorizedFiles: unauthorizedPaths } : {}),
         },
@@ -1386,6 +1401,7 @@ interface ParsedSegmentConfig {
   runtime?: string
   prefetch?: RouteSegmentConfig['prefetch']
   unstableInstant?: boolean
+  stableInstant?: boolean
   /** Literal but invalid `export const revalidate` value (build error in Next). */
   invalidRevalidate?: string
 }
@@ -1426,13 +1442,13 @@ function parseSegmentConfig(source: string): ParsedSegmentConfig {
       searchable,
     )
   if (prefetchMatch) parsed.prefetch = prefetchMatch[1] as RouteSegmentConfig['prefetch']
-  // `unstable_instant = true | false | {…samples}` — an object literal opts in
-  // like `true` (its samples refine the runtime-prefetch render, they don't
-  // gate it).
-  const instantMatch = /^\s*export\s+const\s+unstable_instant\s*=\s*(true|false|\{)/m.exec(
-    searchable,
-  )
-  if (instantMatch) parsed.unstableInstant = instantMatch[1] !== 'false'
+  // Stable `instant` and its legacy alias share one runtime representation.
+  const instantMatch =
+    /^\s*export\s+const\s+(instant|unstable_instant)\s*=\s*(true|false|\{)/m.exec(searchable)
+  if (instantMatch) {
+    parsed.unstableInstant = instantMatch[2] !== 'false'
+    if (instantMatch[1] === 'instant') parsed.stableInstant = true
+  }
   return parsed
 }
 
@@ -1485,6 +1501,7 @@ function segmentConfigFromEntries(
     // `unstable_instant = false` overrides a layout's opt-in.
     if (parsed.unstableInstant !== undefined && config.unstableInstant === undefined) {
       config.unstableInstant = parsed.unstableInstant
+      if (parsed.stableInstant) config.stableInstant = true
     }
     if (parsed.dynamicParams !== undefined) {
       const param = paramOfOwnSegment(appPath, entry.file, allParams)
@@ -1656,6 +1673,26 @@ function defaultReexportsClientModule(
   return false
 }
 
+function clientModuleExportNames(
+  context: ScanContext,
+  file: string,
+  visited = new Set<string>(),
+): Set<string> {
+  const key = path.resolve(file)
+  if (visited.has(key) || !fileExists(context, key)) return new Set()
+  visited.add(key)
+  const facts = scanFacts(key, readSource(context, key))
+  const names = new Set(facts.exportNames)
+  for (const specifier of facts.exportStars) {
+    const target = resolveModuleEdge(context, key, specifier)
+    if (!target) continue
+    for (const name of clientModuleExportNames(context, target, visited)) {
+      if (name !== 'default') names.add(name)
+    }
+  }
+  return names
+}
+
 function collectFromFile(
   context: ScanContext,
   file: string,
@@ -1679,19 +1716,13 @@ function collectFromFile(
     if (isClientModule(context, imported.file)) {
       // `export * from './client'` re-exports the target's named exports (never
       // its default), so each of them is a client reference of this module.
-      if (imported.star) {
-        const importedSource = readSource(context, imported.file)
-        for (const exportName of scanFacts(imported.file, importedSource).exportNames) {
-          if (exportName !== 'default') {
+      if (imported.star || imported.exports.includes('*')) {
+        for (const exportName of clientModuleExportNames(context, imported.file)) {
+          if (!imported.star || exportName !== 'default') {
             addClientReference(references, clientReference(imported.file, exportName))
           }
         }
         continue
-      }
-      if (imported.exports.includes('*')) {
-        throw new Error(
-          `${file} namespace-imports Client Component module ${imported.file}. Import the client component by default or named export instead.`,
-        )
       }
       // A bare side-effect import binds no exports, but the module still belongs in the client bundle:
       // webpack eagerly initializes every client reference module once any of them renders, so its top-level

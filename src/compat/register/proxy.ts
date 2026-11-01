@@ -6,7 +6,7 @@ import { moduleExportNames } from '../../resolve/scan-facts'
 import { readText, toPosixPath } from '../../utils/fs'
 import { recordRewrite } from '../protocol'
 import { recordCanonicalUrl } from '../next/canonical-url'
-import { getNextConfig } from '../next/config-loader'
+import { getNextConfig, nextPageExtensions } from '../next/config-loader'
 import { activateTestProxy } from '../lifecycle/testmode'
 import { legacyRequestAPIs } from '../../request/context'
 
@@ -17,6 +17,7 @@ export function registerProxyExtensions(_config: ResolvedConfig): void {
   })
   setProxyExtensions({
     names: ['proxy', 'middleware'],
+    fileExtensions: nextPageExtensions,
     validateFiles: validateNextProxyFiles,
     handlerExport: module => module.proxy ?? module.default ?? module.middleware,
     skipUrlNormalize: () => getNextConfig().skipProxyUrlNormalize === true,
@@ -70,12 +71,14 @@ async function validateNextProxyFiles(config: ResolvedConfig) {
   const proxy = files.find(file => path.basename(file).startsWith('proxy.'))
   if (middleware && proxy) {
     throw new Error(
-      `Both middleware file "${relativeProxyPath(config, middleware)}" and proxy file "${relativeProxyPath(config, proxy)}" are detected. Please use "${relativeProxyPath(config, proxy)}" only.`,
+      `Both middleware file "${relativeProxyPath(config, middleware)}" and proxy file "${relativeProxyPath(config, proxy)}" are detected. Please use "${relativeProxyPath(config, proxy)}" only. Learn more: https://nextjs.org/docs/messages/middleware-to-proxy`,
     )
   }
   // Proxy is a Next 16 migration; legacy request APIs explicitly target the middleware era.
   if (middleware && !proxy && !legacyRequestAPIs()) {
-    console.warn('The "middleware" file convention is deprecated. Please use "proxy" instead.')
+    console.warn(
+      'The "middleware" file convention is deprecated. Please use "proxy" instead.\n\n  To migrate automatically, run:\n  npx @next/codemod@canary middleware-to-proxy .\n\n  Learn more: https://nextjs.org/docs/messages/middleware-to-proxy',
+    )
   }
   await Promise.all(files.map(file => validateNextProxyFile(config, file)))
 }

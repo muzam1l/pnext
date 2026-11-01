@@ -12,11 +12,7 @@
 // render error exactly once right before it calls serializeError(); logging here too double-prints it.
 
 import type { SerializeErrorContext, SerializedError } from '../../extensions'
-import {
-  isTaggedPrimitiveThrow,
-  tagPrimitiveThrow,
-  untagPrimitiveThrow,
-} from '../client/errors/primitive-throw'
+import { tagPrimitiveThrow } from '../client/errors/primitive-throw'
 
 // React's production redaction text for RSC render errors (#441). Boundary
 // suites assert this verbatim in prod.
@@ -38,23 +34,13 @@ function customDigest(error: Error): string | undefined {
   return typeof digest === 'string' && digest.length > 0 ? digest : undefined
 }
 
-// Next appends an error-code suffix to the hash digest when the thrown value
-// was not an Error: prod RSC wraps a nullish throw and reports `@E394`
-// (test/e2e/app-dir/errors asserts `digest: '<hash>@E394'` in the prod log).
-function digestSuffix(error: Error): string {
-  if (!isTaggedPrimitiveThrow(error)) return ''
-  const raw = untagPrimitiveThrow(error)
-  return raw === null || raw === undefined ? '@E394' : ''
-}
-
 /**
  * RenderExtensions.wrapThrownValue: wrap a non-Error server throw the way Next's RSC transport does -
- * `Error: <String(value)>` with the synthetic `at stringify (<anonymous>)` stack frame the prod log
- * snapshot asserts, and the raw value tagged so the digest picks up the nullish suffix.
+ * `Error: <String(value)>` with the raw value tagged for boundary serialization.
  */
 export function wrapThrownValue(value: unknown): Error {
   const error = tagPrimitiveThrow(value)
-  error.stack = `Error: ${error.message}\n    at stringify (<anonymous>)`
+  error.stack = `Error: ${error.message}\n    at ignore-listed frames`
   return error
 }
 
@@ -75,8 +61,7 @@ export function formatErrorLog(trace: string, digest: string, error?: Error): st
 export function serializeBoundaryError(ctx: SerializeErrorContext): SerializedError {
   const { error, dev } = ctx
   const custom = customDigest(error)
-  const digest =
-    custom ?? stableDigest(`${error.message}${error.stack ?? ''}`) + digestSuffix(error)
+  const digest = custom ?? stableDigest(`${error.message}${error.stack ?? ''}`)
 
   // Boundary components render `${error}` (e.g. `Global error: ${error}`), so
   // the prop must stringify as `Error: <message>` like React's transported

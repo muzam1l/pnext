@@ -11,7 +11,7 @@
 //     Error whose message is the throw's String(value); a thrown undefined/null/string passes through
 //     unwrapped, matching Next's client channel.
 //   - reset() clears the caught error and re-renders the children in place, recovering a
-//     client-component error whose failure lived in the hydrated subtree. unstable_retry() additionally
+//     client-component error whose failure lived in the hydrated subtree. retry() additionally
 //     soft-refreshes, which is what a data-dependent (server) failure needs.
 //
 // When no route error component is available the boundary mounts global-error.
@@ -19,6 +19,7 @@
 import { Component, h, type ComponentChildren, type ComponentType } from 'preact'
 import { isControlFlowError, handleControlFlowError } from './control-flow'
 import { isNotFoundError } from '../../../api/navigation'
+import { errorRuntime } from './lazy'
 import { normalizeBoundaryError } from './primitive-throw'
 
 // ---------------------------------------------------------------------------
@@ -32,6 +33,7 @@ import { normalizeBoundaryError } from './primitive-throw'
 export type RouteErrorComponent = ComponentType<{
   error: unknown
   reset: () => void
+  retry: () => void
   unstable_retry?: () => void
 }>
 export type RouteNotFoundComponent = ComponentType<Record<string, never>>
@@ -122,7 +124,7 @@ export class ClientErrorBoundary extends Component<BoundaryProps, BoundaryState>
 
   /**
    * `reset()` re-renders the boundary's children in place - no server round trip. That is the whole
-   * difference from `unstable_retry()`, and it matters beyond the request count: a refresh swaps the
+   * difference from `retry()`, and it matters beyond the request count: a refresh swaps the
    * body, so every node the reset subtree just rendered is replaced a moment later, and anything
    * holding one of those nodes (a click in flight, a test's element handle) loses it.
    */
@@ -196,13 +198,18 @@ export class ClientErrorBoundary extends Component<BoundaryProps, BoundaryState>
       // loses raw null/undefined/string). Bubble Error objects to the next outer
       // ClientErrorBoundary so nearest in-tree boundary semantics stay intact.
       if (error === null || typeof error !== 'object') {
-        // global-error rides the deferred tier (see ./lazy) — a primitive throw
+        // global-error rides the deferred install chunk (see ./lazy) — a primitive throw
         // with no error.js is the one path that reaches it from a render.
-        void import('./install').then(m => m.escalateToGlobalError(error))
+        void errorRuntime().then(m => m.escalateToGlobalError(error))
         return null
       }
       throw error as Error
     }
-    return h(ErrorComponent, { error, reset: this.reset, unstable_retry: this.unstable_retry })
+    return h(ErrorComponent, {
+      error,
+      reset: this.reset,
+      retry: this.unstable_retry,
+      unstable_retry: this.unstable_retry,
+    })
   }
 }

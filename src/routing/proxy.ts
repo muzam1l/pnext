@@ -30,6 +30,7 @@ export type ProxyHandler = (
 
 export interface ProxyConfig {
   matcher?: ProxyMatcher | ProxyMatcher[]
+  runtime?: 'edge' | 'nodejs'
 }
 
 export interface ProxyRouteCondition {
@@ -87,8 +88,6 @@ export interface ProxyRunner {
   warm(options?: ProxyRunOptions): void
 }
 
-const proxyExtensions = ['.ts', '.tsx', '.js', '.jsx', '.mts']
-
 export function findProxyFile(config: ResolvedConfig) {
   return findProxyFiles(config)[0]
 }
@@ -97,12 +96,17 @@ export function proxyExternalLoadTarget(file: string): ExternalLoadTarget {
   return path.basename(file).startsWith('proxy.') ? 'client-ssr' : 'edge'
 }
 
+/** `middleware.*` runs on edge, `proxy.*` on node, unless `config.runtime` overrides. */
+function proxyRuntime(file: string, config: ProxyConfig | undefined): 'edge' | 'nodejs' {
+  return config?.runtime ?? (path.basename(file).startsWith('proxy.') ? 'nodejs' : 'edge')
+}
+
 export function findProxyFiles(config: ResolvedConfig, names = getProxyExtensions().names) {
   const files: string[] = []
   for (const base of proxyBases(config)) {
     for (const name of names) {
-      for (const extension of proxyExtensions) {
-        const file = path.join(base, `${name}${extension}`)
+      for (const extension of getProxyExtensions().fileExtensions()) {
+        const file = path.join(base, `${name}.${extension}`)
         if (existsSync(file)) files.push(file)
       }
     }
@@ -210,7 +214,7 @@ export function createProxyRunner(
     let response = await runWithRequest(
       nextRequest,
       () =>
-        withRouteRuntime('edge', () =>
+        withRouteRuntime(proxyRuntime(file, module.config), () =>
           wrapMiddleware(nextRequest, () =>
             handler(nextRequest, {
               waitUntil(promise) {

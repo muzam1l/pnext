@@ -3,7 +3,13 @@ import path from 'node:path'
 import { dim } from '../utils/ansi'
 import { moduleGenerationStats } from '../runtime/module-generations'
 import { markBoot, printBootTrace } from './boot/trace'
-import { browserHost, ensurePortFree, openBrowser, printServerReady } from './serve/ui'
+import {
+  availableDevPort,
+  browserHost,
+  ensurePortFree,
+  openBrowser,
+  printServerReady,
+} from './serve/ui'
 
 export const devProcessTitle = 'pnext-dev'
 export const devRestartEnv = 'PNEXT_DEV_RESTART'
@@ -25,6 +31,7 @@ export interface DevOptions {
   root?: string
   port?: number
   hostname?: string
+  tls?: Bun.TLSOptions
 }
 
 /**
@@ -43,23 +50,32 @@ export async function dev(options: DevOptions = {}) {
   const config = await loadConfig(options.root, { dev: true })
   markBoot('dev:config')
   warnDuplicateSass(config.root, Boolean(config.compat?.next))
-  const port = options.port ?? 3000
   // Next's documented default. Bun resolves 'localhost' to ::1 only, refusing IPv4 clients.
   const hostname = options.hostname ?? '0.0.0.0'
   // A memory-triggered restart can briefly race the previous listener's
   // shutdown, so give the port a moment to free before failing.
-  await ensurePortFree(port, hostname, { attempts: 10 })
+  if (options.port !== undefined && process.env[devRestartEnv] === '1')
+    await ensurePortFree(options.port, hostname, { attempts: 10 })
+  const port = await availableDevPort(options.port, hostname)
   markBoot('dev:port')
   const start = Date.now()
   // Bisect switch, same role `PNEXT_DEV_RESTART_CACHE=0` plays for the restart
   // caches: turns the boot warm-up off so a measurement can price it.
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   const warm = process.env.PNEXT_DEV_WARM !== '0'
-  const server = await startDevServer({ config, port, hostname, warm })
+  const server = await startDevServer({ config, port, hostname, warm, tls: options.tls })
   markBoot('dev:server')
   const elapsedMs = Date.now() - start
-  const url = `http://${browserHost(hostname)}:${server.port ?? port}`
-  printServerReady({ mode: 'dev', hostname, port: server.port ?? port, elapsedMs })
+  const protocol = options.tls ? 'https' : 'http'
+  const url = `${protocol}://${browserHost(hostname)}:${server.port ?? port}`
+  printServerReady({
+    mode: 'dev',
+    hostname,
+    networkHostname: options.hostname === '0.0.0.0' ? options.hostname : undefined,
+    protocol,
+    port: server.port ?? port,
+    elapsedMs,
+  })
   printBootTrace()
   // Boot compiles nothing (config loads natively), so the first compile would pay esbuild's service
   // spawn. Warm it here, after the banner - readiness must not wait on it. PNEXT_DEV_ESBUILD_WARM=0 opts out.

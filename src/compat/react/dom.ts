@@ -15,7 +15,9 @@
  */
 import ReactCompat from 'preact/compat'
 import { useActionState, useSyncExternalStore } from './preact'
+import { fulfilledThenable, rejectedThenable } from './use'
 import { registerResourceHint } from '../../render/resource-hints'
+import { PostponeError } from '../../render/postpone'
 
 const ReactDomCompat = Object.assign(ReactCompat, {
   preload,
@@ -94,6 +96,13 @@ export function preinit(href: string, options?: { as?: string; crossOrigin?: str
 }
 
 export const useFormState = useActionState
+
+// React's browser(): on the server use() throws, so the island renders client-only behind its fallback.
+export function browser(): Promise<void> {
+  return process.browser || typeof window !== 'undefined'
+    ? fulfilledThenable()
+    : rejectedThenable(new PostponeError('browser()'))
+}
 
 export interface FormStatusNotPending {
   pending: false

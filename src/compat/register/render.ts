@@ -16,6 +16,7 @@
 // serializeServerActionProp, collectRenderMeta and the server-action module tagging hooks are populated
 // by the actions and cache sub-registrars; this file owns the react and font/suspense hooks.
 
+import path from 'node:path'
 import type { ResolvedConfig } from '../../config'
 import { onExtensionHostReset, setRenderExtensions } from '../../extensions'
 import { setReactCompatActive } from '../react/preact'
@@ -48,11 +49,14 @@ import {
 } from '../next/font/runtime'
 import {
   hasRuntimeMetadata,
+  nextSlotHead,
   readNextModuleMetadata,
   readNextModuleViewport,
   shouldRenderMetadataInBody,
 } from '../metadata'
 import { aliasGenerateStaticParams } from '../static-params'
+import { resolveParamMatching } from './build'
+import { paramPromotion } from '../static-params'
 import { getNextConfig } from '../next/config-loader'
 import { withSyncProps } from '../next/legacy-request-apis'
 import { renderServerInsertedHTML, setServerInsertedHTMLScope } from '../react/server-inserted-html'
@@ -66,6 +70,12 @@ import {
   normalizeOptionalCatchAllParams,
 } from '../segment/vary-params'
 import type { VaryParamsTrackingContext } from '../../extensions'
+
+const cacheJoiner = Symbol.for('pnext.compat.useCacheJoinerPromise')
+
+function isCacheJoiner(promise: Promise<unknown>): boolean {
+  return Boolean((promise as unknown as Record<symbol, unknown>)[cacheJoiner])
+}
 
 export function registerRenderExtensions(config: ResolvedConfig): void {
   // The react layer only matters when react/next compat is on. A next-only
@@ -97,12 +107,23 @@ export function registerRenderExtensions(config: ResolvedConfig): void {
     setMetadataExtensions({
       enabled: nextCompatEnabled,
       hasRuntimeMetadata,
-      readModuleMetadata: readNextModuleMetadata,
+      readModuleMetadata: (module, props, parent, file) =>
+        readNextModuleMetadata(module, props, parent, file && path.relative(config.appPath, file)),
       readModuleViewport: readNextModuleViewport,
       shouldRenderMetadataInBody,
+      slotHead: nextSlotHead,
     })
-    setStaticParamsExtensions({ normalizeModule: aliasGenerateStaticParams })
+    setStaticParamsExtensions({ normalizeModule: aliasGenerateStaticParams, resolveParamMatching })
     setRenderExtensions({
+      streamingPromise: {
+        shouldAwait: isCacheJoiner,
+        inherit(source, target) {
+          if (isCacheJoiner(source)) {
+            ;(target as unknown as Record<symbol, unknown>)[cacheJoiner] = true
+          }
+        },
+      },
+      paramPromotion,
       clientRouteState: nextClientRouteState,
       trackVaryParams: trackRenderVaryParams,
       legacySyncProps: withSyncProps,
@@ -123,8 +144,8 @@ export function registerRenderExtensions(config: ResolvedConfig): void {
     setDocumentScriptExtensions({
       documentBodyScripts: cfg =>
         `${flightDataBootstrapScript()}${renderPartytownHeadScripts()}${basePathScript(cfg.basePath)}${trailingSlashScript(cfg.trailingSlash)}${skipTrailingSlashScript(cfg.skipTrailingSlashRedirect)}${staleTimesScript()}${segmentSchedulerScript()}${legacySyncPropsScript()}${appShellsScript()}${optimisticRoutingScript()}${nextRouterShimScript()}<script>${earlySubmitCaptureScript()}</script>${fontPreloadDomScript()}`,
-      documentHeadTags: () =>
-        `${polyfillsScript(config)}${fontSizeAdjustMeta()}${renderServerInsertedHTML()}`,
+      documentHeadTags: cfg =>
+        `${polyfillsScript(cfg)}${fontSizeAdjustMeta()}${renderServerInsertedHTML()}`,
       streamInsertedHTML: renderServerInsertedHTML,
     })
   }
@@ -221,11 +242,12 @@ function staleTimesScript(): string {
 // SEGMENT-CACHE scheduler, which only exists under cacheComponents. A classic prefetch app must fire all
 // visible prefetches without throttling - the app-client-cache full-prefetch tests clear their request
 // listener between two staggered prefetches and would see the delayed one land as an unexpected request.
-// Core defaults to scheduling, so plain compat stamps an explicit `false` to opt out.
+// Core defaults to scheduling, so plain compat stamps an explicit `false` to opt out. The scheduler
+// seeds its cache from the current route when the router installs, so it also asks for an eager runtime.
 function segmentSchedulerScript(): string {
   const config = getNextConfig() as { cacheComponents?: unknown }
   return config.cacheComponents === true
-    ? `<script>window.__PNEXT_SEGMENT_SCHEDULER__=true;</script>`
+    ? `<script>window.__PNEXT_SEGMENT_SCHEDULER__=window.__PNEXT_EAGER_RUNTIME__=true;</script>`
     : `<script>window.__PNEXT_SEGMENT_SCHEDULER__=false;</script>`
 }
 

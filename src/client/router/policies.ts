@@ -48,7 +48,12 @@ export function setPrefetchStaleTimePolicy(policy: (ctx: PrefetchStaleContext) =
 }
 
 export function prefetchStaleTimeMs(ctx: PrefetchStaleContext): number {
-  return prefetchStaleTimePolicy?.(ctx) ?? PREFETCH_TTL_MS
+  if (prefetchStaleTimePolicy) return prefetchStaleTimePolicy(ctx)
+  // Pure core honors a server-declared window so dynamic pages can stay fresh, capped at the flat TTL.
+  const header = ctx.headerStaleTimeSeconds
+  return header !== undefined && Number.isFinite(header) && header >= 0
+    ? Math.min(header * 1000, PREFETCH_TTL_MS)
+    : PREFETCH_TTL_MS
 }
 
 // The loading-shell reuse window (Next's STATIC staleTime: the cached loading
@@ -58,6 +63,18 @@ export let shellStaleTimePolicy: (() => number) | undefined
 export let loadingShellPredictionPolicy: LoadingShellPredictionPolicy | undefined
 export let stylesheetReconciler: StylesheetReconciler | undefined
 export let revalidationPrefetchDelayMs = 0
+
+export interface NavigationHistoryPolicy {
+  start(replace: boolean): void
+  push(state: Record<string, unknown>, href: string, sequence: number, silent: boolean): void
+  commit(sequence: number): void
+}
+
+export let navigationHistoryPolicy: NavigationHistoryPolicy | undefined
+
+export function setNavigationHistoryPolicy(policy: NavigationHistoryPolicy | undefined) {
+  navigationHistoryPolicy = policy
+}
 
 /** Register the compat loading-shell staleTime (ms) — Next's static window. */
 export function setShellStaleTimePolicy(policy: () => number) {
@@ -87,7 +104,7 @@ export function shellStaleTimeMs(): number {
 // come from flat artifacts written beside each page. Registered by compat, and ONLY when the running
 // document came out of an export; once registered it replaces the server protocol wholesale, so a
 // null result is a miss, not a fallback.
-type ExportDocumentFetcher = (
+export type ExportDocumentFetcher = (
   href: string,
   init: RequestInit,
   prefetch: boolean,

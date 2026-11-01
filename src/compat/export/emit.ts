@@ -5,6 +5,7 @@ import type { BuildManifest, RouteManifestEntry } from '../../types'
 import { listFiles, toPosixPath } from '../../utils/fs'
 import type { BuildStepLogger } from '../../extensions'
 import { getNextConfig } from '../next/config-loader'
+import { routeRuntimePrefetch } from '../next/route-state'
 import { emitStandalone } from './standalone'
 
 interface EmitStaticExportContext {
@@ -42,7 +43,9 @@ export async function emitStaticExport({ config, manifest, log }: EmitStaticExpo
   // the running server - client runtime code fetches it unconditionally, and Next's own asset-404 tests
   // probe it as "a known valid asset path". Export mode additionally snapshots a standalone `out/` tree
   // below; the manifest files it needs are the same bytes, so write the server-served copy first.
-  await log.step('build manifest', () => writeBuildManifests(path.join(config.outPath, 'static')))
+  await log.step('build manifest', () =>
+    writeBuildManifests(path.join(config.outPath, 'static'), manifest.routes),
+  )
   const output = getNextConfig().output
   if (output === 'standalone') {
     await emitStandalone({ config, manifest, log })
@@ -59,7 +62,7 @@ async function writeExportTree(config: ResolvedConfig, manifest: BuildManifest):
 
   const assets = await copyRuntimeAssets(config, outDir)
   await copyPublicTree(config, outDir, assets)
-  await writeBuildManifests(outDir)
+  await writeBuildManifests(outDir, manifest.routes)
 
   const pages = exportPages(config, manifest)
   for (const page of pages) await writePageArtifacts(page, assets)
@@ -126,12 +129,16 @@ function exportDocument(html: string, assets: ReadonlySet<string>): string {
   return `${repointed.slice(0, at)}${EXPORT_MODE_SCRIPT}${repointed.slice(at)}`
 }
 
-async function writeBuildManifests(outDir: string): Promise<void> {
+async function writeBuildManifests(outDir: string, routes: RouteManifestEntry[]): Promise<void> {
   const dir = path.join(outDir, '_next', 'static', BUILD_ID)
   await mkdir(dir, { recursive: true })
+  // The client sends `next-router-prefetch: 2` for body prefetches of these route patterns.
+  const runtime = routes
+    .filter(route => route.kind === 'page' && routeRuntimePrefetch(route))
+    .map(route => route.route)
   await writeFile(
     path.join(dir, '_buildManifest.js'),
-    'self.__BUILD_MANIFEST={};self.__BUILD_MANIFEST_CB&&self.__BUILD_MANIFEST_CB();\n',
+    `self.__BUILD_MANIFEST={};${runtime.length ? `self.__PNEXT_RUNTIME_PREFETCH__=${JSON.stringify(runtime)};` : ''}self.__BUILD_MANIFEST_CB&&self.__BUILD_MANIFEST_CB();\n`,
   )
   await writeFile(path.join(dir, '_ssgManifest.js'), 'self.__SSG_MANIFEST=new Set();\n')
 }

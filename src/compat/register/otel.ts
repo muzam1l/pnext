@@ -37,15 +37,21 @@ import {
   setDocumentScriptExtensions,
   setStreamBoundaryExtensions,
 } from '../../render/hooks'
-import { setProxyRunObserver } from '../../routing/proxy'
+import { findProxyFile, setProxyRunObserver } from '../../routing/proxy'
+import { productionRelease } from '../../runtime/production'
 import {
   SPAN_TYPE,
-  emitClientComponentLoadingSpan,
+  queueClientComponentLoadingSpan,
+  beginClientModuleLoad,
+  recordClientComponent,
   emitLeafSpan,
   emitStartResponseSpan,
-  endRootSpan,
   endRootSpanIfUnclosed,
   markRenderSpanError,
+  markHandlerSpanError,
+  markRootSpanError,
+  recordResponseStatus,
+  forwardRootTraceHeaders,
   setOtelAppRoot,
   setRootSpanRoute,
   startRootSpan,
@@ -53,6 +59,7 @@ import {
   withMiddlewareSpan,
   withPagesApiHandlerSpan,
   withPagesDataSpan,
+  withComponentTreeSpan,
   withRenderBodySpan,
   withRouteHandlerSpan,
 } from '../otel/tracer'
@@ -72,6 +79,26 @@ export function registerOtelRootInterceptor(config: ResolvedConfig): void {
   if (!nextCompatEnabled(config)) return
   setOtelAppRoot(config.root)
 
+  const released = productionRelease(config)
+  const hasProxy = Boolean(released ? released.proxy.file : findProxyFile(config))
+  const beforeProxy = getRequestExtensions().beforeProxy
+  setRequestExtensions({
+    beforeProxy: async request => {
+      if (beforeProxy) await beforeProxy(request)
+      if (!hasProxy) return
+      const url = new URL(request.url)
+      startRootSpan({
+        method: request.method,
+        target: url.pathname + url.search,
+        rsc: request.headers.get('rsc') === '1',
+        headers: request.headers,
+        middleware: true,
+      })
+      forwardRootTraceHeaders(request.headers)
+      queueAfterTask(() => endRootSpanIfUnclosed(500))
+    },
+  })
+
   const rootInterceptor: RequestInterceptor = async request => {
     try {
       // Instrumentation register() installs the app's TracerProvider; opening
@@ -85,11 +112,7 @@ export function registerOtelRootInterceptor(config: ResolvedConfig): void {
         headers: request.headers,
       })
       stampMatchedRoute(url.pathname)
-      // Safety net for the synchronous-500 error path: core's top-level catch
-      // returns a bare 500 WITHOUT running responseFinalizers, so the finalizer
-      // never closes the root span there. The work-unit after-queue DOES flush
-      // on that path (flushWorkUnit in the catch), so end the span as 500 from
-      // an after-task. Idempotent: on success paths the finalizer ends it first.
+      // Close abandoned requests when their work unit drains.
       queueAfterTask(() => endRootSpanIfUnclosed(500))
     } catch {
       // Never let tracing break the request.
@@ -117,8 +140,18 @@ function stampMatchedRoute(pathname: string): void {
   })
 }
 
+// Next's router boundaries contribute loads outside authored client modules.
+const NEXT_APP_ROUTER_CLIENT_MODULES = 7
+
+function clientComponentLoadCount(route: RouteManifestEntry | undefined): number {
+  if (!route) return NEXT_APP_ROUTER_CLIENT_MODULES
+  return NEXT_APP_ROUTER_CLIENT_MODULES + (route.stream?.hasLoadingBoundary ? 1 : 0)
+}
+
 export function registerOtelExtensions(config: ResolvedConfig): void {
   if (!nextCompatEnabled(config)) return
+  const loadedUserland = new Set<string>()
+  const moduleSpanAttributes = { 'next.span_category': 'nextjs' }
 
   const appRoot = config.root
   setOtelAppRoot(appRoot)
@@ -142,8 +175,13 @@ export function registerOtelExtensions(config: ResolvedConfig): void {
   // route-resolution span (`resolve page components`), and cheap leaf
   // segment-module spans. All inert when no root span is open.
   setRenderSpanExtensions({
+    onClientModuleLoad: beginClientModuleLoad,
+    onClientComponent: recordClientComponent,
     withRenderBodySpan: (route, fn) => {
       const displayRoute = routePatternToDisplay(route)
+      if (!isPagesCompatRoute(route)) {
+        emitLeafSpan('prepare route module', SPAN_TYPE.prepareRouteModule, moduleSpanAttributes)
+      }
       // A materialized pages route renders through the app pipeline, but Next
       // reports it as the pages-router document render span.
       if (isPagesCompatRoute(route)) {
@@ -166,17 +204,35 @@ export function registerOtelExtensions(config: ResolvedConfig): void {
         'resolve page components',
         SPAN_TYPE.findPageComponents,
         { 'next.route': displayRoute },
-        fn,
+        () =>
+          withChildSpan(
+            'load route module',
+            SPAN_TYPE.loadRouteModule,
+            moduleSpanAttributes,
+            () => {
+              if (entry?.kind !== 'handler' || loadedUserland.has(entry.file)) return fn()
+              loadedUserland.add(entry.file)
+              return withChildSpan(
+                'load app route module',
+                SPAN_TYPE.loadUserland,
+                { ...moduleSpanAttributes, 'next.route': displayRoute },
+                fn,
+              )
+            },
+          ),
       )
     },
+    withComponentTreeSpan: fn => withComponentTreeSpan(fn),
     emitResolveSegmentSpan: segment =>
       emitLeafSpan('resolve segment modules', SPAN_TYPE.getLayoutOrPageModule, {
         'next.segment': segment,
       }),
-    withRouteHandlerSpan: (route, fn) =>
-      isPagesCompatRoute(route)
-        ? withPagesApiHandlerSpan(routePatternToDisplay(route), fn)
-        : withRouteHandlerSpan(routePatternToDisplay(route), fn),
+    withRouteHandlerSpan: (route, fn) => {
+      if (isPagesCompatRoute(route))
+        return withPagesApiHandlerSpan(routePatternToDisplay(route), fn)
+      emitLeafSpan('prepare route module', SPAN_TYPE.prepareRouteModule, moduleSpanAttributes)
+      return withRouteHandlerSpan(routePatternToDisplay(route), fn)
+    },
   })
   setStreamBoundaryExtensions({ onStreamBoundaryError: markRenderSpanError })
 
@@ -191,14 +247,15 @@ export function registerOtelExtensions(config: ResolvedConfig): void {
       `${previousHeadTags?.(cfg, ctx) ?? ''}${clientTraceMetadataTags({ dynamic: ctx.dynamic, isNextStart: true, rsc: ctx.rsc })}`,
   })
 
-  // Middleware.execute span around the proxy/middleware handler run. Parents
-  // under the incoming traceparent (top-level trace), NOT the request root span.
+  // Middleware and render requests share the middleware-invoke parent.
   setProxyRunObserver((request, fn) => withMiddlewareSpan(request, fn))
 
   const previousOnRequestError = getRequestExtensions().onRequestError
   setRequestExtensions({
     onRequestError: async (error, requestInfo, context) => {
       markRenderSpanError(error)
+      markHandlerSpanError(error)
+      markRootSpanError(error)
       await previousOnRequestError(error, requestInfo, context)
     },
   })
@@ -217,17 +274,25 @@ export function registerOtelExtensions(config: ResolvedConfig): void {
   }
   registerRequestInterceptors(otelRouteInterceptor)
 
-  // Close the root span pre-flush with the final status. Runs on every response-producing path (page
-  // render, route handler, static file, redirect, 404). Before closing, emit the pre-flush leaf spans Next
-  // nests in the tree: `clientComponentLoading` (page renders only) and `start response` under the open
-  // render span for pages, or the root for handlers.
+  // Record response facts now; loading metrics and the request span finish after the body.
   const otelFinalizer: ResponseFinalizer = ctx => {
     try {
-      if (ctx.routeKind === 'html') emitClientComponentLoadingSpan(0)
+      if (
+        ctx.routeKind === 'html' &&
+        !ctx.request.headers.has('next-action') &&
+        ctx.request.headers.get('rsc') !== '1'
+      ) {
+        const matched = selectRouteForRequest(
+          getRequestRuntime()?.routes ?? [],
+          ctx.request.url.pathname,
+          undefined,
+        )
+        queueClientComponentLoadingSpan(clientComponentLoadCount(matched?.route))
+      }
       if (ctx.routeKind === 'html' || ctx.routeKind === 'route-handler') {
         emitStartResponseSpan()
       }
-      endRootSpan(ctx.status)
+      recordResponseStatus(ctx.status)
     } catch {
       // ignore
     }

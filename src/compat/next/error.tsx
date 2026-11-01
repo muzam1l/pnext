@@ -5,9 +5,31 @@ import { Component, Fragment, h, type ComponentChildren, type ComponentType } fr
 import { isControlFlowError } from '../client/errors/control-flow'
 import { untagPrimitiveThrow } from '../client/errors/primitive-throw'
 
+export default function ErrorComponent({
+  statusCode,
+  title,
+}: {
+  statusCode: number
+  title?: string
+}) {
+  const titles: Record<number, string> = {
+    400: 'Bad Request',
+    404: 'This page could not be found',
+    405: 'Method Not Allowed',
+    500: 'Internal Server Error',
+  }
+  return h(
+    'div',
+    null,
+    h('h1', null, statusCode),
+    h('h2', null, title ?? titles[statusCode] ?? 'Error'),
+  )
+}
+
 export interface ErrorInfo {
   error: unknown
   reset: () => void
+  retry: () => void
   unstable_retry: () => void
 }
 
@@ -54,7 +76,7 @@ function initialCatchErrorState(props: CatchErrorProps): CatchErrorState {
   return { error: undefined, hasError: false, version: 0 }
 }
 
-export function unstable_catchError<Props extends Record<string, unknown>>(
+export function catchError<Props extends Record<string, unknown>>(
   Fallback: (props: Props, info: ErrorInfo) => ComponentChildren,
 ): ComponentType<Props & CatchErrorProps> {
   class CatchError extends Component<Props & CatchErrorProps, CatchErrorState> {
@@ -77,14 +99,14 @@ export function unstable_catchError<Props extends Record<string, unknown>>(
       }))
     }
 
-    unstable_retry = () => {
-      // App-Router only: `unstable_retry` re-runs the server render, which the Pages Router has no
+    retry = () => {
+      // App-Router only: `retry` re-runs the server render, which the Pages Router has no
       // equivalent of. The discriminator is the rendering context, NOT the user-supplied `clearError`
       // prop (the Pages fixture passes it too) - App-Router documents always render the segment tree as
       // <pnext-layout>/[data-pnext-root] elements; Pages ones never do.
       if (!isAppRouterDocument()) {
         throw new Error(
-          '`unstable_retry()` can only be used in the App Router. Use `reset()` in the Pages Router.',
+          '`retry()` can only be used in the App Router. Use `reset()` in the Pages Router.',
         )
       }
       if (!process.browser && typeof window === 'undefined') {
@@ -110,7 +132,8 @@ export function unstable_catchError<Props extends Record<string, unknown>>(
         return Fallback(rest as unknown as Props, {
           error: state.error,
           reset: this.reset,
-          unstable_retry: this.unstable_retry,
+          retry: this.retry,
+          unstable_retry: this.retry,
         })
       }
       return h(Fragment, { key: state.version }, props.children)
@@ -120,6 +143,8 @@ export function unstable_catchError<Props extends Record<string, unknown>>(
   ;(CatchError as unknown as Record<symbol, boolean>)[islandErrorBoundarySymbol] = true
   return CatchError
 }
+
+export const unstable_catchError = catchError
 
 function isAppRouterDocument(): boolean {
   if (typeof document === 'undefined') return false

@@ -6,7 +6,11 @@ import {
   isRuntimePrefetchPrerender,
 } from '../../render/ppr'
 import { currentRenderCacheMeta, insideUnstableCacheProducer } from '../cache/revalidate'
-import { insideUseCacheProducer, recordUseCacheRootParamRead } from '../cache/use-cache'
+import {
+  currentUseCacheRootParams,
+  insideUseCacheProducer,
+  recordUseCacheRootParamRead,
+} from '../cache/use-cache'
 import { generateStaticParamsScope } from '../static-params'
 import { accumulateRootVaryParam } from '../segment/vary-params'
 
@@ -123,7 +127,7 @@ export function rootParam<T = string | string[] | undefined>(name: string): Prom
   ) {
     return hangingPromise<T>(`rootParam(${name})`)
   }
-  const value = currentParams()[name]
+  const value = currentUseCacheRootParams()[name]
   return Promise.resolve((Array.isArray(value) && value.length === 0 ? undefined : value) as T)
 }
 

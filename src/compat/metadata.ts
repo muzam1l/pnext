@@ -5,6 +5,8 @@ import { legacyRequestAPIs } from '../request/context'
 import { readSourceText } from '../resolve/source-text'
 import { SPAN_TYPE, withChildSpan } from './otel/tracer'
 import { settledPromise } from '../render/renderer'
+import type { SlotHeadBranch, SlotHeadInput, SlotHeadPolicy } from '../render/hooks'
+import { getNextConfig } from './next/config-loader'
 import {
   createVaryingParams,
   createVaryingSearchParams,
@@ -30,9 +32,6 @@ export async function readNextModuleMetadata(
 ): Promise<Metadata | undefined> {
   if (typeof module.generateMetadata === 'function') {
     const generate = module.generateMetadata as NextGenerateMetadata
-    // `generateMetadata <page>` OTel span (ResolveMetadata.generateMetadata),
-    // named by the route-relative module path (e.g. `/app/[param]/layout`).
-    // Inert when otel-api is unavailable or no root span is open.
     const headProps = headVaryTrackedProps(props)
     const run = () =>
       generate(
@@ -52,17 +51,10 @@ export async function readNextModuleMetadata(
   return module.metadata as Metadata | undefined
 }
 
-// Route-relative module path for a `generateMetadata` span name: an absolute `<root>/app/[param]/
-// layout.tsx` becomes `generateMetadata /app/[param]/layout`. Next names the span with the app-dir-
-// relative path prefixed by the `/app` segment. Returns undefined when the path cannot be derived, in
-// which case the span is skipped rather than failing.
 function metadataSpanName(modulePath: string | undefined): string | undefined {
   if (!modulePath) return undefined
   const normalized = modulePath.replace(/\\/g, '/').replace(/\.[cm]?[jt]sx?$/, '')
-  // Keep everything from the LAST `/app/` segment onward (handles src/app too).
-  const idx = normalized.lastIndexOf('/app/')
-  const rel = idx >= 0 ? normalized.slice(idx) : `/${normalized.replace(/^\/+/, '')}`
-  return `generateMetadata ${rel}`
+  return `generateMetadata /${normalized.replace(/^\/+/, '')}`
 }
 
 export async function readNextModuleViewport(
@@ -120,6 +112,9 @@ export function hasRuntimeMetadata(module: Record<string, unknown>) {
   return typeof module.generateMetadata === 'function'
 }
 
+const HTML_LIMITED_BOT_UA_RE =
+  /[\w-]+-Google|Google-[\w-]+|Chrome-Lighthouse|Slurp|DuckDuckBot|baiduspider|yandex|sogou|bitlybot|tumblr|vkShare|quora link preview|redditbot|ia_archiver|Bingbot|BingPreview|applebot|facebookexternalhit|facebookcatalog|Twitterbot|LinkedInBot|Slackbot|Discordbot|WhatsApp|SkypeUriPreview|Yeti|googleweblight/i
+
 export function shouldRenderMetadataInBody({
   config,
   request,
@@ -128,9 +123,7 @@ export function shouldRenderMetadataInBody({
   request?: Request
 }) {
   const userAgent = request?.headers.get('user-agent') ?? ''
-  const limitedBot =
-    config.htmlLimitedBots ??
-    /Twitterbot|Slackbot|Bingbot|Discordbot|LinkedInBot|Google-PageRenderer|Chrome-Lighthouse|Lighthouse/i
+  const limitedBot = config.htmlLimitedBots ?? HTML_LIMITED_BOT_UA_RE
   return !limitedBot.test(userAgent)
 }
 
@@ -319,4 +312,76 @@ function warnOnce(warned: Set<string>, key: string, message: string) {
   if (warned.has(key)) return
   warned.add(key)
   console.warn(message)
+}
+
+/**
+ * Next's slot metadata model: only a rendered outlet delivers metadata/viewport errors. Without
+ * `experimental.parallelRouteMetadata` only children owns one, except that a navigation into a
+ * named-slot-only route renders from its slot. With it, every slot branch starts eagerly and owns
+ * an outlet, and the head takes ONE branch: children when it defines head tags below the fork, else
+ * the deepest definition, then the deeper page, then the lexically first slot.
+ */
+export async function nextSlotHead(input: SlotHeadInput): Promise<SlotHeadPolicy> {
+  const experimental = getNextConfig().experimental as
+    { parallelRouteMetadata?: boolean } | undefined
+  if (experimental?.parallelRouteMetadata === true) {
+    return parallelSlotHead(input, await input.analyze())
+  }
+  if (!input.namedSlotsOnly) return { outlets: new Map(), head: input.fallback }
+  const branches = await input.analyze()
+  return {
+    outlets: new Map(
+      input.routerPayload
+        ? branches.map(branch => [branch.slotDir, slotOutlet(branch)] as const)
+        : [],
+    ),
+    head: async () => {
+      for (const branch of branches) {
+        const entries = await branch.metadata().catch(() => [])
+        if (branch.hasSource) return { entries, viewport: [], runtime: branch.runtime }
+      }
+      return { entries: [], viewport: [], runtime: false }
+    },
+  }
+}
+
+function parallelSlotHead(input: SlotHeadInput, branches: SlotHeadBranch[]): SlotHeadPolicy {
+  const outlets = new Map(branches.map(branch => [branch.slotDir, slotOutlet(branch)] as const))
+  let selected: SlotHeadBranch | undefined
+  for (const branch of branches) {
+    if (branch.childrenDefinesHead || branch.definitionDepth < 0) continue
+    if (
+      !selected ||
+      branch.definitionDepth > selected.definitionDepth ||
+      (branch.definitionDepth === selected.definitionDepth &&
+        (branch.pageDepth > selected.pageDepth ||
+          (branch.pageDepth === selected.pageDepth && branch.slotDir < selected.slotDir)))
+    ) {
+      selected = branch
+    }
+  }
+  return {
+    outlets,
+    onSlotFileError: input.logError,
+    head: async rendered => {
+      for (const branch of branches) {
+        if (rendered.has(branch.slotDir)) continue
+        void branch.metadata().catch(input.logError)
+        void branch.viewport().catch(input.logError)
+      }
+      if (!selected) return { entries: [], viewport: [], runtime: false }
+      // Each part degrades on its own; its rejection is the selected outlet's to deliver.
+      const [entries, viewport] = await Promise.all([
+        selected.metadata().catch(() => []),
+        selected.viewport().catch(() => []),
+      ])
+      return { entries, viewport, runtime: selected.runtime }
+    },
+  }
+}
+
+function slotOutlet(branch: SlotHeadBranch) {
+  const outlet = Promise.all([branch.metadata(), branch.viewport()])
+  outlet.catch(() => undefined)
+  return outlet
 }

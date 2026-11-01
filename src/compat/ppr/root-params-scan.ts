@@ -38,6 +38,37 @@ function findLayoutFile(dir: string): string | undefined {
   return undefined
 }
 
+/** Scan the params above the nearest root layout for one route file. */
+export function scanRootParamsForFile(appPath: string, file: string): Set<string> {
+  let directory = path.dirname(file)
+  const root = path.resolve(appPath)
+  while (directory.startsWith(root)) {
+    const layout = findLayoutFile(directory)
+    if (layout) {
+      let source = ''
+      try {
+        source = readFileSync(layout, 'utf8')
+      } catch {
+        source = ''
+      }
+      if (isRootLayoutSource(source)) {
+        return new Set(
+          path
+            .relative(root, directory)
+            .split(path.sep)
+            .flatMap(segment => {
+              const name = paramNameOfSegment(segment)
+              return name ? [name] : []
+            }),
+        )
+      }
+    }
+    if (directory === root) break
+    directory = path.dirname(directory)
+  }
+  return new Set()
+}
+
 /**
  * Walk `app/` collecting, for every root layout, the param names on the path
  * from app root down to (and including) that layout's directory. The union is

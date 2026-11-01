@@ -12,6 +12,7 @@
 
 import type { RouteManifestEntry, RouteParamValue } from '../../types'
 import { getRequestRuntime } from '../../routing/request-environment'
+import { paramSetMatches } from '../static-params'
 import { getNextConfig } from './config-loader'
 
 interface RouteState {
@@ -123,10 +124,7 @@ function paramsPrerendered(
   if (Object.keys(params).length !== (route.params ?? []).length) return false
   return sets.some(set => {
     const names = Object.keys(set)
-    return (
-      names.length === Object.keys(params).length &&
-      names.every(name => String(set[name]) === String(params[name]))
-    )
+    return names.length === Object.keys(params).length && paramSetMatches(set, params, names)
   })
 }
 
@@ -181,8 +179,21 @@ export function nextClientRouteState(
     ...(staticChildren.length > 0 ? { staticChildren } : {}),
     ...(Object.keys(staticChildrenBySegment).length > 0 ? { staticChildrenBySegment } : {}),
     ...(prefetchKind ? { prefetchKind } : {}),
-    // Only `allow-runtime` shells are request-sampled per URL; a `partial` shell
+    // Only runtime-prefetched shells are request-sampled per URL; a `partial` shell
     // is a static prerender the whole route shares.
-    ...(declared === 'allow-runtime' ? { runtimePrefetch: true } : {}),
+    ...(routeRuntimePrefetch(route) ? { runtimePrefetch: true } : {}),
   }
+}
+
+/**
+ * True when the route is runtime-prefetched (`next-router-prefetch: 2`): Partial Prefetching (`prefetch =
+ * 'partial'` or global `partialPrefetching`), `prefetch = 'allow-runtime'`, or legacy `unstable_instant`.
+ * A leaf-most `instant = false` opts back out.
+ */
+export function routeRuntimePrefetch(route: Pick<RouteManifestEntry, 'segmentConfig'>): boolean {
+  const config = route.segmentConfig
+  if (config?.unstableInstant === false) return false
+  if (config?.prefetch === 'allow-runtime' || config?.prefetch === 'partial') return true
+  if (config?.unstableInstant === true && !config.stableInstant) return true
+  return (getNextConfig() as { partialPrefetching?: unknown }).partialPrefetching === true
 }

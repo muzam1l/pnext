@@ -8,7 +8,7 @@
 // a build/dev error there - so this runtime is intentionally permissive and a valid getter always works.
 // Context errors (server action / route handler / unstable_cache) match Next's messages exactly.
 
-import { currentParams, currentRequest, getWorkUnit } from '../../request/context'
+import { currentRequest, getWorkUnit } from '../../request/context'
 import {
   cacheComponents,
   hangingPromise,
@@ -16,7 +16,11 @@ import {
   isRuntimePrefetchPrerender,
 } from '../../render/ppr'
 import { insideUnstableCacheProducer } from '../cache/revalidate'
-import { insideUseCacheProducer, recordUseCacheRootParamRead } from '../cache/use-cache'
+import {
+  currentUseCacheRootParams,
+  insideUseCacheProducer,
+  recordUseCacheRootParamRead,
+} from '../cache/use-cache'
 
 /** E-code errors Next throws for root-params used in an unsupported context. */
 function rootParamContextError(name: string): Error | undefined {
@@ -104,7 +108,7 @@ export function rootParam<T = string | string[] | undefined>(name: string): Prom
   ) {
     return hangingPromise<T>(`rootParam(${name})`)
   }
-  const params = currentParams()
+  const params = currentUseCacheRootParams()
   return Promise.resolve(params[name] as T)
 }
 

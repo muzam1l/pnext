@@ -67,6 +67,32 @@ if (violations.length > 0) {
 
 console.log('check-compat-boundary: OK')
 
+const COMPAT_SENTINELS = [
+  'fromRoutes',
+  'prefetchIntent',
+  'setExportDocumentFetcher',
+  'setLoadingShellPredictionPolicy',
+  'setPrefetchStaleTimePolicy',
+  'setRevalidationPrefetchDelay',
+  'setSegmentCachePolicy',
+  'setShellStaleTimePolicy',
+  'setStylesheetReconciler',
+  'setNavigationScrollAction',
+  'setNavigationHistoryPolicy',
+]
+const routerRuntime = readFileSync(path.join(srcDir, 'client/router/runtime.ts'), 'utf8')
+const runtimeExports = [...routerRuntime.matchAll(/export\s*\{([^}]+)\}/g)]
+  .map(match => match[1])
+  .join('\n')
+const leakedSentinels = COMPAT_SENTINELS.filter(name =>
+  new RegExp(`\\b${name}\\b`).test(name.startsWith('set') ? runtimeExports : routerRuntime),
+)
+if (leakedSentinels.length) {
+  console.error(`Compat behavior in core router runtime: ${leakedSentinels.join(', ')}`)
+  process.exit(1)
+}
+console.log('check-router-compat: OK')
+
 // Every .tsx that is pnext's own source (see source-boundary.ts) must carry the preact
 // jsxImportSource pragma: the Bun runtime ignores
 // tsconfig jsxImportSource for files under node_modules, so an npm-installed pnext would compile

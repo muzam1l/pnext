@@ -71,15 +71,15 @@ export function registerCacheExtensions(config: ResolvedConfig): void {
   // Prerenders + runtime renders must observe Next fetch-cache options
   // (force-cache, next: { revalidate, tags }). Idempotent; next-compat only.
   if (nextCompatEnabled(config)) {
-    registerInitHooks(cfg => {
+    registerInitHooks(async cfg => {
       installCompatFetchCache()
       // Where `pnext start` reads the build's --debug-prerender flag back from
       // (the runtime 'use cache' error funnel shapes its log around it).
       setBuildFlagsOutPath(cfg.outPath)
       // Load + instantiate the configured `cacheHandler` (next.config) and
       // install it into the core cache seam so the data cache defers to it.
-      installCustomCacheHandler(cfg.root)
-      installModernCacheHandlers(cfg.root)
+      await installCustomCacheHandler(cfg.root)
+      await installModernCacheHandlers(cfg.root)
     })
   }
 }

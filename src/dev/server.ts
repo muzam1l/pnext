@@ -25,6 +25,8 @@ import {
   buildGlobalCss,
   buildRouteCss,
   clearGlobalCssSourceCache,
+  memoizedGlobalCssSources,
+  globalCssSourcesVersion,
   isCssFile,
   warmCssPipeline,
 } from '../css/build'
@@ -44,7 +46,7 @@ import {
 import { markErrorLogged } from '../utils/error-log'
 import { escapeHtml } from '../utils/html'
 import { internalErrorHtml } from './internal-error'
-import { getFontExtensions, nextCompatEnabled } from '../render/hooks'
+import { getFontExtensions, getRenderSpanExtensions, nextCompatEnabled } from '../render/hooks'
 import {
   clearMetadataFileCaches,
   discoverStaticMetadataFiles,
@@ -127,6 +129,7 @@ interface DevServerOptions {
   config: ResolvedConfig
   port: number
   hostname: string
+  tls?: Bun.TLSOptions
   /**
    * Compile the entry route in the background as soon as the server is up, so the
    * expensive cold build (esbuild cold start + Tailwind subprocess) overlaps with
@@ -365,10 +368,16 @@ export async function startDevServer(options: DevServerOptions) {
       broadcast(clients, 'css-update')
       return
     }
-    // The route table is built from file paths only, so only an added, removed
-    // or renamed file can change it — a plain save never does.
-    if (structural) {
+    // A route's deferred facts ride on the table: a save to a source it walked must rebuild it.
+    const factsMoved = change.files.some(file =>
+      routes.some(route => routeFactsResolved(route) && route.sourceFiles.includes(file)),
+    )
+    if (structural || factsMoved) {
       routes = await scanRoutes(config.appPath, config.workspaceRoot)
+      // Requests that landed during the scan memoized against the old entries.
+      clearDevRouteBundleKeys()
+      clearAppKeyed(assetBuilds, config.outPath)
+      clearAppKeyed(routeCacheKeys, config.outPath)
       setDevClientRoutes(config, routes)
     }
     await validateProxyFiles(config)
@@ -399,9 +408,15 @@ export async function startDevServer(options: DevServerOptions) {
   // a route has resolved its deferred facts — so they are re-derived whenever
   // another route materializes (its first compile), not once at boot.
   let watchedFactsVersion = -1
+  let watchedCssVersion = -1
   function syncWatchRoots() {
-    if (watchedFactsVersion === routeFactsVersion()) return
+    if (
+      watchedFactsVersion === routeFactsVersion() &&
+      watchedCssVersion === globalCssSourcesVersion()
+    )
+      return
     watchedFactsVersion = routeFactsVersion()
+    watchedCssVersion = globalCssSourcesVersion()
     watcher = refreshWatcher(config, routes, watcher, reload, bootTime, eagerInvalidate)
   }
 
@@ -411,6 +426,7 @@ export async function startDevServer(options: DevServerOptions) {
   const server = Bun.serve({
     hostname,
     port,
+    tls: options.tls,
     idleTimeout: DEV_IDLE_TIMEOUT_SECONDS,
     fetch(request, server) {
       // One work unit spans the whole request; its after-queue flushes once the
@@ -482,7 +498,19 @@ export async function startDevServer(options: DevServerOptions) {
       }, 0)
       if (profile) flushDevProfileLines()
       abortUpstreamFetchOnDisconnect(logged.body, request.signal)
-      return flushWorkUnitOnClose(logged, unit, request.signal)
+      const onBodyError = getRequestExtensions().onResponseBodyError
+      return flushWorkUnitOnClose(
+        logged,
+        unit,
+        request.signal,
+        onBodyError &&
+          (error =>
+            onBodyError(
+              error,
+              { method: request.method, url: request.url, headers: request.headers },
+              { phase: unit?.phase, routeKind: unit?.routeKind },
+            )),
+      )
     }
 
     try {
@@ -493,6 +521,8 @@ export async function startDevServer(options: DevServerOptions) {
       const initialPrefetchResponse = maybeDevPagePrefetchResponse(routes, url.pathname, request)
       if (initialPrefetchResponse) return finish(initialPrefetchResponse)
 
+      const beforeProxy = getRequestExtensions().beforeProxy
+      if (beforeProxy) await beforeProxy(request)
       let proxyResponse: Response | undefined
       const proxyResult = await profileDevStep(profile, 'proxy', () =>
         proxyRunner(request, { dev: true, devImportVersion }),
@@ -801,7 +831,9 @@ export async function startDevServer(options: DevServerOptions) {
   }
 
   const warmup = options.warm
-    ? afterReady(() => warmDev(config, routes)).catch(error => logDevPreloadError('warm', error))
+    ? afterReady(() => warmDev(config, routes))
+        .catch(error => logDevPreloadError('warm', error))
+        .finally(syncWatchRoots)
     : undefined
   // Typegen is the one consumer that needs EVERY route's content facts (mode,
   // hydrated), so it runs last and off the critical path — after the entry
@@ -1083,11 +1115,20 @@ async function handleRoute(
     conditionTarget: serverBundleTargetForRuntime(route.segmentConfig?.runtime),
   })
   await drainPreplanBuilds()
-  const imported = (await import(routeHref)) as RouteHandlerModule &
-    Parameters<typeof metadataRouteHandlerModule>[0]
+  const spans = getRenderSpanExtensions()
+  const imported = await spans.withFindPageComponentsSpan(
+    route.route,
+    async () =>
+      (await import(routeHref)) as RouteHandlerModule &
+        Parameters<typeof metadataRouteHandlerModule>[0],
+  )
   const module = (metadataRouteHandlerModule(imported, route) ?? imported) as RouteHandlerModule
   return withRouteRuntime(route.segmentConfig?.runtime, () =>
-    runWithCacheScope(() => handleRouteModule(module, request, params, { routeFile: route.file })),
+    spans.withRouteHandlerSpan(route.route, () =>
+      runWithCacheScope(() =>
+        handleRouteModule(module, request, params, { routeFile: route.file }),
+      ),
+    ),
   )
 }
 
@@ -1788,6 +1829,7 @@ function isInside(root: string, file: string) {
 }
 
 interface DevWatcher {
+  roots: string[]
   rootsKey: string
   stop(): void
 }
@@ -1800,7 +1842,9 @@ function refreshWatcher(
   bootTime: number,
   onEvent: (file: string) => void,
 ) {
-  const roots = devWatchRoots(config, routes)
+  // Roots only grow: a structural rescan unresolves every route, which would unwatch packages.
+  const kept = current?.roots.filter(root => existsSync(root)) ?? []
+  const roots = [...new Set([...kept, ...devWatchRoots(config, routes)])].sort()
   const rootsKey = roots.join('\0')
   if (current?.rootsKey === rootsKey) return current
   current?.stop()
@@ -1810,23 +1854,24 @@ function refreshWatcher(
 function devWatchRoots(config: ResolvedConfig, routes: RouteManifestEntry[]) {
   const packageRoots = workspacePackageRoots(config.workspaceRoot)
   const roots = new Set([config.appPath])
-
-  // Reading sourceFiles off an unresolved route would scan the whole app at
-  // boot — exactly what the deferred route table exists to avoid.
-  for (const route of routes.filter(routeFactsResolved)) {
-    for (const file of route.sourceFiles) {
-      if (isInside(config.appPath, file)) continue
-      const packageRoot = packageRoots.find(root => isInside(root, file))
-      if (packageRoot) roots.add(packageWatchRoot(packageRoot, file))
-      else {
-        // An app that is not a declared workspace member has no package root,
-        // which used to leave its own components/, lib/ and styles/ unwatched:
-        // the server served fresh content but the open page was never told.
-        const projectRoot = projectWatchRoot(config.root, file)
-        if (projectRoot) roots.add(projectRoot)
-      }
+  const add = (file: string) => {
+    if (isInside(config.appPath, file)) return
+    const packageRoot = packageRoots.find(root => isInside(root, file))
+    if (packageRoot) roots.add(packageWatchRoot(packageRoot, file))
+    else {
+      // An app that is not a declared workspace member has no package root,
+      // which used to leave its own components/, lib/ and styles/ unwatched:
+      // the server served fresh content but the open page was never told.
+      const projectRoot = projectWatchRoot(config.root, file)
+      if (projectRoot) roots.add(projectRoot)
     }
   }
+
+  // Discover external stylesheets after the warm tier or a render has walked the layout.
+  memoizedGlobalCssSources(config).forEach(add)
+  // Reading sourceFiles off an unresolved route would scan the whole app at
+  // boot — exactly what the deferred route table exists to avoid.
+  for (const route of routes.filter(routeFactsResolved)) route.sourceFiles.forEach(add)
 
   return [...roots].sort()
 }
@@ -1928,6 +1973,7 @@ function watchRoots(
   if (!recursiveWatchBroken) setDevWatcherFreshness(outPath, true)
 
   return {
+    roots,
     rootsKey,
     stop() {
       if (pending) clearTimeout(pending)

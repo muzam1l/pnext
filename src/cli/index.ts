@@ -68,6 +68,7 @@ try {
       root: positionalRoot(args),
       port: optionNumber(args, '--port'),
       hostname: optionString(args, '--hostname'),
+      tls: devTlsOptions(args),
     })
   } else if (command === 'build') {
     warnUnknownFlags(command, args)
@@ -103,15 +104,20 @@ try {
     warnUnknownFlags(command, args)
     const { analyzeProject } = await import('./analyze')
     const { route, root } = analyzePositionals(args)
+    const why = optionString(args, '--why')
+    const json = args.includes('--json')
     const result = await analyzeProject(root, {
       compression: analyzeCompression(args),
       route,
+      why,
+      // The all-routes text report is a summary; detail is per route or in JSON.
+      details: json || Boolean(route),
     })
-    if (args.includes('--json')) {
+    if (json) {
       console.log(JSON.stringify(result, null, 2))
     } else {
       const { printAnalyzeResult } = await import('./analyze')
-      printAnalyzeResult(result, { route, files: args.includes('--files') })
+      printAnalyzeResult(result, { route, why, files: args.includes('--files') })
     }
   } else if (command === 'typegen') {
     warnUnknownFlags(command, args)
@@ -212,8 +218,12 @@ function positionals(args: string[]) {
       arg === '--port' ||
       arg === '--adapter' ||
       arg === '--hostname' ||
+      arg === '--tls-key' ||
+      arg === '--tls-cert' ||
+      arg === '--tls-ca' ||
       arg === '--debug-build-paths' ||
-      arg === '--experimental-build-mode'
+      arg === '--experimental-build-mode' ||
+      arg === '--why'
     ) {
       index += 1
       continue
@@ -236,6 +246,15 @@ function optionNumber(args: string[], name: string) {
   if (index === -1) return undefined
   const value = args[index + 1]
   return value ? Number(value) : undefined
+}
+
+function devTlsOptions(args: string[]): Bun.TLSOptions | undefined {
+  const key = optionString(args, '--tls-key')
+  const cert = optionString(args, '--tls-cert')
+  if (!key && !cert) return undefined
+  if (!key || !cert) throw new Error('HTTPS requires both --tls-key and --tls-cert.')
+  const ca = optionString(args, '--tls-ca')
+  return { key: Bun.file(key), cert: Bun.file(cert), ...(ca ? { ca: Bun.file(ca) } : {}) }
 }
 
 function optionString(args: string[], name: string) {
@@ -297,6 +316,9 @@ function warnUnknownFlags(command: string, args: string[]) {
 
 function commandFlags(command: string) {
   const flags = new Set(['--help', '-h'])
+  if (command === 'dev') {
+    for (const flag of ['--tls-key', '--tls-cert', '--tls-ca']) flags.add(flag)
+  }
   if (command === 'dev' || command === 'start') {
     flags.add('--port')
     flags.add('--hostname')
@@ -311,7 +333,9 @@ function commandFlags(command: string) {
     ])
       flags.add(flag)
   }
-  if (command === 'analyze') for (const flag of ['--json', '--files', '--brotli']) flags.add(flag)
+  if (command === 'analyze') {
+    for (const flag of ['--json', '--files', '--brotli', '--why']) flags.add(flag)
+  }
   if (command === 'create') flags.add('--no-install')
   if (command === 'migrate') flags.add('--dry-run')
   return flags
@@ -384,7 +408,7 @@ function printCommandHelp(command: string) {
     dev: `Usage: pnext dev [directory] [options]\n\nFlags:\n  --port <port>          Port to listen on (default: 3000).\n  --hostname <hostname>  Hostname to listen on (default: 0.0.0.0).`,
     build: `Usage: pnext build [directory] [options]\n\nFlags:\n  --adapter <adapter>                  Deployment adapter (vercel).\n  --verbose                            Print detailed build output.\n  --experimental-build-mode <mode>     Build mode: compile or generate.\n  --debug-build-paths <patterns>       Build matching routes only.\n  --debug-prerender                    Debug prerender failures.`,
     start: `Usage: pnext start [directory] [options]\n\nFlags:\n  --port <port>          Port to listen on (default: 3000).\n  --hostname <hostname>  Hostname to listen on (default: 0.0.0.0).`,
-    analyze: `Usage: pnext analyze [route] [directory] [options]\n\nFlags:\n  --json                 Print JSON output.\n  --files                Include individual files.\n  --brotli               Report Brotli compression.`,
+    analyze: `Usage: pnext analyze [route] [directory] [options]\n\nWith a route: chunk contents, packages, CSS, fonts, and flags for that route.\n\nFlags:\n  --why <package>        Print the import chain that pulls a package in.\n  --json                 Print JSON output.\n  --files                Include individual files.\n  --brotli               Report Brotli compression.`,
     typegen: 'Usage: pnext typegen [directory]',
     create:
       'Usage: pnext create <directory> [options]\n\nFlags:\n  --no-install           Skip dependency installation.',

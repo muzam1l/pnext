@@ -70,3 +70,14 @@ export function use<T>(usable: PromiseLike<T> | Context<T>): T {
   }
   return useContext(usable as Context<T>)
 }
+
+// Thenables pre-tagged with use()'s tracked state, so use() reads them without suspending.
+export function fulfilledThenable(): Promise<void> {
+  return Object.assign(Promise.resolve(), { status: 'fulfilled' as const, value: undefined })
+}
+
+export function rejectedThenable(reason: Error): Promise<never> {
+  const promise = Promise.reject(reason)
+  promise.catch(() => undefined)
+  return Object.assign(promise, { status: 'rejected' as const, reason })
+}

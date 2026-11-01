@@ -221,6 +221,11 @@ export interface CollectRenderMetaOptions {
 }
 
 export interface RenderExtensions {
+  /**
+   * How many leading params of a route a request promotes into a concrete shell, and whether the
+   * response waits for that render. Undefined leaves promotion to the generated-prefix heuristic.
+   */
+  paramPromotion: (route: RouteManifestEntry) => { length: number; foreground: boolean } | undefined
   /** Enrich the client route state embedded in a rendered document. */
   clientRouteState: (
     route: Pick<
@@ -258,6 +263,12 @@ export interface RenderExtensions {
    * + render/index.tsx invokeServerComponentWithUse). Default: call through untouched.
    */
   wrapServerComponentInvoke: <T>(invoke: () => T) => T
+
+  /** Preserve promise metadata for work that must stay inside its streaming boundary. */
+  streamingPromise?: {
+    shouldAwait: (promise: Promise<unknown>) => boolean
+    inherit: (source: Promise<unknown>, target: Promise<unknown>) => void
+  }
 
   /**
    * Optional one-time render-module initialization side effect. Default: noop.
@@ -377,6 +388,12 @@ export interface RenderExtensions {
   globalNotFoundEnabled: () => boolean
 
   /**
+   * True when a layout composed only of named slots still receives an implicit `children` that renders
+   * the not-found boundary (the pre-explicit-children slot model). Default: false.
+   */
+  implicitSlotChildren: () => boolean
+
+  /**
    * Wrap a render's concrete `params` / `searchParams` object in a tracking view so compat can record
    * which of them the render actually reads. Core never interprets the result - it just hands the
    * returned object to user code in place of the original. Default: identity.
@@ -481,6 +498,7 @@ export interface PrerenderSidecarExtension {
 
 function createRenderExtensions(): RenderExtensions {
   return {
+    paramPromotion: () => undefined,
     clientRouteState: (_route, state) => state,
     wrapServerComponentInvoke: invoke => invoke(),
     onRenderInit: () => undefined,
@@ -496,6 +514,7 @@ function createRenderExtensions(): RenderExtensions {
     wrapThrownValue: () => undefined,
     formatErrorLog: () => undefined,
     globalNotFoundEnabled: () => false,
+    implicitSlotChildren: () => false,
     trackVaryParams: value => value,
     legacySyncProps: promise => promise,
     prerenderSidecar: {
@@ -606,6 +625,8 @@ export interface RequestErrorContext {
 }
 
 export interface RequestExtensions {
+  /** Await server initialization before proxy execution and route dispatch. */
+  beforeProxy?: (request: Request) => Promise<void>
   /** Ordered interceptors run before route matching (action dispatch, rewrites). */
   interceptors: RequestInterceptor[]
 
@@ -639,6 +660,11 @@ export interface RequestExtensions {
    * surfaces its own 500.
    */
   onRequestError: (
+    error: unknown,
+    requestInfo: RequestErrorInfo,
+    context: RequestErrorContext,
+  ) => void | Promise<void>
+  onResponseBodyError?: (
     error: unknown,
     requestInfo: RequestErrorInfo,
     context: RequestErrorContext,
@@ -899,6 +925,7 @@ export interface BuildStepContext {
   routes: unknown[]
   manifest: unknown
   log: BuildStepLogger
+  prerender?: boolean
 }
 
 /**
@@ -1304,6 +1331,15 @@ export interface RoutingExtensions {
    * keeps the lean "no client code, no bundle" default with an empty set.
    */
   alwaysClientEntryReasons: Set<ClientEntryReason>
+  /**
+   * Whether a route that matched a pathname may serve it with these params. A refusal falls
+   * through to the next matching entry (compat: closed params outside their generated sets).
+   */
+  admitRoute: (
+    route: RouteManifestEntry,
+    params: Record<string, RouteParamValue>,
+    headers?: Headers,
+  ) => boolean
 }
 
 function createRoutingExtensions(): RoutingExtensions {
@@ -1314,6 +1350,7 @@ function createRoutingExtensions(): RoutingExtensions {
     clientEntryDetection: [],
     pageExtensions: [],
     alwaysClientEntryReasons: new Set(),
+    admitRoute: () => true,
   }
 }
 
@@ -1391,6 +1428,11 @@ export function registerAlwaysClientEntryReason(reason: ClientEntryReason): void
   activeHost.routing.alwaysClientEntryReasons.add(reason)
 }
 
+/** Register the route admission predicate (compat: closed-param matching). */
+export function registerRouteAdmission(admit: RoutingExtensions['admitRoute']): void {
+  activeHost.routing.admitRoute = admit
+}
+
 /** Why every page ships the router entry; empty for a pure-core app. */
 export function alwaysClientEntryReasons(): ClientEntryReason[] {
   return [...activeHost.routing.alwaysClientEntryReasons]
@@ -1442,6 +1484,7 @@ export function sourceClientEntryReasons(source: string): ClientEntryReason[] {
 // ---------------------------------------------------------------------------
 
 export interface ProxyExtensions {
+  fileExtensions: () => readonly string[]
   /** File basenames core should consider as request proxy entrypoints. */
   names: readonly string[]
   /** Optional validation hook for framework-specific proxy diagnostics. */
@@ -1463,6 +1506,7 @@ export interface ProxyExtensions {
 
 function createProxyExtensions(): ProxyExtensions {
   return {
+    fileExtensions: () => ['ts', 'tsx', 'js', 'jsx', 'mts'],
     names: ['proxy'],
     validateFiles: () => Promise.resolve(),
     handlerExport: module => module.proxy ?? module.default,

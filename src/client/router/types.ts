@@ -136,6 +136,8 @@ export interface DocumentNavState {
    * origin-agnostic, never a direct target render.
    */
   hostRender?: boolean
+  /** On a host render, the route pattern of the interceptor the slot rendered. */
+  interceptedRoute?: string
 }
 
 export interface ActiveEntry {
@@ -311,4 +313,10 @@ export interface SegmentCachePolicy {
   evictPageSegments: () => void
   /** A revalidation invalidates every segment entry. */
   clear: () => void
+}
+
+/** The slice of the Navigation API the router reads (absent from this TypeScript lib). */
+export interface NavigationApi {
+  activation?: { entry: NavigationHistoryEntry } | null
+  currentEntry?: NavigationHistoryEntry | null
 }

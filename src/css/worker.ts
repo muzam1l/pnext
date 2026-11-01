@@ -3,7 +3,7 @@
 // here for the worker's lifetime, so Tailwind stays incremental across rebuilds.
 import { loadPostcss, runPostcss } from './postcss'
 export type CssWorkerRequest = { id: number; root: string; dev: boolean; outDir?: string } & (
-  { kind: 'warm' } | { kind: 'process'; cssFile: string; from?: string }
+  { kind: 'warm' } | { kind: 'process'; cssFile: string; from?: string; dependencies?: string[] }
 )
 
 export interface CssWorkerResponse {
@@ -19,7 +19,8 @@ self.onmessage = async (event: MessageEvent<CssWorkerRequest>) => {
   try {
     const options = { dev: request.dev, outDir: request.outDir }
     if (request.kind === 'warm') await loadPostcss(request.root, options)
-    else await runPostcss(request.root, request.cssFile, options, request.from)
+    else
+      await runPostcss(request.root, request.cssFile, options, request.from, request.dependencies)
     reply({ id: request.id })
   } catch (error) {
     reply({

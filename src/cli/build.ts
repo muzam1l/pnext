@@ -1,5 +1,5 @@
 import { serializeBuildManifest } from '../utils/fs'
-import { copyFile, mkdir, rename, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
@@ -38,6 +38,16 @@ import {
   registerCssRuntime,
   warmCssPipeline,
 } from '../css/build'
+import {
+  analyzeCommand,
+  analyzeGraph,
+  printRouteSizes,
+  readAnalyzeSizes,
+  recordRouteSizes,
+  sizeRows,
+  writeAnalyzeGraph,
+  type RouteSizeRow,
+} from './analyze'
 import { ensureEmptyDir, listFiles, readText, toPosixPath, writeText } from '../utils/fs'
 import {
   discoverStaticMetadataFiles,
@@ -198,6 +208,9 @@ async function runBuild(
 
   console.log(`⚡ ${bold('pnext')} ${dim('— Creating an optimized production build ...\n')}`)
   const config = await loadConfig(root)
+  if (config.output === 'export' && options.adapter) {
+    throw new Error(`Core output: 'export' cannot be combined with a deployment adapter.`)
+  }
   const buildCache = lookupBuildCache(config, options)
   // Compat plugin loader: the single gated seam that populates the core
   // extension registries when compat is enabled (no-op for pure-core apps).
@@ -218,6 +231,10 @@ async function runBuild(
       cached.manifest.staticFiles ?? {},
       performance.now() - startedAt,
       Boolean(cached.manifest.proxyModule),
+      undefined,
+      undefined,
+      undefined,
+      sizeRows(readAnalyzeSizes(config.outPath)),
     )
     return cached.manifest
   }
@@ -233,6 +250,8 @@ async function runBuild(
   lifecycle.warm = warm
   // The framework's half of the standalone trace needs no build output; it overlaps the bundling.
   const standalone = startStandalone(config)
+  // Read before the output is cleared: analyze diffs each route against the previous build.
+  const previousSizes = readAnalyzeSizes(config.outPath)
   const publicFiles = await log.step('prepare output directory', async () => {
     // Build-owned outputs only: `<outRoot>/dev` belongs to a possibly-running
     // dev server and must survive.
@@ -274,7 +293,13 @@ async function runBuild(
   // Compat build steps (action discovery/bundling + server-reference manifest)
   // populate their output onto this accumulator. Pure-core registers no steps.
   const buildState: BuildStepState = { actions: [] }
-  const stepContext = { config, routes, manifest: buildState, log }
+  const stepContext = {
+    config,
+    routes,
+    manifest: buildState,
+    log,
+    prerender: options.buildMode !== 'compile',
+  }
   const { steps } = getBuildExtensions()
   // Steps that declare themselves route-fact-independent (action discovery) run UNDER the scan below
   // rather than after it, which would make both strictly serial.
@@ -326,7 +351,9 @@ async function runBuild(
   // (`/a.html` rather than `/a/index.html`). Only meaningful under compat (the
   // Next config carries `output`); pure-core apps always use the dir layout.
   const flatExportLayout =
-    nextCompatEnabled(config) && buildCompat().nextOutputExport() && config.trailingSlash !== true
+    (config.output === 'export' ||
+      (nextCompatEnabled(config) && buildCompat().nextOutputExport())) &&
+    config.trailingSlash !== true
   // The proxy bundle is independent of the remaining build steps; overlap them.
   const proxyBuild = log.step('proxy module', () => buildProxyModule(config))
   proxyBuild.catch(() => undefined)
@@ -445,7 +472,21 @@ async function runBuild(
   remainingSteps.catch(() => undefined)
   await remainingSteps
   const staticModuleMetadata = await moduleMetadata
-  await clientBundles
+  const clientGraph = await clientBundles
+  // Entry names are final only now that the client stage fingerprinted them.
+  const graph = clientGraph
+    ? analyzeGraph(
+        config,
+        clientGraph,
+        new Map(
+          clientRoutes.flatMap(route =>
+            route.clientEntry ? [[`${clientEntryName(route)}.js`, route.clientEntry]] : [],
+          ),
+        ),
+      )
+    : undefined
+  const graphWritten = graph ? writeAnalyzeGraph(config.outPath, graph) : Promise.resolve()
+  graphWritten.catch(() => undefined)
   const proxyModule = await proxyBuild
   await partytownLib
   // Standalone static chunks (compat: the no-module polyfills chunk) live
@@ -666,7 +707,10 @@ async function runBuild(
             : []
     // Partial sets included: dynamicParams=false checks match governed params
     // against these at request time.
-    if (staticParams) route.prerenderedParams = staticParams.allSets
+    if (staticParams) {
+      route.prerenderedParams = staticParams.allSets
+      if (staticParams.paramMatching) route.paramMatching = staticParams.paramMatching
+    }
     // NEXT_DEBUG_BUILD parity: Next logs why a route that would otherwise have
     // been prerendered fell back to dynamic (the e2e suite greps this line).
     // This branch covers the request-API bailout (headers()/cookies() in the
@@ -893,6 +937,7 @@ async function runBuild(
   const fallback404 = await notFoundDocuments
   await emitNextNotFoundArtifacts(config, fallback404)
   await emitProxyServerArtifacts(config, proxyModule)
+  if (config.output === 'export') assertCoreStaticExport(routes, staticFiles, proxyModule)
 
   // Next always prerenders the built-in `/_not-found` and `/_global-error`
   // pseudo-routes for an app-router build (even when the app ships no custom
@@ -902,7 +947,7 @@ async function runBuild(
   // metadata-dynamic-routes). Register the entries so they surface. No backing
   // file is required: the runtime static lookup keys off files that exist on
   // disk, so a fileless manifest entry is inert at request time.
-  if (config.compat?.next) {
+  if (!isCompile && config.compat?.next) {
     // `/_global-error` only prerenders when the app has a singular top-level
     // root layout; with route-group root layouts (no app/layout.*) Next skips
     // it and the prerender manifest omits the route. The hybrid pages+app
@@ -953,6 +998,14 @@ async function runBuild(
   }
   await writeBuildManifest(config.outPath, manifest)
   log.log(`wrote manifest.json (${routes.length} route${routes.length === 1 ? '' : 's'})`)
+  // Before the adapter and the build cache snapshot the output, both of which read what lands here.
+  const routeSizes =
+    config.output === 'export'
+      ? []
+      : await log.step('route sizes', async () => {
+          await graphWritten
+          return recordRouteSizes(config, manifest, graph, previousSizes, globalCssSources(config))
+        })
   for (const hook of getBuildExtensions().completeHooks) {
     await hook({ config, manifest, log })
   }
@@ -982,6 +1035,7 @@ async function runBuild(
   const phases = await settleBuildParallelPhases()
   flushDevModuleCaches()
   await writeBuildCache(config, options, cached)
+  if (config.output === 'export') await publishCoreStaticExport(config.outPath)
 
   printBuildSummary(
     config,
@@ -992,6 +1046,7 @@ async function runBuild(
     interceptionPrerenders,
     partialPrerenders,
     phases,
+    routeSizes,
   )
   return manifest
 }
@@ -1110,6 +1165,7 @@ function printBuildSummary(
   interceptionPrerenders = new Map<string, string[]>(),
   partialPrerenders = new Set<string>(),
   parallelPhases: { name: string; durationMs: number }[] = [],
+  routeSizes: RouteSizeRow[] = [],
 ) {
   const pages = routes.filter(route => route.kind !== 'handler').length
   const handlers = routes.length - pages
@@ -1123,10 +1179,15 @@ function printBuildSummary(
   const usedMarkers = new Set<string>()
   for (const route of routes) {
     const intercepted = interceptionPrerenders.get(route.id)
+    const staticHandler =
+      route.kind === 'handler' && Object.values(staticFiles).some(file => file.routeId === route.id)
+    const generatedHandler = Boolean(route.metadataRoute?.generatedRoutes?.length)
     const marker =
       route.kind === 'handler'
-        ? Object.values(staticFiles).some(file => file.routeId === route.id)
-          ? '○'
+        ? staticHandler
+          ? route.hasStaticParams || generatedHandler
+            ? '●'
+            : '○'
           : 'ƒ'
         : intercepted
           ? '●'
@@ -1143,7 +1204,15 @@ function printBuildSummary(
     // Next names a dynamic route by its source pattern (`/[dyn]`), not pnext's
     // `:param` form; compat apps' e2e output is matched against Next's.
     usedMarkers.add(marker)
-    console.log(`  ${marker} ${nextCompatEnabled(config) ? toNextRoutePattern(label) : label}`)
+    const labels =
+      staticHandler && generatedHandler && !route.metadataRoute?.generatedParam
+        ? (route.metadataRoute?.generatedRoutes ?? [label])
+        : [label]
+    for (const routeLabel of labels) {
+      console.log(
+        `  ${marker} ${nextCompatEnabled(config) ? toNextRoutePattern(routeLabel) : routeLabel}`,
+      )
+    }
   }
   for (const file of staticMetadataSummaryFiles(staticFiles)) {
     usedMarkers.add('○')
@@ -1166,6 +1235,7 @@ function printBuildSummary(
     .join('   ')
   if (legendLine) console.log(`\n  ${dim(legendLine)}`)
   console.log('')
+  printRouteSizes(routeSizes)
   console.log(
     `${green('✓')} ${bold('Build complete')} ${dim(`in ${formatBuildDuration(durationMs)}`)}`,
   )
@@ -1178,8 +1248,46 @@ function printBuildSummary(
   }
   console.log(`  ${dim(`${parts.join(', ')} → ${outDir}`)}`)
   console.log('')
-  console.log(`  Serve the production build: ${cyan('pnext start')}`)
-  console.log(`  Analyze the build: ${cyan('pnext analyze')}`)
+  if (config.output !== 'export') {
+    console.log(`  Serve the production build: ${cyan('pnext start')}`)
+    console.log(`  Inspect a route's weight: ${cyan(analyzeCommand(routeSizes))}`)
+  }
+}
+
+function assertCoreStaticExport(
+  routes: RouteManifestEntry[],
+  staticFiles: Record<string, StaticFileMetadata>,
+  proxyModule?: string,
+) {
+  if (proxyModule) throw new Error(`Core output: 'export' does not support proxy.ts.`)
+  const handler = routes.find(route => route.kind === 'handler')
+  if (handler) {
+    throw new Error(`Core output: 'export' does not support route handler ${handler.route || '/'}.`)
+  }
+  const prerendered = new Set(
+    Object.values(staticFiles)
+      .filter(file => file.kind === 'page' && file.routeId)
+      .map(file => file.routeId),
+  )
+  const dynamic = routes.find(route => route.kind === 'page' && !prerendered.has(route.id))
+  if (dynamic) {
+    throw new Error(`Core output: 'export' could not prerender page ${dynamic.route || '/'}.`)
+  }
+}
+
+let staticExportSequence = 0
+
+async function publishCoreStaticExport(outPath: string) {
+  // The export replaces the whole out root (release, cache, types) with the release's static tree.
+  const outRoot = path.dirname(outPath)
+  const staging = path.join(
+    path.dirname(outRoot),
+    `.${path.basename(outRoot)}-static-${process.pid}-${++staticExportSequence}`,
+  )
+  await rm(staging, { recursive: true, force: true })
+  await rename(path.join(outPath, 'static'), staging)
+  await rm(outRoot, { recursive: true, force: true })
+  await rename(staging, outRoot)
 }
 
 function staticMetadataSummaryFiles(staticFiles: Record<string, StaticFileMetadata>) {
@@ -1950,7 +2058,8 @@ async function hasPartialStaticPrefix(
   let staticParams: Awaited<ReturnType<typeof staticParamsFor>>
   try {
     staticParams = await staticParamsFor(config, route)
-  } catch {
+  } catch (error) {
+    rethrowIfProgrammingError(error)
     return false
   }
   const paramKeys = [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
@@ -1975,7 +2084,8 @@ async function hasFullStaticParamSet(
   let staticParams: Awaited<ReturnType<typeof staticParamsFor>>
   try {
     staticParams = await staticParamsFor(config, route)
-  } catch {
+  } catch (error) {
+    rethrowIfProgrammingError(error)
     return false
   }
   const paramKeys = [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
@@ -1996,10 +2106,12 @@ async function buildSubShells(
   let staticParams: Awaited<ReturnType<typeof staticParamsFor>>
   try {
     staticParams = await staticParamsFor(config, route)
-  } catch {
+  } catch (error) {
+    rethrowIfProgrammingError(error)
     return
   }
   route.prerenderedParams = staticParams.allSets
+  if (staticParams.paramMatching) route.paramMatching = staticParams.paramMatching
   const paramKeys = [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
   // Distinct leading prefixes AND full param sets. A partial prefix fills keys
   // [0..k) (k < len) and leaves the rest hanging → a sub-shell (postponed). A
@@ -2168,6 +2280,7 @@ function filterDebugBuildRoutes(
     .split(',')
     .map(pattern => pattern.trim())
     .filter(pattern => pattern.length > 0 && !pattern.startsWith('!'))
+    .map(pattern => path.posix.normalize(pattern))
     .map(debugBuildPathMatcher)
   if (matchers.length === 0) return routes
   return routes.filter(route => {
@@ -2462,6 +2575,7 @@ async function buildStaticRouteHandler(
       : routeModule
   ) as RouteHandlerModule
   const paramSets = await staticRouteParams(route, module)
+  if (route.hasStaticParams) route.prerenderedParams = paramSets
   const staticFiles: Record<string, StaticFileMetadata> = {}
 
   // A generated-param metadata route (`generateSitemaps` / `generateImageMetadata`)
@@ -2469,7 +2583,7 @@ async function buildStaticRouteHandler(
   // route even when the response body itself can't be baked (an ImageResponse
   // settles in a later task, so the loop below skips the physical copy).
   // Record the expansion for the compat prerender-manifest writer.
-  if (route.metadataRoute?.generatedParam && paramSets.length > 0) {
+  if (route.metadataRoute && route.params.length > 0 && paramSets.length > 0) {
     route.metadataRoute.generatedRoutes = paramSets.map(params =>
       fillRoutePath(route.route, params, route.metadataRoute?.generatedParam),
     )
@@ -2522,11 +2636,10 @@ async function buildStaticRouteHandler(
     // depends on runtime work and must not produce a static file.
     const early = await settleBeforeNextTask(prerender)
     const completed = early ?? (await prerender)
+    const entirelyCached = await handlerHasEntirelyCachedIo(route)
     const rendered =
       early ??
-      (route.segmentConfig?.dynamic === 'force-static' || (await handlerHasEntirelyCachedIo(route))
-        ? completed
-        : undefined)
+      (route.segmentConfig?.dynamic === 'force-static' || entirelyCached ? completed : undefined)
     if (!rendered) continue
     const response = rendered.value
     // A 5xx means the handler threw during prerender (handleRouteModule funnels
@@ -2537,7 +2650,9 @@ async function buildStaticRouteHandler(
       throw new Error(`route handler prerender returned ${response.status}`)
     }
     if (rendered.noStore && !staticRouteHandlerExplicitlyCached(route)) continue
-    const body = await settleBeforeNextTask(response.clone().arrayBuffer())
+    const body = entirelyCached
+      ? await response.clone().arrayBuffer()
+      : await settleBeforeNextTask(response.clone().arrayBuffer())
     if (!body) continue
     const relative = toPosixPath(path.relative(path.join(config.outPath, 'static'), file))
     // Descendant handlers record their manifest entry (so the synthesized
@@ -2593,7 +2708,14 @@ async function handlerHasEntirelyCachedIo(route: RouteManifestEntry): Promise<bo
   // handler internally. When that default is a top-level `use cache` function every read inside it is
   // cached, so the whole route is prerenderable. Without this the GET sniff below returns false and
   // the route stays runtime-only.
-  if (route.metadataRoute && metadataDefaultUsesCache(source)) return true
+  if (
+    route.metadataRoute &&
+    (metadataDefaultUsesCache(source) ||
+      /^\s*['"]use cache['"]\s*;?\s*$/m.test(source) ||
+      /^(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*await\b/m.test(source))
+  ) {
+    return true
+  }
   const getStart = source.search(/\bexport\s+(?:async\s+)?function\s+GET\s*\(/)
   if (getStart === -1) return false
   const afterGet = source.slice(getStart)
@@ -2723,7 +2845,9 @@ async function staticRouteHandlerCandidate(route: RouteManifestEntry) {
   // per request; it can never be prerendered (Next keeps it dynamic even with a
   // `revalidate` export), so serving a cached body would drop the revalidation.
   if (route.handlerUsesRevalidationApi) return false
-  if (route.metadataRoute) return !route.usesRequest
+  if (route.metadataRoute) {
+    return !route.usesRequest || route.hasStaticParams
+  }
   // `dynamic = 'error'` deliberately exercises a static render so request API
   // reads can fail at their call sites instead of turning the handler dynamic.
   if (config?.dynamic === 'error') return true
@@ -2985,7 +3109,9 @@ function rethrowIfProgrammingError(error: unknown): void {
   if (
     error instanceof ReferenceError ||
     error instanceof SyntaxError ||
-    (error instanceof TypeError && isBuildInternalStack(error))
+    (error instanceof TypeError && isBuildInternalStack(error)) ||
+    // A build validation failure never degrades to skip-and-warn.
+    (error instanceof Error && error.name === 'PnextBuildValidationError')
   ) {
     throw error
   }

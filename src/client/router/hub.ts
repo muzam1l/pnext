@@ -28,12 +28,21 @@ export const routerState: {
   fallbackPaint?: [sequence: number, at: number]
   /** Ends the clicked link's pending state; set once the runtime installs. */
   settleLink?: () => void
+  /** Soft navigations started so far; an action compares it across its round trip. */
+  navigationStarts: number
+  /** The settled document, snapshotted at idle when the runtime is deferred past it. */
+  settledHtml?: string
+  /** Pending until every in-flight soft navigation has settled; unset when none is. */
+  navigationSettled?: Promise<void>
+  /** Navigation API key of the entry current when the hub started listening for popstate. */
+  installedEntryKey?: string
 } = {
   // pathname+search of the URL the router last observed. A popstate that leaves both unchanged is a
   // same-document FRAGMENT traversal - Chrome fires popstate, not just hashchange, for those - and
   // treating one as a history traversal would refetch and swap the body, remounting the live tree
   // under the user's feet.
   observedLocationKey: locationKey(),
+  navigationStarts: 0,
 }
 
 export function locationKey() {
@@ -46,13 +55,16 @@ export function locationKey() {
 // seams (segment cache, prefetch windows, scroll, stylesheet order). Registering
 // one costs first paint a closure holding an `import()`; the facade runs them
 // while the runtime chunk loads, so a policy is in place before the first fetch.
-const deferredInstalls: (() => unknown)[] = []
+// Installers receive the runtime module, so a seam they set rides its chunk rather than a shared one.
+type DeferredInstall = (runtime: typeof import('./runtime-entry')) => unknown
 
-export function registerDeferredInstall(install: () => unknown): void {
+const deferredInstalls: DeferredInstall[] = []
+
+export function registerDeferredInstall(install: DeferredInstall): void {
   deferredInstalls.push(install)
 }
 
-export function takeDeferredInstalls(): (() => unknown)[] {
+export function takeDeferredInstalls(): DeferredInstall[] {
   return deferredInstalls.splice(0)
 }
 

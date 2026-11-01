@@ -9,6 +9,7 @@ import { readFile, readdir, rm } from 'node:fs/promises'
 import path from 'node:path'
 import type { ResolvedConfig } from '../config'
 import { getExternalPackagePolicy } from '../resolve/imports'
+import { resolveFrom } from '../resolve/engine'
 import { importMetaRefs, importSpecifiers } from '../resolve/scan-facts'
 import { splitResourceQuery } from '../utils/resource-query'
 import { toPosixPath, writeFileAtomic } from '../utils/fs'
@@ -259,9 +260,15 @@ export async function pruneReleaseVendor(config: ResolvedConfig, sources: Map<st
           (/\.[cm]?js$/.test(file)
             ? await readFile(file, 'utf8').catch(() => undefined)
             : undefined)
-        for (const specifier of code ? relativeReferences(file, code) : []) {
-          const target = path.resolve(path.dirname(file), splitSuffix(specifier).specifier)
-          if (isInside(vendor, target)) next.push(target)
+        for (const ref of code ? moduleReferences(file, code) : []) {
+          const resolved = resolveFrom(path.dirname(file), splitSuffix(ref.specifier).specifier, [
+            ref.require ? 'require' : 'import',
+            'node',
+            'default',
+          ])
+          if (resolved && 'path' in resolved && isInside(vendor, resolved.path)) {
+            next.push(resolved.path)
+          }
         }
       }),
     )
@@ -287,13 +294,12 @@ async function compiledFiles(dir: string): Promise<string[]> {
   return nested.flat()
 }
 
-/** Relative module references in emitted code: imports, requires and `new URL(…, import.meta.url)`. */
-function relativeReferences(file: string, code: string) {
+/** Module references in emitted code: imports, requires and `new URL(…, import.meta.url)`. */
+function moduleReferences(file: string, code: string) {
   return [
-    ...outputSpecifiers(code).map(found => found.value),
-    ...emittedRefs(code).map(ref => ref.specifier),
-    ...importMetaRefs(file, code).urls.map(url => url.specifier),
-  ].filter(specifier => specifier.startsWith('.'))
+    ...emittedRefs(code),
+    ...importMetaRefs(file, code).urls.map(url => ({ specifier: url.specifier, require: false })),
+  ]
 }
 
 /** A stable entry name: the package path it starts from, plus its workspace identity's hash. */

@@ -624,6 +624,16 @@ export const redirectInterceptor: RequestInterceptor = async (request, ctx) => {
   })
   if (!result) return undefined
   const location = new URL(result.location, url.href)
+  const basePath = config.basePath ?? ''
+  if (
+    !ctx.outsideBasePath &&
+    basePath &&
+    location.origin === url.origin &&
+    location.pathname !== basePath &&
+    !location.pathname.startsWith(`${basePath}/`)
+  ) {
+    location.pathname = `${basePath}${location.pathname.startsWith('/') ? '' : '/'}${location.pathname}`
+  }
   // Next passes the incoming query through to the redirect destination (the
   // `_rsc` union query among it — rsc-query-routing relies on the followed
   // request keeping it). Destination-specified params win.
@@ -666,13 +676,14 @@ export const rewriteInterceptor: RequestInterceptor = async (request, ctx) => {
   if (!result) return undefined
   if (result.destination) {
     activateTestProxy(request.headers)
-    // The incoming `host` (and its forwarded twins) name THIS server; carrying
-    // them onto an outbound request makes the TLS handshake disagree with the
-    // destination's certificate. Let fetch derive them from the destination URL.
+    // Host names the destination; forwarded-host keeps the proxying app origin.
     const headers = new Headers(request.headers)
-    for (const header of ['host', 'x-forwarded-host', 'x-forwarded-port', 'x-forwarded-proto']) {
-      headers.delete(header)
-    }
+    headers.delete('host')
+    headers.set('x-forwarded-host', url.host)
+    if (!headers.has('x-forwarded-proto'))
+      headers.set('x-forwarded-proto', url.protocol.slice(0, -1))
+    if (!headers.has('x-forwarded-port'))
+      headers.set('x-forwarded-port', url.port || (url.protocol === 'https:' ? '443' : '80'))
     const rewrittenRequest = new Request(result.destination, {
       method: request.method,
       headers,

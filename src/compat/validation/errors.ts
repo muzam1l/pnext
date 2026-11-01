@@ -47,7 +47,7 @@ export function conflictingParallelPagesMessage(existingPath: string, appPath: s
 }
 
 /**
- * A non-leaf parallel `@slot` segment missing its `default.js` fallback
+ * A parallel `@slot` segment missing its `default.js` fallback
  * (`parallel-routes-leaf-segments`) — Next's MissingDefaultParallelRouteError.
  */
 export function missingDefaultParallelRouteMessage(segmentPath: string, slotName: string): string {
@@ -101,7 +101,7 @@ Error: The default export is not a React Component in "${componentPath}"`
  * (`app-dir-export`).
  */
 export function missingGenerateStaticParamsForExportMessage(page: string): string {
-  return `Page "${page}" is missing "generateStaticParams()" so it cannot be used with "output: export" config.`
+  return `Page "${page}" is missing "generateStaticParams()" so it cannot be used with "output: export" config. See more info here: https://nextjs.org/docs/messages/generate-static-params`
 }
 
 /**
@@ -153,4 +153,8 @@ export function unresolvedCodemodCommentMessage(note: string): string {
     `After review, either remove the comment if you made the necessary changes or replace ` +
     `"@next-codemod-error" with "@next-codemod-ignore" to bypass the build error if no action at this line can be taken.`
   )
+}
+
+export function isBundlerCompilationFailure(output: string): boolean {
+  return /(?:^|\n)(?:error: )?Build failed with \d+ errors?:/.test(output)
 }

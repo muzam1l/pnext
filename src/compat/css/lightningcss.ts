@@ -21,6 +21,7 @@ interface LightningModule {
     include?: number
     exclude?: number
     errorRecovery?: boolean
+    drafts?: { customMedia?: boolean }
   }): { code: Uint8Array }
   Features: Record<string, number>
 }
@@ -53,7 +54,11 @@ function featureKey(name: string): string {
 
 function featureMask(features: Record<string, number>, names: string[] | undefined): number {
   let mask = 0
-  for (const name of names ?? []) mask |= features[featureKey(name)] ?? 0
+  for (const name of names ?? []) {
+    const value = features[featureKey(name)]
+    if (value === undefined) throw new Error(`Unknown lightningcss feature: ${name}`)
+    mask |= value
+  }
   return mask
 }
 
@@ -74,6 +79,7 @@ export function maybeLightningcssTransform(css: string, file: string, root: stri
   const userExclude = featureMask(lightning.Features, features?.exclude)
   // Nesting always transpiles (Next hardcodes it), user excludes win.
   const include = ((lightning.Features.Nesting ?? 1) | userInclude) & ~userExclude
+  const customMedia = lightning.Features.CustomMediaQueries ?? 0
 
   try {
     const result = lightning.transform({
@@ -82,6 +88,7 @@ export function maybeLightningcssTransform(css: string, file: string, root: stri
       include,
       exclude: userExclude,
       errorRecovery: true,
+      drafts: include & customMedia ? { customMedia: true } : undefined,
     })
     return new TextDecoder().decode(result.code)
   } catch {

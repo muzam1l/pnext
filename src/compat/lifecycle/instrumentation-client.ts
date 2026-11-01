@@ -59,26 +59,92 @@ function injectEntries(config: ResolvedConfig): string[] {
  * The synthetic browser entry: inject modules then the user module (static
  * imports evaluate in order), followed by the transition-start hook registry.
  */
-function entrySource(modules: string[]): string {
+function entrySource(modules: string[], transitionEvents: boolean): string {
   const imports = modules
     .map((file, index) => `import * as mod${index} from ${JSON.stringify(file)};`)
     .join('\n')
   const names = modules.map((_file, index) => `mod${index}`).join(', ')
+  const eventSource = transitionEvents
+    ? `let nextTransitionId = 0
+function sourceRoutePath(route: string, catchAllOptional = false): string {
+  return (
+    '/' +
+    route
+      .split('/')
+      .filter(Boolean)
+      .filter(segment => !/^\\((?!\\.{1,3}\\))/.test(segment))
+      .map(segment => {
+        const catchAll = /^:([\\w$]+)\\*$/.exec(segment)
+        if (catchAll) return catchAllOptional ? \`[[...\${catchAll[1]}]]\` : \`[...\${catchAll[1]}]\`
+        const dynamic = /^:([\\w$]+)$/.exec(segment)
+        return dynamic ? \`[\${dynamic[1]}]\` : segment
+      })
+      .join('/')
+  )
+}
+
+function transitionFromRoutes(): string[] {
+  let nav = {}
+  try { nav = JSON.parse(document.getElementById('__PNEXT_NAV_STATE__')?.textContent || '{}') } catch {}
+  nav.children ||= location.pathname
+  const prefix = 'window.__PNEXT_ROUTE__='
+  const source = [...document.scripts].map(script => script.textContent || '').find(text => text.startsWith(prefix))
+  let state
+  try { state = source && JSON.parse(source.slice(prefix.length).replace(/;\\s*$/, '')) } catch {}
+  const primary = sourceRoutePath(
+    nav.hostRender ? (nav.children ?? '/') : (state?.route ?? nav.children ?? '/'),
+    state?.catchAllOptional,
+  )
+  const routes = [primary]
+  const primarySegments = (nav.children ?? '/').split('/').filter(Boolean)
+  const targetPattern = sourceRoutePath(
+    nav.interceptedRoute ?? state?.route ?? nav.children ?? '/',
+    state?.catchAllOptional,
+  )
+    .split('/')
+    .filter(Boolean)
+  for (const [slotDir, source] of Object.entries(nav.slots ?? {}).sort(([a], [b]) =>
+    a.localeCompare(b),
+  )) {
+    const base = sourceRoutePath(slotDir)
+    const sourcePath = source.split('?')[0] || '/'
+    if (sourcePath === nav.children) routes.push(base)
+    else {
+      const suffix = targetPattern.slice(primarySegments.length)
+      routes.push(\`\${base}\${suffix.length ? \`/(.)\${suffix.join('/')}\` : ''}\`)
+    }
+  }
+  return [...new Set(routes)]
+}
+
+function routerTransitionEvent(intent) {
+  return {
+    id: \`\${Date.now().toString(36)}-\${(++nextTransitionId).toString(36)}\`,
+    timestamp: performance.timeOrigin + performance.now(),
+    fromRoutes: transitionFromRoutes(),
+    prefetchIntent: intent,
+  }
+}
+
+`
+    : ''
   return `${imports}
-const hooks = [${names}]
-  .map(mod => (mod && typeof mod.onRouterTransitionStart === 'function' ? mod.onRouterTransitionStart : null))
-  .filter(Boolean);
-if (hooks.length > 0) {
-  window.__PNEXT_ON_ROUTER_TRANSITION_START__ = (href, navigateType) => {
-    for (const hook of hooks) {
+${eventSource}
+const modules = [${names}];
+window.__PNEXT_ON_ROUTER_TRANSITION_START__ = (href, navigateType, intent) => {
+  const event = ${transitionEvents ? 'routerTransitionEvent(intent)' : 'null'};
+  for (const mod of modules) {
+    const hooks = mod && typeof mod.default === 'object' ? mod.default : mod;
+    const hook = hooks && hooks.onRouterTransitionStart;
+    if (typeof hook === 'function') {
       try {
-        hook(href, navigateType);
+        hook(href, navigateType, ${transitionEvents ? 'event' : 'null'});
       } catch (error) {
-        console.error(error);
+        console.error('An instrumentation-client router transition hook failed', error);
       }
     }
-  };
-}
+  }
+};
 `
 }
 
@@ -96,7 +162,12 @@ export async function buildInstrumentationClient(config: ResolvedConfig): Promis
   const entryFile = path.join(workDir, 'entry.ts')
   const outfile = path.join(config.outPath, 'static', INSTRUMENTATION_CLIENT_ASSET)
   mkdirSync(path.dirname(outfile), { recursive: true })
-  await Bun.write(entryFile, entrySource(modules))
+  const experimental = getNextConfig().experimental as
+    { instrumentationClientRouterTransitionEvents?: boolean } | undefined
+  await Bun.write(
+    entryFile,
+    entrySource(modules, experimental?.instrumentationClientRouterTransitionEvents === true),
+  )
   const tsconfig = path.join(config.root, 'tsconfig.json')
   await build({
     entryPoints: [entryFile],

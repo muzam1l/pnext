@@ -12,10 +12,12 @@ import {
   registerAlwaysClientEntryReason,
   registerClientEntryDetectors,
   registerRouteDependencyClassifiers,
+  registerRouteAdmission,
   registerRouteConventions,
   registerUsageDetectors,
 } from '../../extensions'
 import { nextCompatEnabled } from '../../compat/aliases'
+import { admitRoute } from '../static-params'
 import { escapeRegex } from '../../utils/code'
 
 export function registerRoutingExtensions(config: ResolvedConfig): void {
@@ -37,6 +39,7 @@ export function registerRoutingExtensions(config: ResolvedConfig): void {
   // timestamp exists even on a page with no client components at all
   // (instrumentation-client-hook asserts both). Core keeps its leaner default.
   registerAlwaysClientEntryReason('compat-parity')
+  registerRouteAdmission(admitRoute)
 }
 
 // A route's layout chain is re-classified for every route below it, and the answer depends only on

@@ -20,7 +20,7 @@ import {
   rearmVisiblePrefetches,
   softNavigate,
 } from '../../client/router'
-import { onNavigationStart } from '../../client/router/events'
+import { routerState } from '../../client/router/hub'
 import { UnrecognizedActionError } from './unrecognized-error'
 import {
   ACTION_ID_FIELD,
@@ -48,7 +48,6 @@ const ARG_FILE_MARKER = '$$pnext_file'
 const ARG_FORMDATA_PREFIX = '$pnext_fd_'
 const ARG_FILE_PREFIX = '$pnext_file_'
 const ARG_ACTION_MARKER = '$$pnext_action_ref'
-const REDIRECT_TYPE_HEADER = 'x-pnext-redirect-type'
 const TEMP_REF_MARKER = '$$pnext_temp_ref'
 const ACTION_STREAM_CONTENT_TYPE = 'x-component/pnext-stream'
 const ACTION_ELEMENT_MARKER = '$$pnext_element'
@@ -58,16 +57,24 @@ const MASKED_ACTION_ERROR =
   'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
 const UNEXPECTED_RESPONSE = 'An unexpected response was received from the server.'
 
-// Only compared within a single dispatch, so starting the count when this
-// module loads (rather than at page load) changes nothing.
-let clientNavigationGeneration = 0
-onNavigationStart(() => {
-  clientNavigationGeneration += 1
-})
-
 interface ActionFlightPayload {
   a?: unknown
   f?: { kind?: string; html?: string; url?: string } | ''
+}
+
+interface ActionRedirect {
+  target: string
+  replace: boolean
+}
+
+function actionRedirect(response: Response): ActionRedirect | undefined {
+  const value = response.headers.get(ACTION_REDIRECT_HEADER)
+  if (!value) return undefined
+  const separator = value.lastIndexOf(';')
+  const redirectType = separator === -1 ? undefined : value.slice(separator + 1)
+  if (redirectType === 'push' || redirectType === 'replace') {
+    return { target: value.slice(0, separator), replace: redirectType === 'replace' }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -353,9 +360,40 @@ function stripActionFields(form: FormData): FormData {
 // dispatch
 // ---------------------------------------------------------------------------
 
-export async function callAction(id: string, args: unknown[]): Promise<unknown> {
+// Next's router action queue: actions run one at a time and never while a navigation is pending.
+let actionQueue: Promise<unknown> = Promise.resolve()
+let queuedActions = 0
+let refreshWhenDrained = false
+
+async function navigationSettled() {
+  while (routerState.navigationSettled) await routerState.navigationSettled
+}
+
+export function callAction(id: string, args: unknown[]): Promise<unknown> {
+  queuedActions++
+  const run = actionQueue.then(navigationSettled).then(() => sendAction(id, args))
+  actionQueue = run
+    .catch(() => undefined)
+    .then(() => {
+      // A discarded action's revalidation refreshes once nothing queued can still see the old page.
+      if (--queuedActions > 0 || !refreshWhenDrained) return
+      refreshWhenDrained = false
+      return navigationSettled().then(refresh)
+    })
+  return run
+}
+
+async function sendAction(id: string, args: unknown[]): Promise<unknown> {
   if (typeof Event !== 'undefined' && args.at(-1) instanceof Event) args = args.slice(0, -1)
-  const navigationGenerationAtDispatch = clientNavigationGeneration
+  const navigationGenerationAtDispatch = routerState.navigationStarts
+  // A navigation since dispatch discards this action: its result never changes the document, and its
+  // revalidation refreshes only once the router is idle.
+  const discarded = () => routerState.navigationStarts !== navigationGenerationAtDispatch
+  const revalidate = async (revalidated: boolean) => {
+    if (!revalidated) return
+    if (discarded()) refreshWhenDrained = true
+    else await refresh()
+  }
   const { body, contentType, tempRefs } = await encodeArgs(args)
   // accept mirrors Next's flight wire; app code observes it via headers().
   const headers: Record<string, string> = {
@@ -373,34 +411,31 @@ export async function callAction(id: string, args: unknown[]): Promise<unknown> 
 
   // notFound() thrown inside the action: swap in the server-rendered 404 page.
   if (response.status === 404 && response.headers.get(ACTION_NOT_FOUND_HEADER)) {
-    await swapDocument(response)
+    if (!discarded()) await swapDocument(response)
     return undefined
   }
 
-  // Version skew: the server did not recognize the action id. React routes this
-  // to the nearest error boundary as a typed UnrecognizedActionError (so
-  // unstable_isUnrecognizedActionError catches it), NOT a page swap — the 404
-  // body here is a plain text/plain message, not renderable HTML.
-  if (response.status === 404 && response.headers.get(NEXT_ACTION_NOT_FOUND_HEADER) === '1') {
-    const message = await response.text().catch(() => '')
+  // Version skew reaches the nearest error boundary as a typed UnrecognizedActionError.
+  if (response.headers.get(NEXT_ACTION_NOT_FOUND_HEADER) === '1') {
     throw tagActionError(
       new UnrecognizedActionError(
-        message ||
-          `Server Action "${id}" was not found on the server. \nRead more: https://nextjs.org/docs/messages/failed-to-find-server-action`,
+        `Server Action "${id}" was not found on the server. \nRead more: https://nextjs.org/docs/messages/failed-to-find-server-action`,
       ),
     )
   }
 
-  // Single-pass redirect: a 303 with no Location (fetch would have followed
+  // Legacy single-pass redirect: a 303 with no Location (fetch would have followed
   // one) carrying the destination page HTML. Push history and swap the
   // document — no follow-up request.
   if (response.status === 303) {
     const rearm = hasActionRevalidated(response) ? deferActionPrefetches() : undefined
     try {
-      const target = response.headers.get(ACTION_REDIRECT_HEADER)
+      const redirect = actionRedirect(response)
+      const target = redirect?.target
       if (target && blockJavascriptUrl(target)) return undefined
+      if (target && discarded()) return void (await revalidate(hasActionRevalidated(response)))
       const contentType = response.headers.get('content-type') ?? ''
-      const replace = response.headers.get(REDIRECT_TYPE_HEADER) === 'replace'
+      const replace = redirect?.replace ?? false
       // Single-pass flight redirect: the 303 carries the destination page HTML in
       // the flight envelope. Push history and swap the document in one round trip.
       if (target && contentType.includes(ACTION_FLIGHT_CONTENT_TYPE)) {
@@ -446,36 +481,33 @@ export async function callAction(id: string, args: unknown[]): Promise<unknown> 
   if (responseContentType.includes(ACTION_STREAM_CONTENT_TYPE)) {
     if (hasActionRevalidated(response)) {
       const rearm = deferActionPrefetches()
-      void refresh().finally(rearm)
+      void revalidate(true).finally(rearm)
     }
     return response.body
   }
   if (responseContentType.includes(ACTION_FLIGHT_CONTENT_TYPE)) {
     const payload = await readActionFlightPayload(response)
     const revalidated = hasActionRevalidated(response)
-    const discarded = clientNavigationGeneration !== navigationGenerationAtDispatch
     const rearm = revalidated ? deferActionPrefetches() : undefined
     try {
-      const target = response.headers.get(ACTION_REDIRECT_HEADER)
+      const redirect = actionRedirect(response)
+      const target = redirect?.target
       if (target && blockJavascriptUrl(target)) return undefined
-      const replace = response.headers.get(REDIRECT_TYPE_HEADER) === 'replace'
+      if (target && discarded()) return void (await revalidate(revalidated))
+      const replace = redirect?.replace ?? false
       const flightHtml = payloadHtml(payload)
       if (target && flightHtml) {
         await replaceDocument(flightHtml, target, replace, revalidated)
         return undefined
       }
-      // A completed action's value must reach client state. If navigation
-      // superseded it, that value is discarded, so refresh the now-current route.
-      if (revalidated && discarded) {
-        await refresh()
-      } else if (revalidated && flightHtml && payload.a === undefined) {
+      if (revalidated && flightHtml && payload.a === undefined && !discarded()) {
         await replaceDocument(flightHtml)
-      } else if (revalidated) {
+      } else {
         // Revalidation always re-renders the current route (Next applies the
         // revalidated flight even when the action returned a value). No
         // embedded HTML to swap in — refresh through the soft-nav pipeline so
         // every active parallel slot (intercepted modals included) refetches.
-        await refresh()
+        await revalidate(revalidated)
       }
       return reviveActionReturn(payload.a, tempRefs)
     } finally {
@@ -492,7 +524,9 @@ export async function callAction(id: string, args: unknown[]): Promise<unknown> 
     const payload = (await response.json()) as { data?: unknown; redirect?: string }
     if (typeof payload.redirect === 'string') {
       if (blockJavascriptUrl(payload.redirect)) return undefined
-      await navigate(payload.redirect, response.headers.get(REDIRECT_TYPE_HEADER) === 'replace')
+      if (discarded()) return void (await revalidate(revalidated))
+      // The redirect type rides in `x-action-redirect`; the envelope carries only the target.
+      await navigate(payload.redirect, actionRedirect(response)?.replace ?? false)
       return undefined
     }
     // Revive binary, temporary-reference, and client-component element markers.
@@ -500,7 +534,7 @@ export async function callAction(id: string, args: unknown[]): Promise<unknown> 
     // Revalidation always re-renders the current route, even when the action
     // returned a value (Next parity: revalidatePath/Tag in an action refreshes
     // every active parallel slot, intercepted modals included).
-    if (revalidated) await refresh()
+    await revalidate(revalidated)
     return data
   } finally {
     rearm?.()

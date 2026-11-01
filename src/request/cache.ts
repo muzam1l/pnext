@@ -50,6 +50,11 @@ export function runWithCacheScope<T>(callback: () => T): T {
   return storage.run({ functions: new WeakMap() }, callback)
 }
 
+/** Run `callback` detached from any render's cache scope, so its fetches are not deduped into it. */
+export function runOutsideCacheScope<T>(callback: () => T): T {
+  return storage.exit(callback)
+}
+
 /**
  * Capture the current cache scope (if any) and return a wrapper that re-runs a
  * function inside it. after() uses this so a callback registered during a page

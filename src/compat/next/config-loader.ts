@@ -50,17 +50,30 @@ const CONFIG_BASENAMES = [
   'next.config.cjs',
 ]
 
-let store: NextConfigObject = {}
-let storeReleased = false
+const NEXT_CONFIG_STORE = Symbol.for('pnext.compat.nextConfigStore')
+
+interface NextConfigStore {
+  value: NextConfigObject
+  released: boolean
+}
+
+function configStore(): NextConfigStore {
+  const root = globalThis as Record<PropertyKey, unknown>
+  return (root[NEXT_CONFIG_STORE] ??= { value: {}, released: false }) as NextConfigStore
+}
 
 /** Whether the stored config came from a production release, which no consumer may re-read from source. */
 export function nextConfigReleased(): boolean {
-  return storeReleased
+  return configStore().released
 }
 
 /** The full loaded next.config object; empty until loadNextConfig runs. */
 export function getNextConfig(): NextConfigObject {
-  return store
+  return configStore().value
+}
+
+export function nextPageExtensions(): readonly string[] {
+  return (getNextConfig().pageExtensions as string[] | undefined) ?? ['tsx', 'ts', 'jsx', 'js']
 }
 
 /**
@@ -83,7 +96,9 @@ function readCacheComponentsFlag(config: NextConfigObject): boolean {
 }
 
 export function setNextConfig(config: NextConfigObject): void {
-  store = config
+  // eslint-disable-next-line turbo/no-undeclared-env-vars
+  if (process.env.__NEXT_PARTIAL_PREFETCHING === 'true') config.partialPrefetching = true
+  configStore().value = config
   // Derived per config load, never a process one-shot: a second build in the
   // same process (dev server, programmatic API, test suite) must see its OWN
   // app's flag, not the previous app's.
@@ -215,16 +230,18 @@ export async function emitNextConfigBundle(root: string, outDir: string) {
     hashedOutput(outDir, 'next.config', cjs ? '.cjs' : '.mjs', outfile =>
       bundleConfig({ configPath, root, outDir, outfile, cjs, relocatable: true }),
     ),
-    ...cacheHandlerFiles(store).map(([name, source]) =>
-      hashedOutput(outDir, name, '.cjs', outfile =>
+    ...cacheHandlerFiles(configStore().value).map(([name, source]) =>
+      hashedOutput(outDir, name, '.mjs', outfile =>
         build({
           entryPoints: [source],
           outfile,
           bundle: true,
           platform: 'node',
-          format: 'cjs',
+          format: 'esm',
           target: 'esnext',
           packages: 'external',
+          sourcemap: 'inline',
+          plugins: [nextDistStubPlugin(outDir, true)],
           logLevel: 'silent',
         }),
       ).then(output => [name, output] as const),
@@ -410,13 +427,22 @@ function cjsConfigFormat(configPath: string, root: string): boolean {
 // `next/*` config helpers stay external.
 const NEXT_DIST_STUB_CONTENTS =
   'class PNextConfigStub {}\n' +
-  'module.exports = new Proxy(PNextConfigStub, { get: (t, k) => (k === "default" ? PNextConfigStub : t[k] ?? PNextConfigStub) });\n'
+  'module.exports = new Proxy(PNextConfigStub, { get: (t, k) => (k === "then" ? undefined : k === "default" ? PNextConfigStub : t[k] ?? PNextConfigStub) });\n'
 
-function nextDistStubPlugin(outDir: string): import('esbuild').Plugin {
+function nextDistStubPlugin(outDir: string, handler = false): import('esbuild').Plugin {
   return {
     name: 'pnext-next-dist-stub',
     setup(build) {
       build.onResolve({ filter: /^next\/dist\// }, args => {
+        if (handler) {
+          try {
+            const require = createRequire(args.importer)
+            require.resolve(args.path)
+            return { path: args.path, external: true }
+          } catch (error) {
+            if (!isModuleNotFoundError(error)) throw error
+          }
+        }
         if (args.kind === 'require-resolve') {
           // Preserve the requested module path under the stub root so loaders
           // downstream can still recognize WHICH next internal was meant.
@@ -427,8 +453,12 @@ function nextDistStubPlugin(outDir: string): import('esbuild').Plugin {
         }
         return { path: args.path, namespace: 'pnext-next-dist-stub' }
       })
-      build.onLoad({ filter: /.*/, namespace: 'pnext-next-dist-stub' }, () => ({
-        contents: NEXT_DIST_STUB_CONTENTS,
+      build.onLoad({ filter: /.*/, namespace: 'pnext-next-dist-stub' }, args => ({
+        contents:
+          handler && args.path === 'next/dist/server/lib/cache-handlers/default.external'
+            ? `import { createDefaultExternalHandler } from ${JSON.stringify(path.join(import.meta.dirname, '../cache/modern-handler.ts'))}; export default createDefaultExternalHandler();`
+            : NEXT_DIST_STUB_CONTENTS,
+        resolveDir: import.meta.dirname,
         loader: 'js',
       }))
     },
@@ -577,6 +607,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS = new Set([
   'configFile',
   'configFileName',
   'configOrigin',
+  'deprecated',
   'crossOrigin',
   'deploymentId',
   'devIndicators',
@@ -698,6 +729,13 @@ function hasNestedKey(config: NextConfigObject, dottedKey: string): boolean {
 }
 
 function warnDeprecatedConfigOptions(config: NextConfigObject, configFileName: string): void {
+  if (hasNestedKey(config, 'experimental.useCache')) {
+    console.warn(
+      readCacheComponentsFlag(config)
+        ? `\`experimental.useCache\` is no longer needed, because \`cacheComponents\` already enables the \`"use cache"\` directive. You can remove it from ${configFileName}.`
+        : `\`experimental.useCache\` is deprecated. Please use the top-level \`cacheComponents\` option instead in ${configFileName}.`,
+    )
+  }
   for (const { key, reason } of DEPRECATED_CONFIG_OPTIONS) {
     if (hasNestedKey(config, key)) console.warn(reason(configFileName))
   }
@@ -766,12 +804,12 @@ export async function loadNextConfig(
   } = {},
 ): Promise<LoadNextConfigResult> {
   // A production server names its compiled config, or null when the app had none.
-  storeReleased = options.bundle !== undefined
+  configStore().released = options.bundle !== undefined
   const configPath = options.bundle === undefined ? findConfigPath(root) : options.bundle
   if (!configPath) {
     setNextConfig({})
     emitSessionStartedTelemetry({})
-    return { config: {}, overrides: {} }
+    return { config: getNextConfig(), overrides: {} }
   }
   if (options.bundle && !existsSync(options.bundle)) {
     // The release names this file; serving defaults in its place would drop headers, redirects and more.
@@ -799,7 +837,7 @@ export async function loadNextConfig(
       )
       setNextConfig({})
       emitSessionStartedTelemetry({})
-      return { config: {}, overrides: {} }
+      return { config: getNextConfig(), overrides: {} }
     }
     throw error
   }

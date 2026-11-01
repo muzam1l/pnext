@@ -804,7 +804,7 @@ export function matchRoutePattern(
   for (const part of patternParts) {
     const catchAll = /^:([\w$]+)\*$/.exec(part)
     if (catchAll) {
-      const rest = pathParts.slice(cursor).map(decodeSegment)
+      const rest = pathParts.slice(cursor).map(canonicalSegment)
       if (rest.length === 0 && !optionalCatchAll) return null
       if (rest.length > 0) params[catchAll[1]!] = rest
       return params
@@ -812,7 +812,7 @@ export function matchRoutePattern(
     const dynamic = /^:([\w$]+)$/.exec(part)
     const value = pathParts[cursor++]
     if (value === undefined) return null
-    if (dynamic) params[dynamic[1]!] = decodeSegment(value)
+    if (dynamic) params[dynamic[1]!] = canonicalSegment(value)
     else if (part !== value) return null
   }
   return cursor === pathParts.length ? params : null
@@ -825,6 +825,22 @@ export function matchRoutePattern(
 /** The island prop placeholder the server fills per request (slots.tsx). */
 const PROMISE_MARKER_KEY = '__pnextPromise'
 const ISLAND_PARAMS_ATTRIBUTE = 'data-pnext-params'
+
+export function sameParams(
+  left: Record<string, string | string[]>,
+  right: Record<string, string | string[]>,
+): boolean {
+  const leftKeys = Object.keys(left)
+  const rightKeys = Object.keys(right)
+  if (leftKeys.length !== rightKeys.length) return false
+  return leftKeys.every(key => {
+    const a = left[key]
+    const b = right[key]
+    return Array.isArray(a)
+      ? Array.isArray(b) && a.length === b.length && a.every((value, index) => value === b[index])
+      : a === b
+  })
+}
 
 /**
  * Rewrite every param carrier in a payload rendered for a SIBLING URL of the
@@ -839,10 +855,13 @@ const ISLAND_PARAMS_ATTRIBUTE = 'data-pnext-params'
  * time its dynamic stage is in flight.
  *
  * The payload's own embedded route state is the source of truth for what to
- * replace: only values byte-identical to ITS params are rewritten, so app
- * content that merely happens to contain the same string is untouched.
+ * replace: only scopes equal to ITS params are rewritten, so unrelated app
+ * scopes are untouched.
  */
-function restampSharedParams(html: string, params: Record<string, string | string[]>): string {
+export function restampSharedParams(
+  html: string,
+  params: Record<string, string | string[]>,
+): string {
   const match = /(window\.__PNEXT_ROUTE__=)(\{.*?\})(;?<\/script>)/s.exec(html)
   if (!match?.[2]) return html
   let state: Record<string, unknown>
@@ -860,17 +879,34 @@ function restampSharedParams(html: string, params: Record<string, string | strin
     html.slice(0, match.index) +
     `${match[1]}${paramsJson({ ...state, params })}${match[3]}` +
     html.slice(match.index + match[0].length)
-  const replacements: [string, string][] = [
-    [islandParamsAttribute(bakedJson), islandParamsAttribute(targetJson)],
-    [promiseMarkerJson(bakedJson), promiseMarkerJson(targetJson)],
-  ]
-  return rewriteIslandMarkup(rewritten, text => {
-    let next = text
-    for (const [from, to] of replacements) {
-      next = next.split(from).join(to).split(escapeAttribute(from)).join(escapeAttribute(to))
-    }
-    return next
-  })
+  const from = promiseMarkerJson(bakedJson)
+  const to = promiseMarkerJson(targetJson)
+  return rewriteIslandMarkup(rewritten, text =>
+    text
+      .replace(
+        /\bdata-pnext-params=(["'])(.*?)\1/g,
+        (attribute, _quote: string, encoded: string) => {
+          try {
+            const json = encoded
+              .replaceAll('&quot;', '"')
+              .replaceAll('&#x27;', "'")
+              .replaceAll('&#39;', "'")
+              .replaceAll('&lt;', '<')
+              .replaceAll('&gt;', '>')
+              .replaceAll('&amp;', '&')
+            if (sameParams(JSON.parse(json) as Record<string, string | string[]>, baked))
+              return islandParamsAttribute(targetJson)
+          } catch {
+            // Malformed island metadata cannot authorize a params rewrite.
+          }
+          return attribute
+        },
+      )
+      .split(from)
+      .join(to)
+      .split(escapeAttribute(from))
+      .join(escapeAttribute(to)),
+  )
 }
 
 const islandParamsAttribute = (json: string) =>
@@ -914,6 +950,15 @@ function decodeSegment(segment: string): string {
     return decodeURIComponent(segment)
   } catch {
     // A malformed escape is the route-cache identity as written; keep it.
+    return segment
+  }
+}
+
+/** Param values as the server exposes them: decoded once, then re-encoded. */
+function canonicalSegment(segment: string): string {
+  try {
+    return encodeURIComponent(decodeURIComponent(segment))
+  } catch {
     return segment
   }
 }

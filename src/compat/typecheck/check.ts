@@ -127,7 +127,7 @@ async function checkInProcess(project: string, config: ResolvedConfig): Promise<
   const diagnostics = ts
     .getPreEmitDiagnostics(program)
     .filter(diagnostic => appDiagnostic(diagnostic.file?.fileName, config))
-  return formatDiagnostics(ts, diagnostics)
+  return formatDiagnostics(ts, diagnostics, config.root)
 }
 
 /**
@@ -296,6 +296,7 @@ async function writeTypecheckProject(
 ): Promise<string> {
   const dir = path.join(config.outRootPath, 'typecheck')
   await mkdir(dir, { recursive: true })
+  const nodeTypes = resolveTypesDir('node', config.root)
   const reactTypes = resolveTypesDir('react', config.root)
   const hasReactTypes = reactTypes !== undefined
   const rootParams = scanRootParamTypes(path.join(config.root, 'app'))
@@ -310,7 +311,14 @@ async function writeTypecheckProject(
     typeof config.compat?.next === 'object' && config.compat.next.legacyRequestAPIs === true
   await writeFile(
     path.join(dir, 'next-shims.d.ts'),
-    nextShims(hasReactTypes, rootParams, omitNextModuleShims, legacyRequestTypes, hasRealNext),
+    nextShims(
+      hasReactTypes,
+      rootParams,
+      omitNextModuleShims,
+      legacyRequestTypes,
+      hasRealNext,
+      !!nodeTypes,
+    ),
   )
   const preact = resolvePackageDir('preact', config.root)
   if (reactTypes && preact) {
@@ -333,7 +341,6 @@ async function writeTypecheckProject(
   // (`node:fs`, `node:path`). Next resolves them through @types/node; put the
   // app's copy (or pnext's fallback) in the program so `Cannot find module
   // 'node:*'` never fails an app build.
-  const nodeTypes = resolveTypesDir('node', config.root)
   await writeFile(
     project,
     JSON.stringify(
@@ -548,11 +555,28 @@ function readProject(ts: typeof TS, project: string): TS.ParsedCommandLine {
   return parsed
 }
 
-function formatDiagnostics(ts: typeof TS, diagnostics: readonly TS.Diagnostic[]): string[] {
+function formatDiagnostics(
+  ts: typeof TS,
+  diagnostics: readonly TS.Diagnostic[],
+  root?: string,
+): string[] {
   const messages = new Set<string>()
   for (const diagnostic of diagnostics) {
     const raw = ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n')
     const typedRoute = typedRouteMessage(raw)
+    const pageModule =
+      root &&
+      /^Type 'typeof import\("([^"]+)"\)' does not satisfy the constraint 'AppPageConfig/.exec(
+        raw,
+      )?.[1]
+    if (pageModule && /(?:property|Property) 'default'/.test(raw)) {
+      const file =
+        ['.tsx', '.ts', '.jsx', '.js'].map(ext => pageModule + ext).find(existsSync) ?? pageModule
+      messages.add(
+        `Type error: Page "${path.relative(root, file).split(path.sep).join('/')}" has an invalid "default" export:\n${raw}`,
+      )
+      continue
+    }
     // Next prints `./relative/file.ts:line:col` on its own line above the
     // message; mirror that so build failures name their source.
     let location = ''
@@ -630,6 +654,7 @@ function nextShims(
   omitNextModuleShims = false,
   legacyRequestTypes = false,
   hasRealNext = false,
+  hasNodeTypes = false,
 ): string {
   // Ambient module declarations override real module resolution, so the react
   // fallbacks below must only exist when no real `@types/react` was found —
@@ -675,8 +700,10 @@ declare module 'react/jsx-runtime' {
 declare module 'next/font/local'{import type{FontModule}from'next/font';export default function localFont(options:any):FontModule}
 declare module 'next/font/google'{import type{FontModule}from'next/font';type FontLoader=(options?:any)=>FontModule;const font:FontLoader;export default font;export const Inter:FontLoader,Geist:FontLoader,Geist_Mono:FontLoader,Roboto:FontLoader,Roboto_Mono:FontLoader,Open_Sans:FontLoader,Lato:FontLoader,Montserrat:FontLoader,Poppins:FontLoader,Noto_Sans:FontLoader}
 `
-  const source = `${reactShims}
-declare const process: {
+  const nodeShims = hasNodeTypes
+    ? ''
+    : `
+declare var process: {
   env: Record<string, string | undefined>
   emit?: (...args: any[]) => boolean
   cwd(): string
@@ -691,11 +718,41 @@ declare const process: {
   [key: string]: any
 }
 
-declare const EdgeRuntime: string
+declare var require: { (id: string): any; resolve(id: string): string }
 
-declare const require: (id: string) => any
+declare type BufferEncoding =
+  | 'ascii'
+  | 'utf8'
+  | 'utf-8'
+  | 'utf16le'
+  | 'ucs2'
+  | 'ucs-2'
+  | 'base64'
+  | 'base64url'
+  | 'hex'
+  | 'latin1'
+  | 'binary'
 
-declare class Buffer extends Uint8Array {}
+declare class Buffer extends Uint8Array {
+  toString(encoding?: BufferEncoding, start?: number, end?: number): string
+  toJSON(): { type: 'Buffer'; data: number[] }
+  equals(other: Uint8Array): boolean
+  slice(start?: number, end?: number): Buffer
+  subarray(begin?: number, end?: number): Buffer
+  write(
+    string: string,
+    offset?: number,
+    length?: number,
+    encoding?: BufferEncoding,
+  ): number
+
+  static from(array: string, encoding?: BufferEncoding): Buffer
+  static from(array: ArrayBuffer | Uint8Array | number[]): Buffer
+  static alloc(size: number, fill?: string | number | Uint8Array | Buffer, encoding?: BufferEncoding): Buffer
+  static concat(list: Buffer[] | Uint8Array[], totalLength?: number): Buffer
+  static isBuffer(x: unknown): x is Buffer
+  static byteLength(string: string | Uint8Array, encoding?: BufferEncoding): number
+}
 
 declare module 'async_hooks' {
   export class AsyncLocalStorage<T> {
@@ -744,6 +801,11 @@ declare module 'crypto' {
   export * from 'node:crypto'
   export { default } from 'node:crypto'
 }
+
+`
+  const source = `${reactShims}
+${nodeShims}
+declare const EdgeRuntime: string
 
 // Next.js augments the fetch RequestInit with a "next" field for its extended
 // fetch semantics (revalidate/tags); mirror that here so app code using
@@ -831,6 +893,9 @@ declare module 'next' {
   export type GetStaticPaths<Q = any> = any
   export type InferGetServerSidePropsType<T = any> = any
   export type InferGetStaticPropsType<T = any> = any
+  export type ParamMatching<ParamName extends string = string> = Partial<
+    Record<ParamName, 'not-found' | 'blocking' | 'fallback' | 'dynamic'>
+  >
 }
 
 declare module 'next/cache' {
@@ -846,6 +911,8 @@ declare module 'next/cache' {
   export function refresh(): void
   export function unstable_refresh(): void
   export const io: any
+  export function navigation(): Promise<void>
+  export function prefetch(): Promise<void>
   export const cacheTag: (...tags: string[]) => void
   export const cacheLife: (...args: any[]) => void
   export const unstable_cacheTag: (...tags: string[]) => void
@@ -1063,8 +1130,9 @@ declare module 'next/dynamic' {
 declare module 'next/error' {
   import type { ComponentType, ReactNode } from 'react'
   export interface ErrorInfo {
-    error: Error
+    error: unknown
     reset: () => void
+    retry: () => void
     unstable_retry: () => void
     [key: string]: any
   }
@@ -1080,9 +1148,10 @@ declare module 'next/error' {
   // returned component takes the fallback's own props plus children (the
   // guarded subtree) and an optional clearError reset callback. Mirrors the
   // runtime in src/compat/next/error.tsx.
-  export function unstable_catchError<P extends Record<string, any> = any>(
+  export function catchError<P extends Record<string, any> = any>(
     fallback: (props: P, info: ErrorInfo) => ReactNode,
   ): ComponentType<P & { children?: ReactNode; clearError?: () => void }>
+  export const unstable_catchError: typeof catchError
 }
 
 ${fontShims}

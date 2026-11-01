@@ -4,8 +4,9 @@ import {
   getWorkUnit,
   legacyRequestAPIs,
   requireRequest,
-  requestApiPromise,
+  requestApiPromise as coreRequestApiPromise,
 } from '../../request/context'
+import { isHangingPromise } from '../../render/ppr'
 import { withSyncAccess } from './legacy-request-apis'
 import type { NextRequestCookies } from '../../types'
 import {
@@ -14,10 +15,44 @@ import {
   lifecycleError,
 } from '../lifecycle/after-scope'
 import { assertNoDynamicApiInsideCache, currentRenderCacheMeta } from '../cache/revalidate'
+import { assertNavigationPrerenderAccess } from '../cache/build-prerender-errors'
 
 const COOKIE_MUTATION_ERROR =
   'Cookies can only be modified in a Server Action or Route Handler. ' +
   'Read more: https://nextjs.org/docs/app/api-reference/functions/cookies#options'
+
+function requestApiPromise<T>(api: string, produce: () => T): Promise<T> {
+  const promise = coreRequestApiPromise(api, produce)
+  if (!isHangingPromise(promise)) return promise
+  // Next's tracked session-data promises follow the underlying rejection in a second microtask.
+  let delayed: Promise<T> | undefined
+  const observe = () =>
+    (delayed ??= new Promise<T>((_resolve, reject) => {
+      void promise.catch(reject)
+    }))
+  return new Proxy(promise, {
+    get(target, property) {
+      if (property === 'then') {
+        return (...args: Parameters<typeof target.then>) => {
+          const shared = observe()
+          if (typeof args[0] === 'function')
+            void target.then(
+              () => undefined,
+              () => undefined,
+            )
+          return shared.then(...args)
+        }
+      }
+      if (property === 'catch') {
+        return (...args: Parameters<typeof target.catch>) => observe().catch(...args)
+      }
+      if (property === 'finally') {
+        return (...args: Parameters<typeof target.finally>) => observe().finally(...args)
+      }
+      return Reflect.get(target, property, target) as unknown
+    },
+  })
+}
 
 /**
  * Cookie writes are only legal while the request is executing a Server Action or a Route Handler. Every
@@ -39,33 +74,78 @@ function assertCookieMutationAllowed(): void {
 const HEADERS_MUTATION_ERROR =
   'Headers cannot be modified. Read more: https://nextjs.org/docs/app/api-reference/functions/headers'
 
+const HIDDEN_REQUEST_HEADERS = new Set([
+  'rsc',
+  'next-router-state-tree',
+  'next-router-prefetch',
+  'next-hmr-refresh',
+  'next-router-segment-prefetch',
+  'x-nextjs-request-id',
+  'x-nextjs-html-request-id',
+])
+const readonlyHeaderViews = new WeakMap<Headers, Headers>()
+
 /**
  * headers() exposes the REQUEST headers, which Next makes read-only: append(), set() and delete() throw
- * instead of mutating. getSetCookie() is always empty - request headers carry no response Set-Cookie.
- * Every read method delegates to the underlying Headers unchanged.
+ * instead of mutating. The cached view stays live while hiding framework-only headers.
  */
 function readonlyHeaders(source: Headers): Headers {
-  return new Proxy(source, {
-    get(target, prop) {
+  const cached = readonlyHeaderViews.get(source)
+  if (cached) return cached
+
+  const visibleEntries = function* () {
+    for (const entry of source.entries()) {
+      if (!HIDDEN_REQUEST_HEADERS.has(entry[0].toLowerCase())) yield entry
+    }
+  }
+  let view: Headers
+  view = new Proxy(source, {
+    get(target, prop, _receiver) {
       if (prop === 'append' || prop === 'set' || prop === 'delete') {
         return () => {
           throw new Error(HEADERS_MUTATION_ERROR)
         }
       }
+      if (prop === 'get') {
+        return (name: string) =>
+          HIDDEN_REQUEST_HEADERS.has(name.toLowerCase()) ? null : target.get(name)
+      }
+      if (prop === 'has') {
+        return (name: string) => !HIDDEN_REQUEST_HEADERS.has(name.toLowerCase()) && target.has(name)
+      }
       if (prop === 'getSetCookie') return () => []
+      if (prop === 'entries' || prop === Symbol.iterator) return visibleEntries
+      if (prop === 'keys')
+        return function* () {
+          for (const [name] of visibleEntries()) yield name
+        }
+      if (prop === 'values')
+        return function* () {
+          for (const [, value] of visibleEntries()) yield value
+        }
+      if (prop === 'forEach') {
+        return (
+          callback: (value: string, name: string, parent: Headers) => void,
+          thisArg?: unknown,
+        ) => {
+          for (const [name, value] of visibleEntries()) callback.call(thisArg, value, name, view)
+        }
+      }
       const value: unknown = Reflect.get(target, prop, target)
       return typeof value === 'function'
         ? (value as (...args: unknown[]) => unknown).bind(target)
         : value
     },
   })
+  readonlyHeaderViews.set(source, view)
+  return view
 }
 
 export function headers() {
   assertRequestApiAllowedInAfter('headers()')
   assertDynamicErrorRequestApi('headers()')
   assertNoDynamicApiInsideCache('headers()')
-  const produce = () => readonlyHeaders(new Headers(requireRequest('headers()').headers))
+  const produce = () => readonlyHeaders(requireRequest('headers()').headers)
   const promise = requestApiPromise('headers()', produce)
   return legacyRequestAPIs() ? withSyncAccess(promise, 'headers', produce) : promise
 }
@@ -102,6 +182,7 @@ export function assertDynamicErrorRequestApi(
   api: 'headers()' | 'cookies()' | 'connection()',
 ): void {
   const meta = currentRenderCacheMeta()
+  if (meta?.prerender) assertNavigationPrerenderAccess(meta.route ?? '/', api)
   if (!meta?.dynamicError) return
   throw lifecycleError(
     `Route ${meta.route ?? ''} with \`dynamic = "error"\` couldn't be rendered statically because it used \`${api}\`.`,

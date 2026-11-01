@@ -24,7 +24,12 @@ import {
 } from '../../runtime/production'
 import { toPosixPath } from '../../utils/fs'
 import { splitResourceQuery } from '../../utils/resource-query'
-import { importMetaRefs, moduleSpecifierEdges, requireResolveRefs } from '../../resolve/scan-facts'
+import {
+  fileReadPaths,
+  importMetaRefs,
+  moduleSpecifierEdges,
+  requireResolveRefs,
+} from '../../resolve/scan-facts'
 import { spliceSource } from '../../runtime/module-transform'
 import type { BuildManifest } from '../../types'
 
@@ -296,6 +301,15 @@ function createTracer(config: TraceConfig, from?: TraceSnapshot, onReady?: (dest
       prefetch(file)
       const source = await reads.get(file)
       if (source === undefined) continue
+      if (release) {
+        for (const target of fileReadPaths(file, source, config.root)) {
+          if (!isInside(config.root, target) || isInside(outPath, target)) continue
+          const relative = toPosixPath(path.relative(config.root, target))
+          if (standaloneEntries.has(relative.split('/')[0]!)) continue
+          if (statSync(target, { throwIfNoEntry: false })?.isFile())
+            setFile(trace, relative, target)
+        }
+      }
       const edits = new Map<string, string>()
       for (const edge of scanEdges(file, source)) {
         if (edge.url) {

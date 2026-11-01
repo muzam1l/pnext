@@ -23,6 +23,8 @@ export type StaticParams<Route extends RoutePath> =
 
 export interface PNextConfig {
   outDir?: string
+  /** Emit a directly servable static tree at outDir instead of a server build. Core mode only. */
+  output?: 'export'
   basePath?: string
   assetPrefix?: string
   trailingSlash?: boolean
@@ -42,6 +44,11 @@ export interface PNextConfig {
   workspaceRoot?: string
   compat?: PNextCompatConfig
   adapter?: PNextAdapterConfig
+  /**
+   * Initial-load gzip budget per page route: bytes, or a string like '150kb'. Keys are route
+   * patterns (`/users/[id]`); `'*'` applies to every route without its own key.
+   */
+  budgets?: Record<string, number | string>
 }
 
 /**
@@ -423,6 +430,8 @@ export interface NavState {
    * comparing `children` to the browser pathname under a rewrite.
    */
   hostRender?: boolean
+  /** On a host render, the route pattern of the interceptor the slot rendered. */
+  interceptedRoute?: string
 }
 
 /**
@@ -492,6 +501,11 @@ export interface RouteManifestEntry {
   clientEntryImports?: string[]
   /** Dynamic import closure of the client entry, for low-priority preload links. */
   clientDynamicImports?: string[]
+  /**
+   * The framework runtime chunks among `clientDynamicImports` (router, nav and error tiers, action
+   * dispatch): fetched on demand, and preloaded only where the route can soft-navigate.
+   */
+  clientRuntimeImports?: string[]
   maxDuration?: number
   /** Route opts into partial prerendering via `export const experimental_ppr = true`. */
   ppr?: boolean
@@ -501,6 +515,8 @@ export interface RouteManifestEntry {
   metadataRoute?: MetadataRouteEntry
   /** Param sets prerendered at build from params(). Compat aliases generateStaticParams to params. */
   prerenderedParams?: Record<string, RouteParamValue>[]
+  /** Per-param matching policy the app declared; the compat admission hook interprets it. */
+  paramMatching?: Record<string, string>
   /**
    * Per-prerendered-URL vary sets tracked by the BUILD render, keyed by the concrete pathname. A request-time
    * render answered from that prerender executes no user code, so it tracks nothing and would publish
@@ -572,6 +588,8 @@ export interface RouteManifestEntry {
   syntheticSlotDir?: string
   /** `default.*` file rendered as children for a synthetic entry. */
   childrenDefault?: string
+  /** Synthetic entry whose owner layout declares no children branch: only named slots render. */
+  namedSlotsOnly?: boolean
   /** Intercepting-route metadata, when this route is an interceptor. */
   interception?: RouteInterception
   /** First `'use server'` module in the route's closure — core refuses these. */
@@ -588,6 +606,8 @@ export interface RouteManifestEntry {
    * collapsing them back into the boolean above loses exactly that.
    */
   clientEntryReasons?: ClientEntryReason[]
+  /** The route's closure renders a `<Link>`, so its navigation runtime is worth preloading. */
+  softLinks?: true
 }
 
 /**
@@ -746,4 +766,6 @@ export interface RouteSegmentConfig {
    * response while connection()-gated content is omitted.
    */
   unstableInstant?: boolean
+  /** The instant opt-in came only from stable `export const instant`, which alone does not switch prefetching. */
+  stableInstant?: boolean
 }

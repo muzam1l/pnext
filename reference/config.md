@@ -7,6 +7,7 @@ import type { PNextConfig } from '@wular/pnext'
 
 export default {
   outDir: '.pnext',
+  // output: 'export',
   basePath: '',
   productionBrowserSourceMaps: false,
   compat: {
@@ -22,6 +23,7 @@ This is the form `pnext create` scaffolds. With `compat.next`, pnext also loads 
 | Field                         | Default     | What it does                                                                                               |
 | ----------------------------- | ----------- | ---------------------------------------------------------------------------------------------------------- |
 | `outDir`                      | `'.pnext'`  | Build output: the shippable `standalone/` folder, the build `cache/`, and generated `types/`.              |
+| `output`                      | unset       | Core mode: `'export'` emits only a directly servable static tree at `outDir`.                              |
 | `basePath`                    | `''`        | Path prefix for an app served below the domain root.                                                       |
 | `assetPrefix`                 | `basePath`  | URL prefix for emitted assets. Set it when assets come from a CDN.                                         |
 | `trailingSlash`               | `false`     | Canonicalizes URLs to a trailing slash and redirects the form without one.                                 |
@@ -31,12 +33,15 @@ This is the form `pnext create` scaffolds. With `compat.next`, pnext also loads 
 | `workspaceRoot`               | inferred    | Monorepo root for resolving and reloading local workspace package imports.                                 |
 | `htmlLimitedBots`             | see below   | User agents that get blocking metadata in the head. Applies with `compat.next`.                            |
 | `adapter`                     | unset       | Narrows what a deployment adapter packs into its server function.                                          |
+| `budgets`                     | unset       | Initial-load gzip budget per page route. See [Analyze](./dev.md#analyze).                                  |
 | `compat`                      | all `false` | Turns on the React, Next, and React Compiler compatibility layers.                                         |
 
 Worth knowing:
 
+- Core `output: 'export'` requires every page to prerender and rejects route handlers and `proxy.ts`. It moves HTML, assets, and `public/` files to the top of `outDir`; there is no server build to run with `pnext start`. Next compatibility apps continue to configure `output: 'export'` in `next.config`.
 - Development client output is already unminified, so it never emits sourcemaps.
 - `workspaceRoot` is inferred from `package.json#workspaces` or `pnpm-workspace.yaml`, otherwise the app root. It does not change the app root used for `public/`, `.pnext/`, or `pnext.config.ts`. Set it only to override the inference.
+- `budgets` keys are route patterns like `/users/[id]`, and `'*'` covers every route without its own key. Values are bytes or sizes like `'150kb'`: `budgets: { '/': '120kb', '*': '200kb' }`.
 - The `htmlLimitedBots` default is a regex covering Twitterbot, Slackbot, Bingbot, Discordbot, LinkedInBot, and the Google and Lighthouse renderers. Matching user agents receive metadata blocked in the head instead of streamed into the body.
 
 ## Compat modes

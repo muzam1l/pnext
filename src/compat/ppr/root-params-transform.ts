@@ -10,6 +10,8 @@
 //        const lang = __pnextRootParams.lang;
 //        const l = __pnextRootParams.locale;
 //
+// `export { lang as x } from` reads into a fresh binding exported as `x`; `import * as root` binds the Proxy.
+//
 // The alias map still resolves the specifier to compat/next/root-params.ts, so the default import binds
 // the Proxy. Build-time validation that a name is actually a root param lives in root-params-scan.ts;
 // this transform stays permissive.
@@ -21,7 +23,7 @@ const ROOT_PARAMS_SPECIFIER = /['"]next\/root-params['"]/
 // `[^}]` for the clause, never a lazy `[\s\S]*?`: the latter backtracks across
 // an earlier `import { X } from 'react'` and swallows that line too.
 const IMPORT_RE =
-  /^[ \t]*import\s+\{([^}]*)\}\s+from\s+['"]next\/root-params['"]\s*;?[ \t]*(?:\r?\n)?/gm
+  /^[ \t]*(import|export)\s+(?:\{([^}]*)\}|\*\s+as\s+([\w$]+))\s+from\s+['"]next\/root-params['"]\s*;?[ \t]*(?:\r?\n)?/gm
 
 interface Binding {
   imported: string
@@ -52,17 +54,35 @@ export function rewriteRootParamsSource(source: string): string {
   if (!ROOT_PARAMS_SPECIFIER.test(source)) return source
   const proxyName = uniqueIdentifier(source, '__pnextRootParams')
   const declarations: string[] = []
+  const exportBindings: string[] = []
   let importedProxy = false
 
-  const rewritten = source.replace(IMPORT_RE, (_statement, clause: string) => {
-    const bindings = parseBindings(clause)
-    if (bindings.length === 0) return ''
-    importedProxy = true
-    for (const { imported, local } of bindings) {
-      declarations.push(`const ${local} = ${proxyName}[${JSON.stringify(imported)}];`)
-    }
-    return ''
-  })
+  const rewritten = source.replace(
+    IMPORT_RE,
+    (statement, keyword: string, clause: string | undefined, namespace: string | undefined) => {
+      if (namespace) {
+        if (keyword === 'export') return statement
+        importedProxy = true
+        declarations.push(`const ${namespace} = ${proxyName};`)
+        return ''
+      }
+      const bindings = parseBindings(clause ?? '')
+      if (bindings.length === 0) return ''
+      importedProxy = true
+      for (const { imported, local } of bindings) {
+        const read = `${proxyName}[${JSON.stringify(imported)}]`
+        if (keyword === 'import') {
+          declarations.push(`const ${local} = ${read};`)
+          continue
+        }
+        // A re-export binds no local name (`as default` cannot be one), so bind a fresh one.
+        const binding = uniqueIdentifier(source, '__pnextRootParam', ...exportBindings)
+        exportBindings.push(binding)
+        declarations.push(`const ${binding} = ${read};`, `export { ${binding} as ${local} };`)
+      }
+      return ''
+    },
+  )
 
   if (!importedProxy) return source
   return [

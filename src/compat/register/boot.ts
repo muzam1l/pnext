@@ -44,7 +44,7 @@ import {
 } from '../aliases'
 import { transpilePackages } from '../bundler/config'
 import { materializeNextCssSources, nextCssResolveDependency } from '../css/modules'
-import { getNextConfig } from '../next/config-loader'
+import { getNextConfig, nextPageExtensions } from '../next/config-loader'
 import { registerLifecycleBootHooks } from './lifecycle'
 import { registerRoutingExtensions } from './routing'
 
@@ -92,7 +92,11 @@ export function registerCompatBootExtensions(config: ResolvedConfig): void {
     extraCssExtensions: () => ['.scss', '.sass'],
     resolveCssDependency: nextCssResolveDependency(config),
   })
-  setProxyExtensions({ names: NEXT_PROXY_NAMES, validateFiles: validateProxyFiles })
+  setProxyExtensions({
+    names: NEXT_PROXY_NAMES,
+    fileExtensions: nextPageExtensions,
+    validateFiles: validateProxyFiles,
+  })
 }
 
 /**

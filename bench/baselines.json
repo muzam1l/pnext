@@ -33,9 +33,9 @@
       }
     },
     "bytes": {
-      "js-raw": 15.19,
-      "js-gzip": 6.64,
-      "js-deferred-gzip": 32.92,
+      "js-raw": 15.76,
+      "js-gzip": 6.76,
+      "js-deferred-gzip": 33.13,
       "js-files": 3,
       "install": 6.2,
       "zero-island": 15.19
@@ -77,9 +77,9 @@
       }
     },
     "bytes": {
-      "js-raw": 32.31,
-      "js-gzip": 13.19,
-      "js-deferred-gzip": 32.81,
+      "js-raw": 32.94,
+      "js-gzip": 13.41,
+      "js-deferred-gzip": 33.04,
       "js-files": 4,
       "install": 6.2,
       "zero-island": 15.82
@@ -118,8 +118,8 @@
       "hmr": null
     },
     "bytes": {
-      "js-raw": 6.74,
-      "js-gzip": 2.8,
+      "js-raw": 6.86,
+      "js-gzip": 2.85,
       "js-deferred-gzip": 6.41,
       "js-files": 1,
       "install": 6.2

@@ -121,6 +121,8 @@ function applyDefaultIsrHeader(
     return
   }
   if (existing && (pagesRevalidateSeconds === undefined || existing !== 'no-store')) return
+  // A failed render is never cached; the document finalizer gives it the per-request value.
+  if (ctx.status >= 500) return
   const revalidateSeconds =
     pagesRevalidateSeconds ?? (ctx.routeMode === 'isr' ? ctx.hints?.revalidateSeconds : undefined)
   if (typeof revalidateSeconds !== 'number' || revalidateSeconds <= 0) return

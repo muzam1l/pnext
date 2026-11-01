@@ -184,6 +184,9 @@ function prerenderEntry(
 ) {
   return {
     initialRevalidateSeconds: metadata?.revalidateSeconds ?? false,
+    ...(metadata?.expireSeconds !== undefined
+      ? { initialExpireSeconds: metadata.expireSeconds }
+      : {}),
     srcRoute: route?.route ?? pathname,
     dataRoute: pathname === '/' ? '/index.rsc' : `${pathname}.rsc`,
     allowHeader: prerenderAllowHeader,

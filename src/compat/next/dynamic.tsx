@@ -12,22 +12,32 @@ import {
 
 export type { DynamicLoader, DynamicModule, DynamicOptions }
 
+const LOADING_PROPS = { isLoading: true, pastDelay: true, error: null }
+
 export default function dynamic<Props extends object = object>(
   loader: DynamicLoader<Props>,
   options: DynamicOptions<Props> = {},
   // Injected by the server compile; see rewriteDynamicCallTargets.
   target?: DynamicTarget,
 ) {
-  const coreDynamic = pnextDynamic(loader, options, target) as DynamicWithReference<Props>
+  if (typeof loader === 'string') return pnextDynamic(loader, options, target)
+  // Next calls `loading` with its load state, not the component's props.
+  const Loading = options.loading as ComponentType<typeof LOADING_PROPS> | undefined
+  const fallback = () => (Loading ? h(Loading, LOADING_PROPS) : null)
+  const coreDynamic = pnextDynamic(
+    loader,
+    { ...options, loading: Loading && fallback },
+    target,
+  ) as DynamicWithReference<Props>
   // Core's component server-renders and hydrates like Next, waiting for a chunk still loading.
-  if (typeof loader === 'string' || options.ssr !== false) return coreDynamic
+  if (options.ssr !== false) return coreDynamic
 
-  // ssr:false renders nothing on the server; the client renders `loading`, then the component.
+  // ssr:false server-renders `loading`; the client hydrates it, then swaps in the component.
   const DynamicComponent = ((props: Props) =>
     h(
       'pnext-dynamic',
       { style: { display: 'contents' } },
-      !process.browser && typeof window === 'undefined' ? null : h(coreDynamic, props),
+      !process.browser && typeof window === 'undefined' ? fallback() : h(coreDynamic, props),
     )) as DynamicWithReference<Props>
 
   DynamicComponent[dynamicReferenceSymbol] = coreDynamic[dynamicReferenceSymbol]

@@ -22,7 +22,11 @@ import {
   takeSegment,
   type SegmentPayloadMeta,
 } from './segment-cache'
-import { resetSegmentPrefetchDedupe, scheduleAppShellPrefetch } from './segment-prefetch'
+import {
+  resetSegmentPrefetchDedupe,
+  scheduleAppShellPrefetch,
+  scheduleRuntimePrefetch,
+} from './segment-prefetch'
 
 export function installSegmentCachePolicy(): SegmentCachePolicy {
   return {
@@ -87,6 +91,15 @@ function record(input: SegmentCacheRecord): void {
     complete: input.complete,
     runtime: input.runtime,
   })
+  if (input.kind !== 'document' && input.segmentPath === '/_index') {
+    scheduleRuntimePrefetch({
+      pathname: input.pathname,
+      search: input.search,
+      route: decoded.route,
+      runtime: input.runtime,
+      complete: input.complete,
+    })
+  }
   recordSegment({
     segmentPath: input.segmentPath,
     pathname: input.pathname,

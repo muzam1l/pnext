@@ -81,6 +81,10 @@ function actionClientModulePath() {
   return path.join(import.meta.dirname, '../compat/actions/client.ts')
 }
 
+function livePageModulePath() {
+  return path.join(import.meta.dirname, '../compat/client/live-page.ts')
+}
+
 function navCompatModulePath() {
   return path.join(import.meta.dirname, '../compat/client/nav.ts')
 }
@@ -871,6 +875,7 @@ ${deferredIslands ? "import { useEffect, useState } from 'preact/hooks';" : ''}
 ${suspense ? "import { Suspense } from 'preact/compat';" : ''}
 ${revival ? layoutSegmentHelperSource(nextCompat) : ''}
 ${nextCompat && (revival || page) ? syncPropsHelperSource() : ''}
+${nextCompat && page ? `import { LivePage as __PNextLivePage } from ${JSON.stringify(livePageModulePath())};` : ''}
 ${revival ? propsParserSource(nextCompat) : ''}
 ${revival ? islandHelpersSource(facts) : ''}
 ${islandCssHelperSource()}
@@ -1433,7 +1438,7 @@ if (!root) return;
 // Published for the router: it needs the mount container (and, for a dissolved
 // page slot, its anchors) to preserve this page across a refresh.
 window.__PNEXT_CLIENT_PAGE_ROOT__ = root;
-mount(root, ${wrapInBoundary('h(Page, pageProps())', nextCompat)});
+mount(root, ${wrapInBoundary(pageVNode(nextCompat), nextCompat)});
 }
 
 // Next renders a page's children directly into the layout with no wrapper element, so tests assert
@@ -1495,6 +1500,10 @@ function pageMarkerContainer(open, close, parent) {
   };
 }
 `
+}
+
+function pageVNode(nextCompat?: boolean) {
+  return nextCompat ? 'h(__PNextLivePage, { Page, props: pageProps() })' : 'h(Page, pageProps())'
 }
 
 // Under next compat every hydrated island and the page mount wraps in the in-tree
@@ -1739,7 +1748,7 @@ async function domNode(node) {
   }
 
   if (Page && element.id === 'pnext-page') {
-    return ${wrapInBoundary('h(Page, pageProps())', nextCompat)};
+    return ${wrapInBoundary(pageVNode(nextCompat), nextCompat)};
   }
 
   return h(element.localName, domProps(element), await domChildren(element));

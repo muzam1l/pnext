@@ -11,6 +11,10 @@ import {
   setBlockedJavascriptUrlReporter,
   softNavigate,
 } from '../../client/router'
+import { linkClickTarget } from '../../client/router/hub'
+import { assertRouterQueueImplemented } from '../actions/shared'
+
+declare const __PNEXT_CONCURRENT_ROUTER_QUEUE__: boolean
 
 const BLOCKED_JS_URL_MESSAGE = 'Next.js has blocked a javascript: URL as a security precaution.'
 
@@ -25,7 +29,18 @@ export function installNavCompat() {
     })
   }
   installNextRouterGlobal()
-  registerDeferredInstall(() => import('./nav-runtime').then(m => m.installNavPolicies()))
+  if (typeof __PNEXT_CONCURRENT_ROUTER_QUEUE__ === 'boolean' && __PNEXT_CONCURRENT_ROUTER_QUEUE__)
+    document.addEventListener('click', failConcurrentQueueNavigation, true)
+  registerDeferredInstall(router =>
+    import('./nav-runtime').then(m => m.installNavPolicies(router.policySetters!)),
+  )
+}
+
+// The click is the router's, so it must not fall back to a browser navigation either.
+function failConcurrentQueueNavigation(event: MouseEvent) {
+  if (!linkClickTarget(event)) return
+  event.preventDefault()
+  assertRouterQueueImplemented()
 }
 
 // `window.next.router` — Next's own global handle. Pure-core apps have no such
@@ -34,8 +49,14 @@ function installNextRouterGlobal() {
   window.next ??= {}
   window.next.router = {
     ...window.next.router,
-    push: href => softNavigate(String(href)),
-    replace: href => softNavigate(String(href), { replace: true }),
+    push: href => {
+      assertRouterQueueImplemented()
+      return softNavigate(String(href))
+    },
+    replace: href => {
+      assertRouterQueueImplemented()
+      return softNavigate(String(href), { replace: true })
+    },
     prefetch: href => prefetchRoute(String(href), { strict: true }),
   }
 }

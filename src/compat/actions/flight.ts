@@ -1,4 +1,4 @@
-import { ACTION_REDIRECT_HEADER, REDIRECT_TYPE_HEADER } from './protocol'
+import { ACTION_REDIRECT_HEADER } from './protocol'
 
 export const ACTION_FLIGHT_CONTENT_TYPE = 'text/x-component'
 
@@ -17,6 +17,10 @@ export interface CreateActionFlightResponseOptions {
   redirectType?: string
 }
 
+export function actionRedirectHeaderValue(target: string, redirectType?: string): string {
+  return `${target};${redirectType === 'replace' ? 'replace' : 'push'}`
+}
+
 export async function createActionFlightResponse({
   pageResponse,
   target,
@@ -33,13 +37,10 @@ export async function createActionFlightResponse({
   const headers = new Headers(pageResponse.headers)
   headers.set('content-type', ACTION_FLIGHT_CONTENT_TYPE)
   copyActionHeaders(actionHeaders, headers)
-  if (redirect) headers.set(ACTION_REDIRECT_HEADER, redirect)
-  if (redirectType) headers.set(REDIRECT_TYPE_HEADER, redirectType)
-  // A framework redirect returns HTTP 303 (matching Next's action-redirect wire
-  // the e2e suite asserts) with the destination page HTML inline in the flight
-  // payload; the client swaps the document without a follow-up GET. A plain
-  // flight envelope (revalidation, no redirect) stays 200.
-  return new Response(JSON.stringify(payload), { status: redirect ? 303 : 200, headers })
+  if (redirect)
+    headers.set(ACTION_REDIRECT_HEADER, actionRedirectHeaderValue(redirect, redirectType))
+  // Fetch-action redirects are successful Flight responses, not HTTP redirects.
+  return new Response(JSON.stringify(payload), { status: 200, headers })
 }
 
 function copyActionHeaders(from: Headers, to: Headers): void {

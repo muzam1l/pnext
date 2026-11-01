@@ -1,5 +1,10 @@
-import { runAction, type RunActionOptions } from './endpoint'
-import { ACTION_FLIGHT_CONTENT_TYPE, createActionFlightResponse } from './flight'
+import { resolveAction, runAction, type RunActionOptions } from './endpoint'
+import { allActions, lookupAction } from './registry'
+import {
+  ACTION_FLIGHT_CONTENT_TYPE,
+  actionRedirectHeaderValue,
+  createActionFlightResponse,
+} from './flight'
 import { INVALID_ORIGIN_MESSAGE, isActionOriginAllowed } from './origin'
 import {
   ACTION_ID_FIELD,
@@ -54,7 +59,10 @@ export async function isProgressiveActionRequest(request: Request): Promise<bool
     // A form-level action (ACTION_ID_FIELD) OR a bare submitter override
     // (SUBMIT_ACTION_ID_FIELD, e.g. <form><button formAction={fn}> with no form
     // action) both count as a progressive action submission.
-    const id = lastFieldValue(form, SUBMIT_ACTION_ID_FIELD) ?? lastFieldValue(form, ACTION_ID_FIELD)
+    const id =
+      lastFieldValue(form, SUBMIT_ACTION_ID_FIELD) ??
+      lastFieldValue(form, ACTION_ID_FIELD) ??
+      reactFormActionId(form)
     return typeof id === 'string' && id !== ''
   } catch {
     return false
@@ -75,7 +83,7 @@ export interface ServeActionOptions extends RunActionOptions {
     actionId: string,
   ) => Promise<Response | null>
   /**
-   * Single-pass redirects: render the redirect target's page for an RPC redirect so the 303 response
+   * Single-pass redirects: render the redirect target's page for an RPC redirect so the 200 response
    * carries the destination HTML and the client swaps it in without a follow-up GET. The request passed
    * already carries the action's cookie mutations. Null falls back to the JSON redirect envelope.
    */
@@ -86,7 +94,7 @@ export interface ServeActionOptions extends RunActionOptions {
    * Next "forwarded action" discrimination: true when the POSTed route's module graph does NOT contain
    * the action (the client dispatched it after navigating away from the page that owns it). Next
    * forwards such requests to the owning worker and relays the inner response's HEADERS but not its
-   * status, so the browser observes 200 + `x-action-redirect` instead of the direct-dispatch 303.
+   * status, so the browser observes 200 + `x-action-redirect`.
    */
   isForwardedAction?: (id: string) => boolean
 }
@@ -97,6 +105,12 @@ export async function serveAction(
   options: ServeActionOptions,
 ): Promise<Response> {
   const progressive = !request.headers.has(ACTION_ID_HEADER)
+  if (
+    !progressive &&
+    request.headers.get('content-type')?.includes('application/x-www-form-urlencoded')
+  ) {
+    return options.renderNotFound?.(request) ?? new Response(null, { status: 404 })
+  }
 
   // CSRF origin check runs before the action executes: a mismatched origin must
   // never run the action. JS clients get the error as a text/plain body (thrown
@@ -114,24 +128,25 @@ export async function serveAction(
     })
   }
 
-  const promoted = progressive ? await promoteFormActionId(request) : undefined
+  const promoted = progressive ? await promoteFormActionId(request, options) : undefined
   const prepared = promoted?.request ?? request
 
-  // A form POST to a page carrying no recognizable action id is an
-  // unrecognized MPA action: 404 + Next's marker header and log, rather than a
-  // "Missing header" 400. (Non-progressive requests always carry the header.)
-  if (progressive && !prepared.headers.has(ACTION_ID_HEADER)) {
+  if (progressive && (promoted?.errorStatus || !prepared.headers.has(ACTION_ID_HEADER))) {
+    const status = promoted?.errorStatus ?? (allActions().length > 0 ? 400 : 409)
     console.error(
       'Failed to find Server Action. This request might be from an older or newer deployment.\n' +
         'Read more: https://nextjs.org/docs/messages/failed-to-find-server-action',
     )
-    return new Response('Server action not found.', {
-      status: 404,
-      headers: {
-        'content-type': 'text/plain; charset=utf-8',
-        [NEXT_ACTION_NOT_FOUND_HEADER]: '1',
+    return new Response(
+      status === 400 ? 'Invalid Server Action request.' : 'Server Action unavailable.',
+      {
+        status,
+        headers: {
+          'content-type': 'text/plain; charset=utf-8',
+          [NEXT_ACTION_NOT_FOUND_HEADER]: '1',
+        },
       },
-    })
+    )
   }
 
   const response = await runAction(prepared, options)
@@ -157,22 +172,23 @@ export async function serveAction(
       const revalidated = response.headers.get(NEXT_ACTION_REVALIDATED_HEADER)
       if (revalidated) headers.set(NEXT_ACTION_REVALIDATED_HEADER, revalidated)
       const redirectType = response.headers.get(REDIRECT_TYPE_HEADER)
-      if (redirectType) headers.set(REDIRECT_TYPE_HEADER, redirectType)
       copySetCookies(response.headers, headers)
 
       // Forwarded action (dispatched from a page that does not own it): Next
-      // relays the owning worker's headers on a 200 — no single-pass 303.
+      // relays the owning worker's headers on a 200.
       // The JSON envelope makes the client soft-navigate to the target.
       const actionId = prepared.headers.get(ACTION_ID_HEADER)
       if (actionId && options.isForwardedAction?.(actionId)) {
-        headers.set(ACTION_REDIRECT_HEADER, target)
+        headers.set(
+          ACTION_REDIRECT_HEADER,
+          actionRedirectHeaderValue(target, redirectType ?? undefined),
+        )
         headers.set('content-type', 'application/json; charset=utf-8')
         return new Response(JSON.stringify({ redirect: target }), { status: 200, headers })
       }
 
-      // Same-origin targets: single-pass redirect. The 303 has NO location
-      // header (fetch would transparently follow one) and carries the
-      // destination page HTML; the client pushes history and swaps the
+      // Same-origin targets: single-pass redirect. The 200 has NO location header and
+      // carries the destination page HTML; the client pushes history and swaps the
       // document in one round trip, like Next's flight redirects.
       const targetUrl = resolveRedirectTarget(request, target)
       if (targetUrl && (options.renderActionFlight || options.renderRedirectTarget)) {
@@ -191,7 +207,7 @@ export async function serveAction(
             ...(redirectType ? { redirectType } : {}),
           })
         }
-        const htmlRendered = rendered
+        const fallbackRendered = rendered
           ? rendered
           : await options
               .renderRedirectTarget?.(
@@ -199,19 +215,26 @@ export async function serveAction(
                 targetUrl,
               )
               .catch(() => null)
-        if (htmlRendered?.status === 200) {
-          headers.set(ACTION_REDIRECT_HEADER, targetUrl.pathname + targetUrl.search)
-          headers.set(
-            'content-type',
-            htmlRendered.headers.get('content-type') ?? 'text/html; charset=utf-8',
-          )
-          return new Response(htmlRendered.body, { status: 303, headers })
+        if (wantsFlight && fallbackRendered?.status === 200) {
+          return createActionFlightResponse({
+            pageResponse: fallbackRendered,
+            target: targetUrl,
+            actionHeaders: response.headers,
+            redirect: targetUrl.pathname + targetUrl.search,
+            ...(redirectType ? { redirectType } : {}),
+          })
         }
-        // Same host, but the app cannot render it in-process (a path outside basePath, a rewrite to
-        // another origin). Next still answers the action with a redirect status, so send the bare 303
-        // plus marker and let the client make the follow-up request.
-        headers.set(ACTION_REDIRECT_HEADER, targetUrl.pathname + targetUrl.search)
-        return new Response(null, { status: 303, headers })
+        // A same-host path outside the app cannot be rendered in-process. Keep
+        // the action response successful and let the client navigate once.
+        headers.set(
+          ACTION_REDIRECT_HEADER,
+          actionRedirectHeaderValue(
+            targetUrl.pathname + targetUrl.search,
+            redirectType ?? undefined,
+          ),
+        )
+        headers.set('content-type', 'application/json; charset=utf-8')
+        return new Response(JSON.stringify({ redirect: target }), { status: 200, headers })
       }
 
       // Fallback: JSON envelope; the client soft-navigates (or hard-navigates
@@ -268,15 +291,13 @@ export async function serveAction(
     copySetCookies(response.headers, headers)
     return new Response(null, { status: 303, headers })
   }
-  // Progressive unknown-id: mirror Next's MPA behavior (a plain 500).
-  if (response.status === 404 && !response.headers.has(ACTION_NOT_FOUND_HEADER)) {
+  // Progressive failures retain the same unavailable-action status and body as fetch actions.
+  if (response.headers.has(NEXT_ACTION_NOT_FOUND_HEADER)) {
     console.error(
-      'Error: Failed to find Server Action. This request might be from an older or newer deployment',
+      response.status === 400
+        ? 'Error: Invalid Server Actions request.'
+        : `Error: Failed to find Server Action "${prepared.headers.get(ACTION_ID_HEADER)}". This request might be from an older or newer deployment`,
     )
-    return new Response('Internal Server Error', {
-      status: 500,
-      headers: { 'content-type': 'text/plain; charset=utf-8' },
-    })
   }
   return response
 }
@@ -299,7 +320,8 @@ function acceptsActionFlight(request: Request): boolean {
  */
 async function promoteFormActionId(
   request: Request,
-): Promise<{ request: Request; hasFormState: boolean }> {
+  options: ServeActionOptions,
+): Promise<{ request: Request; hasFormState: boolean; errorStatus?: 400 | 409 }> {
   const contentType = request.headers.get('content-type') ?? ''
   const isForm =
     contentType.includes('multipart/form-data') || contentType.includes('form-urlencoded')
@@ -317,9 +339,28 @@ async function promoteFormActionId(
   // form's default action (ACTION_ID_FIELD), unambiguously and independent of
   // field order — a no-JS submit has no event.submitter to tell them apart, and
   // the form-level hidden field can render either before or after the button.
-  const submitId = firstFieldValue(form, SUBMIT_ACTION_ID_FIELD)
-  const formActionId = firstFieldValue(form, ACTION_ID_FIELD)
-  const id = submitId ?? formActionId
+  const ids: FormDataEntryValue[] = []
+  for (const [name, value] of form) {
+    if (name === ACTION_ID_FIELD || name === SUBMIT_ACTION_ID_FIELD) ids.push(value)
+    else if (name.startsWith('$ACTION_ID_')) ids.push(name.slice('$ACTION_ID_'.length))
+  }
+  if (allActions().length > 0 || ids.length > 1) {
+    for (const actionId of ids) {
+      if (
+        typeof actionId !== 'string' ||
+        (!lookupAction(actionId) && !(await resolveAction(actionId, request, options)))
+      ) {
+        return {
+          request,
+          hasFormState: false,
+          errorStatus: typeof actionId === 'string' && actionId.length === 42 ? 409 : 400,
+        }
+      }
+    }
+  }
+  const submitId = lastFieldValue(form, SUBMIT_ACTION_ID_FIELD)
+  const formActionId = lastFieldValue(form, ACTION_ID_FIELD)
+  const id = submitId ?? formActionId ?? reactFormActionId(form)
   if (typeof id !== 'string' || id === '') return { request, hasFormState: false }
   form.delete(SUBMIT_ACTION_ID_FIELD)
   // Form state only applies to the form's own useActionState action, never a
@@ -344,9 +385,12 @@ function lastFieldValue(form: FormData, name: string) {
   return values.length > 0 ? values[values.length - 1] : undefined
 }
 
-function firstFieldValue(form: FormData, name: string) {
-  const values = form.getAll(name)
-  return values.length > 0 ? values[0] : undefined
+function reactFormActionId(form: FormData): string | undefined {
+  let id: string | undefined
+  for (const name of form.keys()) {
+    if (name.startsWith('$ACTION_ID_')) id = name.slice('$ACTION_ID_'.length)
+  }
+  return id
 }
 
 function copySetCookies(from: Headers, to: Headers) {

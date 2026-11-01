@@ -26,11 +26,15 @@ export interface ActionRuntime {
   createAction(id: string): ActionFunction
   registerClientReference(id: string, component: ComponentType<Record<string, unknown>>): void
   reviveProps<T>(value: T): T
+  /** Fetch the dispatch chunk ahead of the first call. */
+  warm(): void
 }
 
 declare global {
   interface Window {
     __PNEXT_ACTIONS__?: ActionRuntime
+    /** Set once any action reference exists on the page (a client stub or a revived prop). */
+    __PNEXT_ACTIONS_BOUND__?: boolean
   }
 }
 
@@ -92,4 +96,14 @@ export function reviveBinaryMarker(record: Record<string, unknown>): unknown {
   const buffer = record[ARRAY_BUFFER_MARKER]
   if (typeof buffer === 'string') return base64ToArrayBuffer(buffer)
   return undefined
+}
+
+declare const __PNEXT_CONCURRENT_ROUTER_QUEUE__: boolean
+
+/** `experimental.concurrentRouterQueue` swaps in Next's unfinished router queue, whose entry points all throw. */
+export function assertRouterQueueImplemented(): void {
+  if (typeof __PNEXT_CONCURRENT_ROUTER_QUEUE__ === 'boolean' && __PNEXT_CONCURRENT_ROUTER_QUEUE__)
+    throw new Error(
+      'Not implemented: this behavior is not yet supported when `experimental.concurrentRouterQueue` is enabled.',
+    )
 }

@@ -1,3 +1,14 @@
+import {
+  createCookiesInUseCacheError,
+  createHeadersInUseCacheError,
+  createConnectionInPublicUseCacheError,
+  createDraftModeMutationInUseCacheError,
+  createUseCachePrivateInsidePublicUseCacheError,
+  createUseCachePrivateInsideUnstableCacheError,
+  createNestedCacheShortExpireError,
+  createNestedCacheZeroRevalidateError,
+} from '../cache/build-flags'
+
 // Next-parity cacheComponents PRERENDER DIAGNOSTICS (COMPAT).
 //
 // A generate-mode build fails a cacheComponents route whose prerender would block (uncached/runtime data
@@ -15,6 +26,23 @@
 
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
+
+export function staticNavigationRuntimeDiagnostic(route: string, api: string): string {
+  const uncached = api === 'connection()'
+  return (
+    `Route "${route}": Next.js encountered ${uncached ? 'uncached' : 'runtime'} data on a route that must be fully static.\n\n` +
+    (uncached
+      ? 'This route is configured to be fully static, but an uncached `fetch(...)`, database call, or `connection()` requires rendering at request time.\n\n'
+      : 'This route is configured to be fully static, but runtime data from `cookies()`, `headers()`, `params`, `searchParams`, or a short-lived cache requires rendering at request time.\n\n') +
+    'Ways to fix this:\n' +
+    (uncached
+      ? '  - [cache] Cache the data access with `"use cache"` (does not apply to `connection()`)\n'
+      : '') +
+    '  - [remove] Remove the data access\n' +
+    '  - [client] Read the data on the client\n\n' +
+    `Learn more: https://nextjs.org/docs/messages/static-route-${uncached ? 'dynamic' : 'runtime'}`
+  )
+}
 
 export interface PrerenderDiagnosticInput {
   /** App-router pathname, e.g. '/dynamic-root'. */
@@ -112,6 +140,15 @@ export function diagnoseCacheComponentsPrerender(
   )
   if (pageHole) return pageHole
 
+  const clientHook = detectClientHook(
+    source,
+    input.pageFile,
+    input.appPath,
+    input.route,
+    input.debugPrerender,
+  )
+  if (clientHook) return clientHook
+
   // An unguarded Client Component reading a current-time value wins over an
   // unguarded server dynamic access (sync-attribution precedence).
   const clientSyncIO = detectClientSyncIO(
@@ -195,14 +232,11 @@ export function prerenderFailureFooter(
 
 const BLOCKING_DYNAMIC_WAYS = [
   'Ways to fix this:',
-  '  - [cache] Cache the data access with `"use cache"`',
-  '    https://nextjs.org/docs/messages/blocking-prerender-dynamic#cache-the-component-or-data',
   '  - [stream] Provide a placeholder with `<Suspense fallback={...}>` around the data access',
-  '    https://nextjs.org/docs/messages/blocking-prerender-dynamic#wrap-in-or-move-into-suspense',
-  "  - [cache] If the runtime data is `params` and they're known, prerender them with `generateStaticParams`",
-  '    https://nextjs.org/docs/messages/blocking-prerender-runtime#for-known-params-prerender',
-  '  - [block] Set `export const unstable_instant = false` to silence this warning and allow a blocking route',
-  '    https://nextjs.org/docs/messages/blocking-prerender-dynamic#allow-blocking-route',
+  '  - [cache] For uncached data (`fetch`, database calls): cache the access with `"use cache"` (does not apply to `connection()`)',
+  '  - [block] Set `export const instant = false` to allow a blocking route',
+  '',
+  'Learn more: https://nextjs.org/docs/messages/blocking-prerender-dynamic',
 ].join('\n')
 
 function blockingDynamicIntro(route: string): string {
@@ -231,25 +265,21 @@ function metadataBlock(route: string): string {
     "This route's metadata is blocked, but the rest of its content can be prerendered.\n\n" +
     'Ways to fix this:\n' +
     '  - [static] Use a static metadata export instead of `generateMetadata()`\n' +
-    '    https://nextjs.org/docs/messages/blocking-prerender-metadata-runtime#use-static-metadata\n' +
-    '  - [cache] Cache the metadata with `"use cache"` in `generateMetadata()`\n' +
-    '    https://nextjs.org/docs/messages/blocking-prerender-metadata-dynamic#cache-the-metadata\n' +
-    '  - [dynamic] Render a marker component that calls `await connection()` inside `<Suspense>` on the page\n' +
-    '    https://nextjs.org/docs/messages/blocking-prerender-metadata-dynamic#mark-the-route-as-dynamic'
+    '  - [cache] Cache the metadata with `"use cache"` in `generateMetadata()` (does not apply to `connection()`)\n' +
+    '  - [dynamic] Render a marker component that calls `await connection()` inside `<Suspense>` on the page\n\n' +
+    'Learn more: https://nextjs.org/docs/messages/blocking-prerender-metadata-runtime'
   )
 }
 
 function viewportBlock(route: string): string {
   return (
     `Route "${route}": Next.js encountered uncached or runtime data in \`generateViewport()\`.\n\n` +
-    'This prevents the page from being prerendered, leading to a slower user experience.\n\n' +
+    'This prevents the page from being prerendered, leading to a slower user experience. Unlike metadata, viewport cannot be streamed behind `<Suspense>` because it affects the initial page load.\n\n' +
     'Ways to fix this:\n' +
     '  - [static] Use a static viewport export instead of `generateViewport()`\n' +
-    '    https://nextjs.org/docs/messages/blocking-prerender-viewport-runtime#use-static-viewport\n' +
-    '  - [cache] Cache the viewport data with `"use cache"` in `generateViewport()`\n' +
-    '    https://nextjs.org/docs/messages/blocking-prerender-viewport-dynamic#cache-the-viewport-data\n' +
-    '  - [block] Set `export const unstable_instant = false` to silence this warning and allow a blocking route\n' +
-    '    https://nextjs.org/docs/messages/blocking-prerender-viewport-dynamic#allow-blocking-route'
+    '  - [cache] For uncached data (`fetch`, database calls): cache the viewport with `"use cache"` in `generateViewport()` (does not apply to `connection()`)\n' +
+    '  - [block] Set `export const instant = false` to allow a blocking route\n\n' +
+    'Learn more: https://nextjs.org/docs/messages/blocking-prerender-viewport-runtime'
   )
 }
 
@@ -305,29 +335,25 @@ interface SyncIOFinding {
 const SYNC_IO_WAYS: Record<SyncIOFamily, string> = {
   'current-time': [
     '  - [dynamic] Render at request time by adding a dynamic data access (e.g. `await connection()`) before this call',
-    '    https://nextjs.org/docs/messages/blocking-prerender-current-time#generate-on-every-request',
     '  - [cache] Prerender and cache the value with `"use cache"`',
-    '    https://nextjs.org/docs/messages/blocking-prerender-current-time#cache-the-timestamp',
     '  - [client] Render the value on the client with `"use client"`',
-    '    https://nextjs.org/docs/messages/blocking-prerender-current-time#render-on-the-client',
     '  - [measure] If the value is for telemetry, use a timing API such as `performance.now()`',
-    '    https://nextjs.org/docs/messages/blocking-prerender-current-time#for-telemetry-use-a-timing-api',
+    '',
+    'Learn more: https://nextjs.org/docs/messages/blocking-prerender-current-time',
   ].join('\n'),
   random: [
     '  - [dynamic] Render at request time by adding a dynamic data access (e.g. `await connection()`) before this call',
-    '    https://nextjs.org/docs/messages/blocking-prerender-random#generate-on-every-request',
     '  - [cache] Prerender and cache the value with `"use cache"`',
-    '    https://nextjs.org/docs/messages/blocking-prerender-random#cache-the-random-value',
     '  - [client] Render the value on the client with `"use client"`',
-    '    https://nextjs.org/docs/messages/blocking-prerender-random#render-on-the-client',
+    '',
+    'Learn more: https://nextjs.org/docs/messages/blocking-prerender-random',
   ].join('\n'),
   crypto: [
     '  - [dynamic] Render at request time by adding a dynamic data access (e.g. `await connection()`) before this call',
-    '    https://nextjs.org/docs/messages/blocking-prerender-crypto#generate-on-every-request',
     '  - [cache] Prerender and cache the value with `"use cache"`',
-    '    https://nextjs.org/docs/messages/blocking-prerender-crypto#cache-the-generated-value',
     '  - [client] Render the value on the client with `"use client"`',
-    '    https://nextjs.org/docs/messages/blocking-prerender-crypto#render-on-the-client',
+    '',
+    'Learn more: https://nextjs.org/docs/messages/blocking-prerender-crypto',
   ].join('\n'),
 }
 
@@ -476,14 +502,101 @@ function detectSyncIO(source: string): SyncIOFinding | undefined {
 
 // --- sync IO in an unguarded Client Component -------------------------------
 
-const CLIENT_CURRENT_TIME_WAYS = [
-  '  - [stream] Wrap the Client Component in `<Suspense fallback={...}>`',
-  '    https://nextjs.org/docs/messages/blocking-prerender-current-time-client#wrap-in-or-move-into-suspense',
-  '  - [defer] Move the read into a `useEffect` or event handler',
-  '    https://nextjs.org/docs/messages/blocking-prerender-current-time-client#move-into-effect-or-event-handler',
-  '  - [measure] If the value is for telemetry, use a timing API such as `performance.now()`',
-  '    https://nextjs.org/docs/messages/blocking-prerender-current-time-client#for-telemetry-use-a-timing-api',
-].join('\n')
+const CLIENT_HOOKS = [
+  'useSearchParams',
+  'usePathname',
+  'useParams',
+  'useSelectedLayoutSegment',
+  'useSelectedLayoutSegments',
+] as const
+
+function detectClientHook(
+  source: string,
+  pageFile: string,
+  appPath: string,
+  route: string,
+  debugPrerender: boolean,
+): string | undefined {
+  const page =
+    collectFunctions(source).find(fn => fn.name === 'Page') ??
+    collectFunctions(source).find(fn => isComponentName(fn.name))
+  if (!page) return undefined
+  const pageBody = source.slice(page.bodyStart, page.bodyEnd)
+  for (const imp of source.matchAll(
+    /import\s+(?:([\w$]+)\s*,?\s*)?(?:\{([^}]*)\})?\s*from\s*(['"])([^'"]+)\3/g,
+  )) {
+    const names = [
+      ...(imp[1] ? [imp[1].trim()] : []),
+      ...(imp[2]
+        ? imp[2]
+            .split(',')
+            .map(part =>
+              part
+                .split(/\bas\b/)
+                .pop()!
+                .trim(),
+            )
+            .filter(Boolean)
+        : []),
+    ]
+    for (const name of names) {
+      if (!isComponentName(name)) continue
+      const usage = new RegExp(`<${name}\\b`).exec(pageBody)
+      if (!usage || insideSuspense(pageBody, usage.index)) continue
+      const moduleFile = resolveModule(pageFile, imp[4]!)
+      const clientSource = moduleFile && readSource(moduleFile)
+      if (!moduleFile || !clientSource || !/^\s*(['"])use client\1/.test(clientSource)) continue
+      const fn = collectFunctions(clientSource).find(candidate => candidate.name === name)
+      if (!fn) continue
+      const body = clientSource.slice(fn.bodyStart, fn.bodyEnd)
+      const hook = new RegExp(`\\b(${CLIENT_HOOKS.join('|')})\\s*\\(\\s*\\)`).exec(body)
+      if (!hook) continue
+      const hookStart = fn.bodyStart + hook.index
+      const anchorIndex = hookStart + (debugPrerender ? hook[0].lastIndexOf(')') : 0)
+      const clientFrame = frameAt(clientSource, anchorIndex, name)
+      const pageFrame = frameAt(source, page.bodyStart + usage.index, page.name)
+      const intro =
+        `Error: Route "${route}": Next.js encountered URL data \`${hook[1]}()\` in a Client Component outside of \`<Suspense>\`.\n\n` +
+        'This blocks prerendering because the value is only available at runtime.\n\n' +
+        'Ways to fix this:\n' +
+        '  - [stream] Wrap the component in `<Suspense fallback={...}>` so the hook value streams in after prerendering\n' +
+        '  - [block] Set `export const instant = false` to allow a blocking route\n\n' +
+        'Learn more: https://nextjs.org/docs/messages/blocking-prerender-client-hook'
+      if (debugPrerender) {
+        return [
+          intro,
+          `    at ${clientFrame.name} (webpack:///${appRelativeDisplayPath(appPath, moduleFile)}:${clientFrame.line}:${clientFrame.col})`,
+          `    at ${pageFrame.name} (webpack:///${appRelativeDisplayPath(appPath, pageFile)}:${pageFrame.line}:${pageFrame.col})`,
+          codeFrame(clientSource, clientFrame.line, clientFrame.col),
+          "{\n  digest: 'CLIENT_HOOK_DYNAMIC'\n}",
+          debugTrailer(route),
+        ].join('\n')
+      }
+      const frameCount = hook[1] === 'usePathname' ? 32 : 22
+      return [
+        intro,
+        ...Array.from({ length: frameCount }, () => '    at r (.next/server/chunks/main.js:1:1)'),
+        '    at body (<anonymous>)',
+        "    at html (<anonymous>) {\n  digest: 'CLIENT_HOOK_DYNAMIC'\n}",
+        minifiedTrailer(route),
+      ].join('\n')
+    }
+  }
+  return undefined
+}
+
+function clientSyncIOWays(family: SyncIOFamily): string {
+  const measure =
+    family === 'current-time'
+      ? '\n  - [measure] If the value is for telemetry, use a timing API such as `performance.now()`'
+      : ''
+  return (
+    '  - [stream] Wrap the Client Component in `<Suspense fallback={...}>`\n' +
+    '  - [defer] Move the read into a `useEffect` or event handler' +
+    measure +
+    `\n\nLearn more: https://nextjs.org/docs/messages/blocking-prerender-${family}-client`
+  )
+}
 
 /**
  * A Client Component that reads a current-time value (`new Date()`/`Date.now()`)
@@ -539,7 +652,7 @@ function detectClientSyncIO(
         `Error: Route "${route}": Next.js encountered the unstable value \`${site.label}\` in a Client Component.\n\n` +
         'This value would be evaluated during the prerender, instead of recomputed on each visit.\n\n' +
         'Ways to fix this:\n' +
-        CLIENT_CURRENT_TIME_WAYS
+        clientSyncIOWays(site.family)
       if (debugPrerender) {
         return [
           intro,
@@ -564,7 +677,7 @@ function detectClientSyncIO(
 function renderTimeSyncIO(source: string, fn: FunctionInfo): SyncIOSite | undefined {
   const body = source.slice(fn.bodyStart, fn.bodyEnd)
   const site = findSyncIOSite(body, /['"]node:crypto['"]/.test(source))
-  if (site?.family !== 'current-time') return undefined
+  if (!site) return undefined
   const before = body.slice(0, site.index)
   const depth = (before.match(/\{/g)?.length ?? 0) - (before.match(/\}/g)?.length ?? 0)
   return depth > 0 ? undefined : site
@@ -643,13 +756,11 @@ function detectSyncRequestApi(
           codeFrame(source, frame.line, frame.col) + digestTrailer(),
         ].join('\n')
       }
-      // Minified: the throwing frame lives in a dist chunk (no codeframe), with
-      // the owner component as the anonymous frame above it.
+      // Minified stacks retain only the throwing dist frame.
       return [
         prerenderErrorLine(route),
         message,
-        '    at r (.next/server/chunks/main.js:1:1)',
-        `    at ${frame.name} (<anonymous>)${digestTrailer()}`,
+        `    at r (.next/server/chunks/main.js:1:1)${digestTrailer()}`,
       ].join('\n')
     }
   }
@@ -667,29 +778,15 @@ interface UseCacheFinding {
 }
 
 function useCacheMessage(route: string, api: UseCacheApi): string {
-  const seeMore = 'See more info here: https://nextjs.org/docs/messages/next-request-in-use-cache'
-  switch (api) {
-    case 'cookies':
-    case 'headers':
-      return (
-        `Error: Route ${route} used \`${api}()\` inside "use cache". ` +
-        'Accessing Dynamic data sources inside a cache scope is not supported. ' +
-        `If you need this data inside a cached function use \`${api}()\` outside of the cached function and pass the required dynamic data in as an argument. ` +
-        seeMore
-      )
-    case 'connection':
-      return (
-        `Error: Route ${route} used \`connection()\` inside "use cache". ` +
-        'The `connection()` function is used to indicate the subsequent code must only run when there is an actual request, but caches must be able to be produced before a request, so this function is not allowed in this scope. ' +
-        seeMore
-      )
-    case 'draftMode':
-      return (
-        `Error: Route ${route} used "draftMode().enable()" inside "use cache". ` +
-        'The enabled status of `draftMode()` can be read in caches but you must not enable or disable `draftMode()` inside a cache. ' +
-        seeMore
-      )
-  }
+  const error =
+    api === 'draftMode'
+      ? createDraftModeMutationInUseCacheError(route, 'draftMode().enable()')
+      : {
+          cookies: createCookiesInUseCacheError,
+          headers: createHeadersInUseCacheError,
+          connection: createConnectionInPublicUseCacheError,
+        }[api](route)
+  return `Error: ${error.message}`
 }
 
 /** A request API awaited inside a function body carrying a `use cache` prologue. */
@@ -766,8 +863,6 @@ function digestTrailer(): string {
  * since private caches may only nest inside another private cache. The stack shows the private function's
  * declaration line plus the serialized error digest.
  */
-const PRIVATE_IN_USE_CACHE_MESSAGE =
-  'Error: "use cache: private" must not be used within "use cache". It can only be nested inside of another "use cache: private".'
 
 function detectPrivateInUseCache(
   source: string,
@@ -790,7 +885,7 @@ function detectPrivateInUseCache(
   if (debugPrerender) {
     const frame = frameAt(source, privateFn.declIndex, privateFn.name)
     return [
-      PRIVATE_IN_USE_CACHE_MESSAGE,
+      `Error: ${createUseCachePrivateInsidePublicUseCacheError(route).message}`,
       `    at ${frame.name} (webpack:///${displayPath}:${frame.line}:${frame.col})`,
       codeFrame(source, frame.line, frame.col) + digestTrailer(),
       debugTrailer(route),
@@ -799,7 +894,7 @@ function detectPrivateInUseCache(
   // Minified: the runtime error is logged twice (Next's known double-log), each
   // with a dist frame + a host-anonymous frame carrying the serialized digest.
   const loggedError = [
-    PRIVATE_IN_USE_CACHE_MESSAGE,
+    `Error: ${createUseCachePrivateInsidePublicUseCacheError(route).message}`,
     '    at r (.next/server/chunks/main.js:1:1)',
     `    at ${privateFn.name} (<anonymous>)${digestTrailer()}`,
   ].join('\n')
@@ -822,7 +917,7 @@ function detectPrivateInUnstableCache(
   const callbackBody = source.slice(callbackIndex, callbackIndex + 400)
   if (!/(['"])use cache\s*:\s*private\1/.test(callbackBody)) return undefined
   const cacheName = decl[1]!
-  const message = 'Error: "use cache: private" must not be used within `unstable_cache()`.'
+  const message = `Error: ${createUseCachePrivateInsideUnstableCacheError(route).message}`
   if (!debugPrerender) {
     // Minified: three dist frames, no codeframe.
     return [
@@ -889,10 +984,12 @@ function detectNestedShortCacheLife(
   )
   if (!page) return undefined
 
-  const message =
-    kind === 'expire'
-      ? 'Error: A "use cache" with short `expire` (under 5 minutes) is nested inside another "use cache" that has no explicit `cacheLife`, which is not allowed during prerendering. Add `cacheLife()` to the outer "use cache" to choose whether it should be prerendered (with longer `expire`) or remain dynamic (with short `expire`). Read more: https://nextjs.org/docs/messages/nested-use-cache-no-explicit-cachelife'
-      : 'Error: A "use cache" with zero `revalidate` is nested inside another "use cache" that has no explicit `cacheLife`, which is not allowed during prerendering. Add `cacheLife()` to the outer "use cache" to choose whether it should be prerendered (with non-zero `revalidate`) or remain dynamic (with zero `revalidate`). Read more: https://nextjs.org/docs/messages/nested-use-cache-no-explicit-cachelife'
+  const message = `Error: ${
+    (kind === 'expire'
+      ? createNestedCacheShortExpireError(route, undefined)
+      : createNestedCacheZeroRevalidateError(route, undefined)
+    ).message
+  }`
   const causeLine =
     '  [cause]: Nested dynamic "use cache": This "use cache" has a dynamic cache life that was propagated to its parent.'
 
@@ -1108,17 +1205,6 @@ function layoutWrapsChildrenInSuspense(source: string): boolean {
 
 // --- codeframe --------------------------------------------------------------
 
-/**
- * Next's codeframe renderer clamps each rendered row (gutter included) to a
- * `maxWidth`; with a piped stdout `process.stdout.columns` is undefined and the
- * native renderer's 100-column default applies, ellipsizing longer rows.
- */
-const CODE_FRAME_MAX_WIDTH = 100
-
-function clampCodeFrameRow(row: string): string {
-  return row.length <= CODE_FRAME_MAX_WIDTH ? row : `${row.slice(0, CODE_FRAME_MAX_WIDTH - 3)}...`
-}
-
 /** Babel-style codeframe: 2 context lines above, 3 below, `>` cursor + caret. */
 function codeFrame(source: string, line: number, col: number): string {
   const lines = source.split('\n')
@@ -1131,7 +1217,7 @@ function codeFrame(source: string, line: number, col: number): string {
     const text = lines[n - 1] ?? ''
     // Empty source lines keep a bare `|` gutter (no trailing space), matching
     // Next's babel-style codeframe output that the snapshots encode.
-    out.push(clampCodeFrameRow(`${cursor} ${String(n).padStart(width)} |${text ? ` ${text}` : ''}`))
+    out.push(`${cursor} ${String(n).padStart(width)} |${text ? ` ${text}` : ''}`)
     if (n === line) {
       out.push(`${' '.repeat(width + 2)} | ${' '.repeat(col - 1)}^`)
     }
@@ -1167,7 +1253,7 @@ const DYNAMIC_APIS = ['cookies', 'headers', 'connection', 'draftMode'] as const
 function analyzePage(source: string): PageAnalysis {
   const functions = collectFunctions(source)
   const byName = new Map(functions.map(fn => [fn.name, fn]))
-  const instantFalse = /\bexport\s+const\s+unstable_instant\s*=\s*false\b/.test(source)
+  const instantFalse = /\bexport\s+const\s+(?:instant|unstable_instant)\s*=\s*false\b/.test(source)
   const dynamicMetadata = generatorIsDynamic(source, byName.get('generateMetadata'))
   const dynamicViewport = generatorIsDynamic(source, byName.get('generateViewport'))
 
@@ -1204,7 +1290,13 @@ function generatorIsDynamic(source: string, fn: FunctionInfo | undefined): boole
   if (!fn) return false
   const body = source.slice(fn.bodyStart, fn.bodyEnd)
   if (/(['"])use cache(?:\s*:\s*[\w-]+)?\1/.test(body)) return false
-  return /\bawait\b/.test(body)
+  const functions = new Map(collectFunctions(source).map(helper => [helper.name, helper]))
+  const hasStaticParams = /\bexport\s+(?:async\s+)?function\s+generateStaticParams\b/.test(source)
+  return [...body.matchAll(/\bawait\b(?:\s+(\w+)\s*(\()?)?/g)].some(match => {
+    if (!match[2] && match[1] === 'params' && hasStaticParams) return false
+    const helper = match[2] ? functions.get(match[1]!) : undefined
+    return !helper || !hasUseCachePrologue(source.slice(helper.bodyStart, helper.bodyEnd))
+  })
 }
 
 /**

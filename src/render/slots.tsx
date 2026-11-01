@@ -31,6 +31,7 @@ interface SlotRenderOptions {
     state?: { childrenSearch?: string; slots?: Record<string, string> }
   }
   route: Pick<RouteManifestEntry, 'clientReferences' | 'slotDirs'>
+  slotFallback?: { dir: string; tree: ComponentChildren }
   params?: Record<string, RouteParamValue>
   clientComponents?: Map<string, ComponentType<Record<string, unknown>>>
   slotStateOut?: Record<string, string>
@@ -158,7 +159,7 @@ export async function renderDirSlots<Options extends SlotRenderOptions>(
     // the boundary marker would make it a truthy VNode, and an unmatched
     // `@children` slot must stay falsy so childrenFromSlots can fall back to
     // the segment-matched children tree.
-    props[basename(slotDir).slice(1)] = content == null ? null : wrapSlotBoundary(content)
+    props[basename(slotDir).slice(1)] = content == null ? null : wrapSlotBoundary(content, slotDir)
   }
   return props
 }
@@ -168,6 +169,7 @@ async function resolveSlotContent<Options extends SlotRenderOptions>(
   slotDir: string,
   consumed: number,
 ): Promise<ComponentChildren> {
+  if (context.options.slotFallback?.dir === slotDir) return context.options.slotFallback.tree
   const key = toPosixPath(relative(context.appPath, slotDir))
 
   // Interceptor targets are absolute paths, so the navigated URL applies to
@@ -336,9 +338,35 @@ type SlotBoundaryMarker = ((props: ServerVNodeProps) => ComponentChildren) & {
 const SlotBoundaryMarker: SlotBoundaryMarker = props => props.children
 SlotBoundaryMarker[slotBoundarySymbol] = true
 
+const SLOT_DIR_PROP = '__pnextSlotDir'
+
 /** Wrap a named parallel-route slot subtree in the task-boundary marker. */
-export function wrapSlotBoundary(content: ComponentChildren): ComponentChildren {
-  return h(SlotBoundaryMarker as ComponentType<ServerVNodeProps>, null, content)
+export function wrapSlotBoundary(content: ComponentChildren, slotDir: string): ComponentChildren {
+  return h(
+    SlotBoundaryMarker as ComponentType<ServerVNodeProps>,
+    { [SLOT_DIR_PROP]: slotDir },
+    content,
+  )
+}
+
+/**
+ * A slot marker the server-tree resolver reached is rendered: record it, and wrap its content in the
+ * slot's metadata outlet so the outcome surfaces where the slot renders.
+ */
+export function enterSlotMarker<Node extends { type: unknown; props: Record<string, unknown> }>(
+  node: Node,
+  rendered: Set<string> | undefined,
+  outlets: Map<string, (content: ComponentChildren) => ComponentChildren> | undefined,
+): Node {
+  if (!(node.type as { [slotBoundarySymbol]?: true })[slotBoundarySymbol]) return node
+  const dir = node.props[SLOT_DIR_PROP] as string
+  rendered?.add(dir)
+  const outlet = outlets?.get(dir)
+  if (!outlet) return node
+  return {
+    ...node,
+    props: { ...node.props, children: outlet(node.props.children as ComponentChildren) },
+  }
 }
 
 /** Read the params for the slot scope active in the current async resolution. */

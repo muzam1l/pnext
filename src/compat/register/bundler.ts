@@ -20,7 +20,13 @@ import path from 'node:path'
 import type { OnLoadResult, Plugin } from 'esbuild'
 import type { ResolvedConfig } from '../../config'
 import type { ServerEsbuildPluginOptions } from '../../extensions'
-import { compatAliases, nextCompatEnabled, rewriteNextFontSource } from '../../compat/aliases'
+import {
+  compatAliases,
+  nextCompatEnabled,
+  nextRequireAliases,
+  reactServerLayerAliases,
+  rewriteNextFontSource,
+} from '../../compat/aliases'
 import {
   getBundlerExtensions,
   getCompatModeExtensions,
@@ -47,6 +53,7 @@ import {
   setTsConfigPath,
 } from '../../resolve/imports'
 import { setServerBundleConditions } from '../../runtime/load'
+import { getNextConfig } from '../next/config-loader'
 import { escapeRegex, specifierSniffTokens } from '../../utils/code'
 import {
   cacheComponentsEnabled,
@@ -106,7 +113,12 @@ import {
   webpackLoaderRuleModule,
   webpackLoaderRulesPlugin,
 } from '../bundler/webpack-loaders'
-import { rewriteStaticCompatImports } from '../bundler/static-imports'
+import {
+  nextDefaultImportSpecifiers,
+  rewriteNextCallableRequires,
+  rewriteNextDefaultImports,
+  rewriteStaticCompatImports,
+} from '../bundler/static-imports'
 import { createClientWorkerTransform } from '../bundler/worker'
 import { rewriteStyledJsxSource } from '../css/styled-jsx'
 import { getImagesConfig } from '../next/image/config'
@@ -247,17 +259,28 @@ export function registerBundlerExtensions(config: ResolvedConfig): void {
   registerServerSourceTransforms(withSniff(["'bun", '"bun'], rewriteBunBuiltinExternals))
   // Materialized fixtures can re-import original sources outside esbuild's
   // alias graph. Keep their static compat imports on the registered facades.
-  // Leave React entrypoints for the resolver: RSC/proxy/middleware needs the
-  // stricter react-server-layer overrides instead of the ordinary shims.
+  // Layer-dependent entries must reach the resolver before any base alias is baked into source.
   const staticServerAliases = compatAliases(config, 'server')
-  delete staticServerAliases.react
-  delete staticServerAliases['react-dom']
+  for (const specifier of Object.keys(reactServerLayerAliases(config))) {
+    delete staticServerAliases[specifier]
+  }
   // The CJS facades live in compat/next, one level up from this register dir.
   const nextRoot = path.resolve(import.meta.dirname, '..', 'next')
   const requireAliases = {
-    'next/navigation': path.join(nextRoot, 'navigation.cjs'),
+    ...nextRequireAliases(),
     'next/router': path.join(nextRoot, 'router.cjs'),
   }
+  registerClientSourceTransforms(
+    withSniff(
+      specifierSniffTokens(
+        [...nextDefaultImportSpecifiers, 'next/head', 'next/link'].flatMap(specifier => [
+          specifier,
+          `${specifier}.js`,
+        ]),
+      ),
+      (source, file) => rewriteNextCallableRequires(rewriteNextDefaultImports(source, file), file),
+    ),
+  )
   registerServerSourceTransforms(
     withSniff(
       specifierSniffTokens([...Object.keys(staticServerAliases), ...Object.keys(requireAliases)]),
@@ -391,7 +414,17 @@ export function registerBundlerExtensions(config: ResolvedConfig): void {
       __PNEXT_IMAGE_CONFIG_INLINE__: JSON.stringify(getImagesConfig()),
       __PNEXT_IMAGE_CONFIG_INLINED__: 'true',
       // Next's router policies replace core's scroll and refresh ones, so client bundles drop those.
-      ...(nextCompatEnabled(config) ? { __PNEXT_NEXT_ROUTER__: 'true' } : {}),
+      ...(nextCompatEnabled(config)
+        ? {
+            __PNEXT_NEXT_ROUTER__: 'true',
+            __PNEXT_DEFER_LINKLESS_ROUTER__: 'true',
+            __PNEXT_ROUTER_POLICY_SETTERS__: 'true',
+          }
+        : {}),
+      __PNEXT_CONCURRENT_ROUTER_QUEUE__: String(
+        (getNextConfig().experimental as { concurrentRouterQueue?: unknown } | undefined)
+          ?.concurrentRouterQueue === true,
+      ),
       // publicRuntimeConfig inlined the same way; omitted entirely when unset so an app that
       // never configures it adds zero bytes (unlike images, there is no default to drop).
       ...(Object.keys(publicRuntimeConfig()).length > 0

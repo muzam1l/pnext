@@ -21,6 +21,7 @@ export type ResolvedConfig = Required<Pick<PNextConfig, 'outDir' | 'basePath'>> 
   Omit<PNextConfig, 'outDir' | 'basePath'> & {
     root: string
     workspaceRoot: string
+    workspaceRootExplicit?: boolean
     appDir: string
     publicDir: 'public'
     appPath: string
@@ -144,16 +145,18 @@ export async function loadConfig(
     // The source config above already warned; its compiled copy must not warn again.
     return loadReleasedConfig(root, release, { ...options, warnings: false })
   }
+  const workspaceRoot = canonicalRoot(
+    config.workspaceRoot
+      ? path.resolve(root, config.workspaceRoot)
+      : (findWorkspaceRoot(root) ?? root),
+  )
+  // Checked before anything writes there: a build clears its out root.
+  verifyOutRoot(merged.outDir, root, workspaceRoot, sourceOverrides.outDir !== undefined)
   // A build materializes pages into its output, so the release names them portably.
   const appPath = await resolveAppPath(
     root,
     config,
     options.dev ? undefined : path.join(outRootPath, 'pnext-pages-compat'),
-  )
-  const workspaceRoot = canonicalRoot(
-    config.workspaceRoot
-      ? path.resolve(root, config.workspaceRoot)
-      : (findWorkspaceRoot(root) ?? root),
   )
 
   return {
@@ -173,6 +176,7 @@ export async function loadConfig(
     assetPrefix: merged.assetPrefix ?? merged.basePath,
     root,
     workspaceRoot,
+    workspaceRootExplicit: config.workspaceRoot !== undefined,
     appPath,
     publicPath: path.resolve(root, 'public'),
     // Dev owns `<outRoot>/dev` exclusively so a concurrent `pnext build` — which
@@ -219,6 +223,7 @@ async function loadReleasedConfig(
 
 // One row per enum-valued config field; validateConfig checks them all.
 const enumFields: readonly [keyof PNextConfig, readonly unknown[]][] = [
+  ['output', ['export']],
   ['prefetch', PREFETCH_MODES],
 ]
 
@@ -229,6 +234,11 @@ function validateConfig(config: PNextConfig) {
     const list = allowed.map(v => (typeof v === 'string' ? `'${v}'` : String(v))).join(', ')
     throw new Error(
       `Invalid pnext config: '${field}' must be one of ${list} (received ${JSON.stringify(value)}).`,
+    )
+  }
+  if (config.output === 'export' && config.compat?.next) {
+    throw new Error(
+      `Invalid pnext config: core 'output' cannot be combined with 'compat.next'; use next.config output: 'export'.`,
     )
   }
 }
@@ -249,6 +259,55 @@ function canonicalRoot(dir: string) {
   } catch {
     return dir
   }
+}
+
+/** Whether `descendant` is strictly inside `ancestor`. */
+function isStrictlyInside(ancestor: string, descendant: string) {
+  const relative = path.relative(ancestor, descendant)
+  return (
+    relative !== '' &&
+    relative !== '..' &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  )
+}
+
+/** The nearest ancestor holding a lockfile or workspace marker: Next's closest root candidate. */
+function lockfileRoot(root: string) {
+  const markers = [
+    'pnpm-workspace.yaml',
+    'pnpm-lock.yaml',
+    'package-lock.json',
+    'yarn.lock',
+    'bun.lock',
+    'bun.lockb',
+  ]
+  for (let dir = root; ; dir = path.dirname(dir)) {
+    if (markers.some(name => existsSync(path.join(dir, name)))) return dir
+    if (path.dirname(dir) === dir) return root
+  }
+}
+
+/**
+ * The out root lies inside the app or its workspace and never contains the app, as Next requires of
+ * distDir. The containment rule is what keeps a build from clearing the app; the boundary only follows Next.
+ */
+function verifyOutRoot(
+  outDir: string,
+  root: string,
+  workspaceRoot: string,
+  fromNextConfig: boolean,
+) {
+  const app = canonicalRoot(root)
+  const outRoot = path.resolve(app, outDir)
+  const boundaries = [app, workspaceRoot, lockfileRoot(app)]
+  const inside = boundaries.some(boundary => isStrictlyInside(boundary, outRoot))
+  if (inside && outRoot !== app && !isStrictlyInside(outRoot, app)) return
+  throw new Error(
+    fromNextConfig
+      ? `The configured distDir should be inside of the application directory or the workspace containing it, and must not contain the application directory itself:\n\n  distDir:        ${outRoot}\n  application:    ${app}\n  workspace root: ${workspaceRoot}\n\nRead more: https://nextjs.org/docs/messages/invalid-dist-dir`
+      : `Invalid pnext config: outDir must be inside the app or its workspace and must not contain the app (outDir: ${outRoot}, app: ${app}).`,
+  )
 }
 
 function stripUndefined<T extends object>(value: T): T {

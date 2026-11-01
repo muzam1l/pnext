@@ -371,7 +371,7 @@ export function cachedData(
     const tagStale = tagsStaleSince(entry.tags, entry.storedAt)
     if (!tagStale && !dataCacheEntryExpired(entry)) return entry.value
     // ISR regeneration renders refetch expired entries inline.
-    if (cacheMetaStorage.getStore()?.blockingStaleFetches !== true) {
+    if (meta?.blockingStaleFetches !== true && !insideDataCacheProducer()) {
       if (!entry.refreshing) {
         entry.refreshing = true
         void storeDataCacheEntry(key, produce, options, entry)
@@ -558,6 +558,7 @@ export function recordCacheTags(tags: readonly string[]) {
   // tags of every fetch made inside it, so revalidateTag invalidates the entry).
   const producerTags = producerTagsStorage.getStore()
   if (producerTags) for (const tag of tags) producerTags.add(tag)
+  if (useCacheMetadataSinks.tags?.(tags)) return
   const meta = cacheMetaStorage.getStore()
   if (!meta) return
   for (const tag of tags) meta.tags.add(tag)
@@ -569,16 +570,21 @@ export function recordCacheTags(tags: readonly string[]) {
 // that ENTRY's cacheLife too, matching Next: a `fetch(..., { next:
 // { revalidate: 1 } })` inside 'use cache' bounds the cache entry at 1s, not
 // just the surrounding route.
-const useCacheRevalidateSink = revalidateGlobal('useCacheRevalidateSink', () => ({
-  current: undefined as ((seconds: number) => void) | undefined,
+const useCacheMetadataSinks = revalidateGlobal('useCacheMetadataSinks', () => ({
+  revalidate: undefined as ((seconds: number) => boolean) | undefined,
+  tags: undefined as ((tags: readonly string[]) => boolean) | undefined,
 }))
 
-export function setUseCacheRevalidateSink(sink: (seconds: number) => void) {
-  useCacheRevalidateSink.current = sink
+export function setUseCacheRevalidateSink(sink: (seconds: number) => boolean) {
+  useCacheMetadataSinks.revalidate = sink
+}
+
+export function setUseCacheTagSink(sink: (tags: readonly string[]) => boolean) {
+  useCacheMetadataSinks.tags = sink
 }
 
 export function recordCacheRevalidate(seconds: number) {
-  useCacheRevalidateSink.current?.(seconds)
+  if (useCacheMetadataSinks.revalidate?.(seconds)) return
   const meta = cacheMetaStorage.getStore()
   if (!meta) return
   meta.revalidateSeconds =

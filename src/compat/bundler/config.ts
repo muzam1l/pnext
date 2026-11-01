@@ -8,6 +8,7 @@
 // ---------------------------------------------------------------------------
 
 import { getNextConfig } from '../next/config-loader'
+import path from 'node:path'
 import type { ModularizeRule } from './modularize-imports'
 
 /** A predefined built-in set kept external server-side (Next ships this list). */
@@ -451,6 +452,10 @@ export function turbopackResolveAlias(): Record<string, string> {
   const out: Record<string, string> = {}
   for (const [key, value] of Object.entries(alias as Record<string, unknown>)) {
     if (typeof value === 'string') out[key] = value
+    else if (value === false) out[key] = EMPTY_ALIAS_MODULE
   }
   return out
 }
+
+export const EMPTY_ALIAS_MODULE = path.join(import.meta.dirname, 'empty.cjs')
+export const EMPTY_ALIAS_DYNAMIC_MODULE = 'data:text/javascript,export default {}'

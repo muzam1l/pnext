@@ -53,6 +53,7 @@ export function onNavigationStart(listener: () => void) {
 }
 
 export function emitNavigationStart() {
+  routerState.navigationStarts += 1
   for (const listener of [...navigationStartListeners]) listener()
 }
 

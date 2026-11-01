@@ -20,6 +20,7 @@ import {
   registerRequestInterceptors,
   setRequestExtensions,
   type RequestInterceptor,
+  reportRequestError,
 } from '../../extensions'
 import { nextCompatEnabled } from '../aliases'
 import { getNextConfig } from '../next/config-loader'
@@ -42,7 +43,16 @@ export function registerLifecycleBootHooks(config: ResolvedConfig): void {
 
   // The user's onRequestError hook (once instrumentation has loaded) receives
   // every real request error; control-flow errors are filtered in the funnel.
-  setRequestExtensions({ onRequestError: reportRequestErrorToUser })
+  setRequestExtensions({
+    onRequestError: reportRequestErrorToUser,
+    beforeProxy: () => instrumentationReady(),
+    onResponseBodyError: (error, requestInfo, context) =>
+      reportRequestError(
+        new Error('failed to pipe response', { cause: error }),
+        requestInfo,
+        context,
+      ),
+  })
 
   // Keep the server alive when an SSR error escapes as an unhandled rejection
   // (a client component that throws during server render — preact resolves the

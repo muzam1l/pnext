@@ -1,9 +1,12 @@
 import {
+  createRevalidateDuringRenderError,
+  createRevalidateInCachedFunctionError,
+} from '../cache/build-flags'
+import {
   bumpRevalidationEvent,
   cachedData,
   currentRenderCacheMeta,
   insideDataCacheProducer,
-  insideUnstableCacheProducer,
   markPathRevalidated,
   markTagRevalidated,
   markTagStale,
@@ -15,7 +18,7 @@ import { recordUseCacheLife, recordUseCacheTags } from '../cache/use-cache'
 import { currentRequest, getWorkUnit } from '../../request/context'
 import { getNextConfig } from './config-loader'
 import { isPrerendering, PostponeError } from '../../render/ppr'
-export { io } from '../ppr/io'
+export { io, navigation, prefetch } from '../ppr/io'
 
 export function refresh() {
   const phase = getWorkUnit()?.phase
@@ -35,31 +38,23 @@ export const unstable_refresh = refresh
  */
 function assertRevalidateOutsideRender(expression: string): void {
   const route = currentRenderCacheMeta()?.route ?? '/'
-  const suffix =
-    'which is unsupported. To ensure revalidation is performed consistently it must always ' +
-    'happen outside of renders and cached functions. See more info here: ' +
-    'https://nextjs.org/docs/app/building-your-application/rendering/static-and-dynamic#dynamic-rendering'
   if (insideDataCacheProducer()) {
-    throw new Error(
-      insideUnstableCacheProducer()
-        ? `Route ${route} used "${expression}" inside a function cached with "unstable_cache(...)" ${suffix}`
-        : `Route ${route} used "${expression}" inside a "use cache" ${suffix}`,
-    )
+    throw createRevalidateInCachedFunctionError(route, expression)
   }
   // Live request renders only: build prerenders (and their after() drains,
   // which run with the work-unit phase still 'render') keep their existing
   // skip-to-dynamic behavior rather than throwing here.
   if (getWorkUnit()?.phase !== 'render' || isPrerendering()) return
-  throw new Error(`Route ${route} used "${expression}" during render ${suffix}`)
+  throw createRevalidateDuringRenderError(route, expression)
 }
 
 export function revalidatePath(path: string, type?: 'page' | 'layout') {
-  assertRevalidateOutsideRender(`revalidatePath ${path}`)
+  assertRevalidateOutsideRender(`revalidatePath(${JSON.stringify(path)})`)
   markPathRevalidated(path, type)
 }
 
 export function revalidateTag(tag: string, profile?: string | CacheLifeProfile) {
-  assertRevalidateOutsideRender(`revalidateTag ${tag}`)
+  assertRevalidateOutsideRender(`revalidateTag(${JSON.stringify(tag)})`)
   if (profile === undefined) {
     console.warn(
       'Warning: "revalidateTag" without the second argument is now deprecated. Use updateTag(tag) for read-your-writes semantics, or pass a cache profile (e.g. revalidateTag(tag, \'max\')).',
@@ -98,7 +93,7 @@ export function updateTag(tag: string) {
 // Newer names for the same operations.
 export const unstable_expirePath = revalidatePath
 export const unstable_expireTag = (tag: string) => {
-  assertRevalidateOutsideRender(`expireTag ${tag}`)
+  assertRevalidateOutsideRender(`expireTag(${JSON.stringify(tag)})`)
   markTagRevalidated(tag)
 }
 export const expirePath = revalidatePath
@@ -159,6 +154,7 @@ interface CacheLifeProfile {
 }
 
 const DEFAULT_EXPIRE_TIME = 31536000 // one year, Next's default expireTime.
+const INFINITE_CACHE = 0xfffffffe
 
 const builtInCacheLifeProfiles: Record<string, CacheLifeProfile> = {
   default: { revalidate: 900, expire: DEFAULT_EXPIRE_TIME, stale: 300 },
@@ -181,8 +177,16 @@ function resolveCacheLifeProfile(name: string): CacheLifeProfile | undefined {
   const merged = { ...builtIn, ...custom }
   return {
     ...merged,
-    expire: merged.expire ?? expireTime,
+    ...(merged.stale !== undefined ? { stale: normalizeCacheLifeValue(merged.stale) } : {}),
+    ...(merged.revalidate !== undefined
+      ? { revalidate: normalizeCacheLifeValue(merged.revalidate) }
+      : {}),
+    expire: normalizeCacheLifeValue(merged.expire ?? expireTime),
   }
+}
+
+function normalizeCacheLifeValue(value: number): number {
+  return value === Infinity ? INFINITE_CACHE : value
 }
 
 export function cacheLife(
@@ -192,9 +196,16 @@ export function cacheLife(
     typeof profile === 'string'
       ? resolveCacheLifeProfile(profile)
       : {
-          revalidate: typeof profile?.revalidate === 'number' ? profile.revalidate : undefined,
-          expire: typeof profile?.expire === 'number' ? profile.expire : undefined,
-          stale: typeof profile?.stale === 'number' ? profile.stale : undefined,
+          revalidate:
+            typeof profile?.revalidate === 'number'
+              ? normalizeCacheLifeValue(profile.revalidate)
+              : undefined,
+          expire:
+            typeof profile?.expire === 'number'
+              ? normalizeCacheLifeValue(profile.expire)
+              : undefined,
+          stale:
+            typeof profile?.stale === 'number' ? normalizeCacheLifeValue(profile.stale) : undefined,
         }
   if (!resolved) return
   const { revalidate, expire, stale } = resolved

@@ -1,14 +1,15 @@
 // FIRST-PAINT half of the client error runtime. Everything ./install does only ever runs once
-// something has already thrown, so it rides the router runtime's deferred tier instead of first
-// paint. The in-tree ClientErrorBoundary stays eager: it renders.
+// something has already thrown, so it loads on idle instead of at first paint. The in-tree
+// ClientErrorBoundary stays eager: it renders.
 //
 // What DOES stay eager is a pair of capture-only listeners: an error thrown during hydration or in
-// a first-paint effect fires long before the idle tier lands, and Next still shows global-error for
-// it. They buffer the value, pull ./install right away, and hand it over - so a healthy page still
-// never fetches the chunk.
+// a first-paint effect fires before the idle load lands, and Next still shows global-error for it.
+// They buffer the value, pull ./install right away, and hand it over.
 import { options } from 'preact'
-import { registerDeferredInstall } from '../../../client/router'
 import type { InstallOptions } from './install'
+import { registerDeferredInstall } from '../../../client/router'
+
+declare const __PNEXT_DEFER_LINKLESS_ROUTER__: boolean | undefined
 
 // Same key ./install reads (Symbol.for crosses the chunk boundary): only values the preact
 // boundary walk rethrew — a ROOT RENDER failure, Next's global-error case — may replace the
@@ -39,6 +40,16 @@ function tagRenderEscapes(): void {
 }
 
 type ErrorRuntime = typeof import('./install')
+
+let installedRuntime: (() => Promise<ErrorRuntime>) | undefined
+
+/**
+ * The error runtime, installed with this page's options first: an escalation must see the app's
+ * global-error component even when no idle load ever ran the install.
+ */
+export function errorRuntime(): Promise<ErrorRuntime> {
+  return installedRuntime?.() ?? import('./install')
+}
 
 export function installClientErrors(installOptions: InstallOptions = {}): void {
   if (!process.browser && typeof window === 'undefined') return
@@ -79,12 +90,18 @@ export function installClientErrors(installOptions: InstallOptions = {}): void {
   window.addEventListener('error', onError)
   window.addEventListener('unhandledrejection', onRejection)
 
+  installedRuntime = load
   // A streamed server error has already thrown: Next shows its boundary while hydrating, not on idle.
   const pullForStreamError = () => {
     if (document.querySelector('pnext-error')) void load()
   }
   pullForStreamError()
   document.addEventListener('DOMContentLoaded', pullForStreamError)
-
-  registerDeferredInstall(load)
+  // Idle, not with the router: a page without links never loads that, yet errors must still reach
+  // error.js and global-error synchronously once the page is interactive.
+  if (typeof __PNEXT_DEFER_LINKLESS_ROUTER__ !== 'undefined' && __PNEXT_DEFER_LINKLESS_ROUTER__) {
+    if (typeof requestIdleCallback === 'function')
+      requestIdleCallback(() => void load().catch(() => undefined), { timeout: 1000 })
+    else setTimeout(() => void load().catch(() => undefined), 1)
+  } else registerDeferredInstall(() => load().then(() => undefined))
 }

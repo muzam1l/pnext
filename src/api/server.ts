@@ -106,7 +106,7 @@ export class NextResponse extends Response {
   static redirect(url: string | URL, init: number | ResponseInit = 307) {
     const responseInit = typeof init === 'number' ? { status: init } : init
     const headers = new Headers(responseInit.headers)
-    headers.set('location', String(url))
+    headers.set('location', redirectHref(url))
     return new NextResponse(null, {
       ...responseInit,
       status: responseInit.status ?? 307,
@@ -224,6 +224,16 @@ function defineMeta(response: NextResponse, meta: NextResponseMeta) {
 
 function requestMeta(init: NextResponseInit | undefined): Pick<NextResponseMeta, 'requestHeaders'> {
   return init?.request?.headers ? { requestHeaders: new Headers(init.request.headers) } : {}
+}
+
+// Like Next's NextURL, a redirect to one carries its basePath; the wrapped pathname is app-relative.
+function redirectHref(url: string | URL) {
+  if (typeof url === 'string') return url
+  const basePath = (url as Partial<NextURL>).basePath
+  if (!basePath) return url.href
+  const href = new URL(url.href)
+  href.pathname = url.pathname === '/' ? basePath : `${basePath}${url.pathname}`
+  return href.href
 }
 
 function createNextUrl(url: string | URL): NextURL {

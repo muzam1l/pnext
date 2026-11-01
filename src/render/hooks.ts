@@ -11,8 +11,16 @@
 // compat module.
 
 import type { ResolvedConfig } from '../config'
-import type { Metadata, MetadataLink, PageProps, Viewport } from '../types'
+import type {
+  Metadata,
+  MetadataLink,
+  PageProps,
+  RouteManifestEntry,
+  RouteParamValue,
+  Viewport,
+} from '../types'
 import { restoreWithExtensionHost } from '../extensions'
+import type { MetadataEntry } from './metadata'
 
 // ---------------------------------------------------------------------------
 // Compat enablement gates (pure config reads; kept in core so render never
@@ -202,6 +210,52 @@ export interface MetadataExtensions {
     props: PageProps,
   ) => Promise<Viewport | undefined>
   shouldRenderMetadataInBody: (input: { config: ResolvedConfig; request?: Request }) => boolean
+  /** Which parallel-route slot branches feed the head, and which deliver errors where they render. */
+  slotHead: (input: SlotHeadInput) => SlotHeadPolicy | Promise<SlotHeadPolicy>
+}
+
+/** One matched parallel-route slot branch, as the renderer reads it. */
+export interface SlotHeadBranch {
+  slotDir: string
+  /** The branch defines `metadata`/`generateMetadata` (not just a viewport or files). */
+  hasSource: boolean
+  runtime: boolean
+  /** Depth below the slot dir of the deepest head definition (exports or files); -1 when none. */
+  definitionDepth: number
+  /** Depth of the branch's page below the slot dir. */
+  pageDepth: number
+  /** The children branch defines head tags below this branch's owner layout. */
+  childrenDefinesHead: boolean
+  /** Started on first call, then memoized; rejections are observed at creation. */
+  metadata: () => Promise<MetadataEntry[]>
+  viewport: () => Promise<Viewport[]>
+}
+
+export interface SlotHeadInput {
+  /** The route renders only named slots: no children branch exists. */
+  namedSlotsOnly: boolean
+  /** The response feeds the client router rather than a document load. */
+  routerPayload: boolean
+  /** Core's own policy: the first branch defining metadata, errors propagating. */
+  fallback: () => Promise<SlotHead>
+  /** Inspect every branch's head definitions (modules and metadata files), starting nothing yet. */
+  analyze: () => Promise<SlotHeadBranch[]>
+  logError: (error: unknown) => void
+}
+
+export interface SlotHead {
+  entries: MetadataEntry[]
+  viewport: Viewport[]
+  runtime: boolean
+}
+
+export interface SlotHeadPolicy {
+  /** Outcomes rendered slots carry, keyed by slot dir: a rejection surfaces where the slot renders. */
+  outlets: Map<string, Promise<unknown>>
+  /** The head's slot contribution, once the render knows which slot dirs rendered. */
+  head: (rendered: ReadonlySet<string>) => Promise<SlotHead>
+  /** Report (instead of throw) a failing metadata image file inside a slot. */
+  onSlotFileError?: (error: unknown) => void
 }
 
 const metadataExtensions: Partial<MetadataExtensions> = {}
@@ -268,6 +322,20 @@ export function setDocumentScriptExtensions(overrides: Partial<DocumentScriptExt
 
 export interface StaticParamsExtensions {
   normalizeModule: (module: Record<string, unknown>) => Record<string, unknown>
+  validateResult?: (
+    config: ResolvedConfig,
+    route: RouteManifestEntry,
+    file: string,
+    result: unknown,
+    checkComplete: boolean,
+  ) => void
+  /** The route's per-param matching policy from its layout/page modules, if any declare one. */
+  resolveParamMatching: (
+    config: ResolvedConfig,
+    route: RouteManifestEntry,
+    modules: { file: string; module: Record<string, unknown> }[],
+    generated: Record<string, RouteParamValue>[],
+  ) => Promise<Record<string, string> | undefined>
 }
 
 const staticParamsExtensions: StaticParamsExtensions = {
@@ -275,6 +343,7 @@ const staticParamsExtensions: StaticParamsExtensions = {
     typeof module.params === 'function' || typeof module.generateStaticParams !== 'function'
       ? module
       : { ...module, params: module.generateStaticParams },
+  resolveParamMatching: () => Promise.resolve(undefined),
 }
 
 export function getStaticParamsExtensions(): StaticParamsExtensions {
@@ -333,6 +402,8 @@ export function setActionModuleExtensions(overrides: Partial<ActionModuleExtensi
 // work and their result returned verbatim.
 
 export interface RenderSpanExtensions {
+  onClientModuleLoad?: () => (() => void) | undefined
+  onClientComponent?: (id: string) => void
   /**
    * Wrap the body render (renderTree) so compat emits the
    * `render route (app) <route>` span (`AppRender.getBodyResult`). `route` is
@@ -346,6 +417,9 @@ export interface RenderSpanExtensions {
    * sibling of the render-body span under the root). Default: run `fn`.
    */
   withFindPageComponentsSpan: <T>(route: string, fn: () => Promise<T>) => Promise<T>
+
+  /** Wrap app component-tree construction in the createComponentTree span. */
+  withComponentTreeSpan: <T>(fn: () => Promise<T>) => Promise<T>
 
   /**
    * Emit a cheap leaf `resolve segment modules` span
@@ -367,6 +441,7 @@ export interface RenderSpanExtensions {
 const renderSpanExtensions: RenderSpanExtensions = {
   withRenderBodySpan: (_route, fn) => fn(),
   withFindPageComponentsSpan: (_route, fn) => fn(),
+  withComponentTreeSpan: fn => fn(),
   emitResolveSegmentSpan: () => undefined,
   withRouteHandlerSpan: (_route, fn) => fn(),
 }
