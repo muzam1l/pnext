@@ -1,11 +1,7 @@
-# Private checks: the native test suite (`tests`) and the Next.js conformance fold (`conform`) live in
-# muzam1l/pnext-workspace. The job here dispatches its workspace workflow for this PR's head, waits,
-# prints the run's report. The job is the PR check; it passes only when every test passes.
-# - tests: every push from an owner, member or collaborator; a guest PR once a maintainer adds `ok-to-test`.
-# - conform: only when a maintainer adds the `conform` label; re-run it from this job.
-# Runs use the workspace branch named like the PR branch when one exists, else main.
+# Native test suite: every push from an owner, member or collaborator; a guest PR once a maintainer adds `ok-to-test`.
+# Runs in muzam1l/pnext-workspace on the branch named like the PR branch, else main, and passes only when every test passes.
 # pull_request_target so fork PRs get secrets; nothing here checks out or runs PR code.
-name: workspace
+name: tests
 
 on:
   pull_request_target:
@@ -14,23 +10,20 @@ on:
 permissions: {}
 
 jobs:
-  # One check per event: the `conform` label runs conform; `ok-to-test` or a push from a trusted author runs tests.
-  check:
+  tests:
     if: >-
-      github.event.action == 'labeled'
-      && contains(fromJSON('["ok-to-test","conform"]'), github.event.label.name)
+      github.event.action == 'labeled' && github.event.label.name == 'ok-to-test'
       || github.event.action != 'labeled'
       && (contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
       || contains(github.event.pull_request.labels.*.name, 'ok-to-test'))
-    name: ${{ github.event.label.name == 'conform' && 'conform' || 'tests' }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     concurrency:
-      group: ${{ github.event.label.name == 'conform' && 'conform' || 'tests' }}-${{ github.event.pull_request.number }}
-      cancel-in-progress: ${{ github.event.label.name != 'conform' }}
+      group: tests-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     env:
       GH_REPO: muzam1l/pnext-workspace
-      CHECK: ${{ github.event.label.name == 'conform' && 'conform' || 'tests' }}
+      CHECK: tests
       SHA: ${{ github.event.pull_request.head.sha }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:

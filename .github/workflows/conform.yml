@@ -1,0 +1,76 @@
+# Next.js conformance fold: runs when a maintainer adds the `conform` label; re-run it from this job.
+# Runs in muzam1l/pnext-workspace on the branch named like the PR branch, else main, and passes only when every test passes.
+# pull_request_target so fork PRs get secrets; nothing here checks out or runs PR code.
+name: conform
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  conform:
+    if: >-
+      github.event.label.name == 'conform'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    concurrency:
+      group: conform-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    env:
+      GH_REPO: muzam1l/pnext-workspace
+      CHECK: conform
+      SHA: ${{ github.event.pull_request.head.sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Run in pnext-workspace
+        env:
+          GH_TOKEN: ${{ secrets.WORKSPACE_TOKEN }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          KEY: pnext-pr${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          # Run on the workspace branch named like the PR branch; if it doesn't exist, run on main.
+          dispatch() { gh workflow run "$CHECK.yml" --ref "$1" -f pnext_sha="$SHA" -f run_key="$KEY"; }
+          WS_REF=$HEAD_REF
+          if ! dispatch "$WS_REF" 2> dispatch.err; then
+            grep -q 'No ref found' dispatch.err || { cat dispatch.err; exit 1; }
+            WS_REF=main
+            dispatch "$WS_REF"
+          fi
+          echo "workspace ref: $WS_REF"
+          for _ in $(seq 1 24); do
+            sleep 5
+            RUN_ID=$(gh run list --workflow "$CHECK.yml" --event workflow_dispatch --limit 20 \
+              --json databaseId,displayTitle --jq ".[] | select(.displayTitle == \"$CHECK $KEY\") | .databaseId")
+            [ -n "$RUN_ID" ] && break
+          done
+          [ -n "$RUN_ID" ] || { echo "dispatched run never appeared"; exit 1; }
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          echo "workspace run: https://github.com/$GH_REPO/actions/runs/$RUN_ID"
+          while [ "$(gh run view "$RUN_ID" --json status --jq .status)" != completed ]; do sleep 30; done
+          echo "CONCLUSION=$(gh run view "$RUN_ID" --json conclusion --jq .conclusion)" >> "$GITHUB_ENV"
+          gh run download "$RUN_ID" -n "$CHECK-report" -D report || true
+
+      - name: Report
+        if: ${{ !cancelled() }}
+        run: |
+          if [ ! -f report/report.md ]; then
+            mkdir -p report
+            echo "no report (workspace run ${CONCLUSION:-did not finish})" > report/report.md
+          fi
+          cat report/report.md
+          cat report/report.md >> "$GITHUB_STEP_SUMMARY"
+          SUMMARY=$(head -1 report/report.md | sed 's/^[^ ]* //')
+          if [ "$CHECK" = conform ]; then
+            head -1 report/report.md | grep -q '^✅' && PASS=1
+          else
+            [ "$CONCLUSION" = success ] && PASS=1
+          fi
+          if [ -n "${PASS:-}" ]; then echo "::notice title=$CHECK::$SUMMARY"; else echo "::error title=$CHECK::$SUMMARY"; exit 1; fi
+
+      - name: Cancel workspace run
+        if: cancelled() && env.RUN_ID
+        env:
+          GH_TOKEN: ${{ secrets.WORKSPACE_TOKEN }}
+        run: gh run cancel "$RUN_ID" || true
