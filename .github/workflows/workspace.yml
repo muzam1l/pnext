@@ -1,6 +1,7 @@
 # Private checks: the native test suite (`tests`) and the Next.js conformance fold (`conform`) live in
 # muzam1l/pnext-workspace. The job here dispatches its workspace workflow for this PR's head, waits,
-# prints the run's report in this log and sets the matching commit status on the PR head.
+# prints the run's report and sets the matching check on the PR head. `tests` passes or fails; `conform`
+# is green only when every test passes, otherwise neutral.
 # - tests: every push from an owner, member or collaborator; a guest PR once a maintainer adds `ok-to-test`.
 # - conform: only when a maintainer adds the `conform` label; re-run it from this job.
 # Runs use the workspace branch named like the PR branch when one exists, else main.
@@ -12,7 +13,7 @@ on:
     types: [opened, reopened, synchronize, labeled]
 
 permissions:
-  statuses: write
+  checks: write
 
 jobs:
   # One check per event: the `conform` label runs conform; `ok-to-test` or a push from a trusted author runs tests.
@@ -35,12 +36,14 @@ jobs:
       SHA: ${{ github.event.pull_request.head.sha }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
-      - name: Pending status
+      - name: Start check
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api --silent -X POST "repos/${{ github.repository }}/statuses/$SHA" \
-            -f state=pending -f context="$CHECK" -f description="running in pnext-workspace" -f target_url="$RUN_URL"
+          CHECK_RUN=$(gh api -X POST "repos/${{ github.repository }}/check-runs" -f name="$CHECK" -f head_sha="$SHA" \
+            -f status=in_progress -f details_url="$RUN_URL" -f "output[title]=running in pnext-workspace" \
+            -f "output[summary]=Running in pnext-workspace." --jq .id)
+          echo "CHECK_RUN=$CHECK_RUN" >> "$GITHUB_ENV"
 
       - name: Run in pnext-workspace
         env:
@@ -71,25 +74,32 @@ jobs:
           gh run download "$RUN_ID" -n "$CHECK-report" -D report || true
 
       - name: Report
-        if: always() && env.RUN_ID
+        if: ${{ !cancelled() && env.CHECK_RUN }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -f report/report.md ]; then
-            cat report/report.md
-            cat report/report.md >> "$GITHUB_STEP_SUMMARY"
-            SUMMARY=$(head -1 report/report.md | sed 's/^[^ ]* //' | cut -c1-140)
-          else
-            SUMMARY="no report (workspace run ${CONCLUSION:-unfinished})"
-            echo "$SUMMARY"
+          if [ ! -f report/report.md ]; then
+            mkdir -p report
+            echo "no report (workspace run ${CONCLUSION:-did not finish})" > report/report.md
           fi
-          STATE=$([ "$CONCLUSION" = success ] && echo success || echo failure)
-          gh api --silent -X POST "repos/${{ github.repository }}/statuses/$SHA" \
-            -f state="$STATE" -f context="$CHECK" -f description="$SUMMARY" -f target_url="$RUN_URL"
-          [ "$STATE" = success ]
+          cat report/report.md
+          cat report/report.md >> "$GITHUB_STEP_SUMMARY"
+          SUMMARY=$(head -1 report/report.md | sed 's/^[^ ]* //' | cut -c1-140)
+          if [ "$CHECK" = conform ]; then
+            VERDICT=$(head -1 report/report.md | grep -q '^✅' && echo success || echo neutral)
+          else
+            VERDICT=$([ "$CONCLUSION" = success ] && echo success || echo failure)
+          fi
+          gh api --silent -X PATCH "repos/${{ github.repository }}/check-runs/$CHECK_RUN" -f status=completed \
+            -f conclusion="$VERDICT" -f "output[title]=$SUMMARY" -F "output[summary]=@report/report.md"
+          [ "$VERDICT" != failure ]
 
       - name: Cancel workspace run
-        if: cancelled() && env.RUN_ID
+        if: cancelled() && env.CHECK_RUN
         env:
-          GH_TOKEN: ${{ secrets.WORKSPACE_TOKEN }}
-        run: gh run cancel "$RUN_ID" || true
+          GH_TOKEN: ${{ github.token }}
+          WS_TOKEN: ${{ secrets.WORKSPACE_TOKEN }}
+        run: |
+          [ -z "$RUN_ID" ] || GH_TOKEN=$WS_TOKEN gh run cancel "$RUN_ID" || true
+          gh api --silent -X PATCH "repos/${{ github.repository }}/check-runs/$CHECK_RUN" \
+            -f status=completed -f conclusion=cancelled || true
