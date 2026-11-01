@@ -203,23 +203,25 @@ const RUNG_LABELS: Record<string, string> = {
   'island (compat.next)': 'JS: with Next.js compatibility',
 }
 
+// Every rung gets a row, so a runtime ladder that never ran reads as not measured.
 const ladder: string[][] = []
-for (const rung of head.runtime) {
-  const before = base.runtime.find(item => item.name === rung.name)
-  const deltas = [delta(before?.gzip, rung.gzip)]
+for (const [name, label] of Object.entries(RUNG_LABELS)) {
+  const before = base.runtime.find(item => item.name === name)
+  const after = head.runtime.find(item => item.name === name)
+  const deltas = [delta(before?.gzip, after?.gzip)]
   headline.push([
-    `${mark(deltas, 1)} ${RUNG_LABELS[rung.name] ?? rung.name}`,
+    `${mark(deltas, 1)} ${label}`,
     bytes(before?.gzip),
-    bytes(rung.gzip),
+    bytes(after?.gzip),
     deltaCell(deltas, 1),
     '—',
   ])
   ladder.push([
-    RUNG_LABELS[rung.name] ?? rung.name,
-    `${bytes(before?.gzip)} / ${bytes(rung.gzip)}`,
-    deltaCell([delta(before?.gzip, rung.gzip)], 1),
-    `${bytes(before?.deferredGzip)} / ${bytes(rung.deferredGzip)}`,
-    deltaCell([delta(before?.deferredGzip, rung.deferredGzip)], 1),
+    label,
+    `${bytes(before?.gzip)} / ${bytes(after?.gzip)}`,
+    deltaCell(deltas, 1),
+    `${bytes(before?.deferredGzip)} / ${bytes(after?.deferredGzip)}`,
+    deltaCell([delta(before?.deferredGzip, after?.deferredGzip)], 1),
   ])
 }
 
@@ -233,14 +235,14 @@ const runs = pnextOf(head, 'ssr')?.runs
 const flagged = headline.filter(row => !row[0]!.startsWith('✅'))
 const verdict = flagged.length
   ? {
-      conclusion: 'neutral',
+      conclusion: 'failure',
       title: `${flagged.length} of ${headline.length} worse than ${baseName} or not measured`,
     }
   : { conclusion: 'success', title: `same or better than ${baseName}` }
 const verdictFile = flag('verdict')
 if (verdictFile) writeFileSync(verdictFile, `${JSON.stringify(verdict)}\n`)
 const markdown = [
-  `### Bench ${flagged.length ? '➖' : '✅'} ${verdict.title}`,
+  `### Bench ${flagged.length ? '❌' : '✅'} ${verdict.title}`,
   '',
   `${short(flag('head-sha'))} vs \`${baseName}\` ${short(flag('base-sha'))}` +
     `${runs ? `, ${runs} run${runs === 1 ? '' : 's'} each` : ''}. Change per app: hello-world / ssr / dashboard.`,

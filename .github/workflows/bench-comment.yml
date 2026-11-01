@@ -9,7 +9,6 @@ on:
 
 permissions:
   actions: read
-  checks: write
   pull-requests: write
 
 jobs:
@@ -41,11 +40,3 @@ jobs:
             const mine = comments.find(c => c.user.type === 'Bot' && c.body.startsWith('<!-- bench -->'));
             if (mine) await github.rest.issues.updateComment({ ...context.repo, comment_id: mine.id, body });
             else await github.rest.issues.createComment({ ...context.repo, issue_number: pr.number, body });
-            // The `bench` check: success only when nothing regressed, otherwise neutral; drift never fails a PR.
-            let verdict = { conclusion: 'neutral', title: 'bench did not finish' };
-            try { verdict = JSON.parse(fs.readFileSync('report/verdict.json', 'utf8')); } catch {}
-            await github.rest.checks.create({
-              ...context.repo, name: 'bench', head_sha: run.head_sha, status: 'completed',
-              conclusion: verdict.conclusion === 'success' ? 'success' : 'neutral',
-              output: { title: String(verdict.title).slice(0, 200), summary: body },
-            });

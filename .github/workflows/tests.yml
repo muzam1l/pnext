@@ -7,7 +7,8 @@ on:
   pull_request_target:
     types: [opened, reopened, synchronize, labeled]
 
-permissions: {}
+permissions:
+  checks: write
 
 jobs:
   tests:
@@ -57,6 +58,8 @@ jobs:
 
       - name: Report
         if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ ! -f report/report.md ]; then
             mkdir -p report
@@ -65,6 +68,9 @@ jobs:
           cat report/report.md
           cat report/report.md >> "$GITHUB_STEP_SUMMARY"
           SUMMARY=$(head -1 report/report.md | sed 's/^[^ ]* //')
+          # The PR row shows this job's own check title: the pass/fail counts.
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/check-runs/${{ job.check_run_id }}" \
+            -f "output[title]=$SUMMARY" -F "output[summary]=@report/report.md" >/dev/null || true
           if [ "$CHECK" = conform ]; then
             head -1 report/report.md | grep -q '^✅' && PASS=1
           else

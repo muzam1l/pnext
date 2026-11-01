@@ -25,8 +25,11 @@ concurrency:
 
 jobs:
   bench:
-    name: measure
+    name: bench
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -100,6 +103,21 @@ jobs:
         with:
           name: bench-report
           path: .tmp/bench-report
+      # The PR's one bench check: red when anything is worse than the base or wasn't measured.
+      - name: Verdict
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE=$(jq -r .title .tmp/bench-report/verdict.json 2>/dev/null || echo 'bench did not finish')
+          # Shown on the PR row; a fork PR's read-only token can't set it, the job result still shows.
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/check-runs/${{ job.check_run_id }}" \
+            -f "output[title]=$TITLE" -F "output[summary]=@.tmp/bench-report/comment.md" >/dev/null || true
+          if jq -e '.conclusion == "success"' .tmp/bench-report/verdict.json >/dev/null 2>&1; then
+            echo "::notice title=bench::$TITLE"
+          else
+            echo "::error title=bench::$TITLE"; exit 1
+          fi
       - name: Upload recorded baselines
         if: inputs.record
         uses: actions/upload-artifact@v4
