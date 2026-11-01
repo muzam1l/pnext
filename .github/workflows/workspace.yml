@@ -1,5 +1,5 @@
 # Private checks: the native test suite (`tests`) and the Next.js conformance fold (`conform`) live in
-# muzam1l/pnext-workspace. Each job here dispatches its workspace workflow for this PR's head, waits,
+# muzam1l/pnext-workspace. The job here dispatches its workspace workflow for this PR's head, waits,
 # prints the run's report in this log and sets the matching commit status on the PR head.
 # - tests: every push from an owner, member or collaborator; a guest PR once a maintainer adds `ok-to-test`.
 # - conform: only when a maintainer adds the `conform` label; re-run it from this job.
@@ -15,46 +15,23 @@ permissions:
   statuses: write
 
 jobs:
-  plan:
-    runs-on: ubuntu-latest
-    outputs:
-      checks: ${{ steps.plan.outputs.checks }}
-    steps:
-      - id: plan
-        env:
-          ACTION: ${{ github.event.action }}
-          LABEL: ${{ github.event.label.name }}
-          TRUSTED: ${{ contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) }}
-          OK_TO_TEST: ${{ contains(github.event.pull_request.labels.*.name, 'ok-to-test') }}
-        run: |
-          if [ "$ACTION" = labeled ]; then
-            case "$LABEL" in
-              ok-to-test) CHECKS='["tests"]' ;;
-              conform) CHECKS='["conform"]' ;;
-              *) CHECKS='[]' ;;
-            esac
-          elif [ "$TRUSTED" = true ] || [ "$OK_TO_TEST" = true ]; then
-            CHECKS='["tests"]'
-          else
-            CHECKS='[]'
-          fi
-          echo "checks=$CHECKS" >> "$GITHUB_OUTPUT"
-
+  # One check per event: the `conform` label runs conform; `ok-to-test` or a push from a trusted author runs tests.
   check:
-    needs: plan
-    if: needs.plan.outputs.checks != '[]'
-    strategy:
-      matrix:
-        check: ${{ fromJSON(needs.plan.outputs.checks) }}
-    name: ${{ matrix.check }}
+    if: >-
+      github.event.action == 'labeled'
+      && contains(fromJSON('["ok-to-test","conform"]'), github.event.label.name)
+      || github.event.action != 'labeled'
+      && (contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+      || contains(github.event.pull_request.labels.*.name, 'ok-to-test'))
+    name: ${{ github.event.label.name == 'conform' && 'conform' || 'tests' }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     concurrency:
-      group: ${{ matrix.check }}-${{ github.event.pull_request.number }}
-      cancel-in-progress: ${{ matrix.check == 'tests' }}
+      group: ${{ github.event.label.name == 'conform' && 'conform' || 'tests' }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: ${{ github.event.label.name != 'conform' }}
     env:
       GH_REPO: muzam1l/pnext-workspace
-      CHECK: ${{ matrix.check }}
+      CHECK: ${{ github.event.label.name == 'conform' && 'conform' || 'tests' }}
       SHA: ${{ github.event.pull_request.head.sha }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
