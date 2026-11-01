@@ -146,14 +146,24 @@ const METRICS: MetricSpec[] = [
     text: mbText,
   },
   {
+    // The headline counts everything the first page can download, not just its first paint.
+    id: 'js-total-gzip',
+    label: 'First-page client JS incl. deferred (gzip)',
+    category: 'payload',
+    phase: 'static',
+    pick: r => r.jsGzip + r.jsDeferredGzip,
+    value: kb,
+    text: kbText,
+    headline: { label: 'Client JS incl. deferred (gzip)', direction: 'less' },
+  },
+  {
     id: 'js-gzip',
-    label: 'First-page client JS (gzip)',
+    label: 'First-paint client JS (gzip)',
     category: 'payload',
     phase: 'static',
     pick: r => r.jsGzip,
     value: kb,
     text: kbText,
-    headline: { label: 'First-page client JS (gzip)', direction: 'less' },
   },
   {
     id: 'js-raw',
@@ -166,7 +176,7 @@ const METRICS: MetricSpec[] = [
   },
   {
     id: 'js-deferred-gzip',
-    label: 'Deferred client JS (gzip)',
+    label: 'Deferred client JS, idle or on demand (gzip)',
     category: 'payload',
     phase: 'static',
     pick: r => r.jsDeferredGzip,
@@ -259,6 +269,7 @@ export function siteBenchJson(
       raw: bytes(size.raw),
       gzip: bytes(size.gzip),
       brotli: bytes(size.brotli),
+      deferred: bytes(size.deferredGzip),
     })),
   }
 }

@@ -2,8 +2,10 @@
 /**
  * pnext benchmark: the same fixtures rendered by pnext and by Next.js.
  *
- *   bun bench/run.ts [ssr|dashboard|visible|all] [--framework=both|pnext|next] [--runs=N|--bundles]
+ *   bun bench/run.ts [ssr|dashboard|visible|all|runtime] [--framework=both|pnext|next] [--runs=N|--bundles]
+ *                    [--no-runtime] [--raw=<file>]
  *
+ * `runtime` measures only the client runtime ladder; --raw writes the raw results there and skips the report.
  * Prints results; reference docs are updated by hand. See bench/README.md.
  */
 import { readFileSync } from 'node:fs'
@@ -84,19 +86,19 @@ const targets: Target[] = [
     },
   },
   {
-    label: 'Router runtime',
+    label: 'Router first paint (server page + Link)',
     limit: `<= ${bytes(TARGETS.routerGzip)} gzip`,
     measured: ({ runtime }) => {
-      const value = runtime.find(size => size.name === 'router-prefetch-only')?.gzip
+      const value = runtime.find(size => size.name === 'server page + Link')?.gzip
       if (value === undefined) return undefined
       return { text: `${bytes(value)} gzip`, status: verdict(value, TARGETS.routerGzip) }
     },
   },
   {
-    label: 'Hydrated-route framework tax',
+    label: 'Hydrated-route framework tax (Preact island)',
     limit: `<= ${bytes(TARGETS.hydratedRouteGzip)} gzip`,
     measured: ({ runtime }) => {
-      const value = runtime.find(size => size.name === 'combined-router-hydrator')?.gzip
+      const value = runtime.find(size => size.name === 'island (Preact)')?.gzip
       if (value === undefined) return undefined
       return { text: `${bytes(value)} gzip`, status: verdict(value, TARGETS.hydratedRouteGzip) }
     },
@@ -125,9 +127,14 @@ const runsLabel = bundlesOnly
   ? 'bundle sizes only, no timed runs'
   : `${runs} per metric${runs >= 3 ? ' (first discarded)' : ''}, medians reported`
 
-const selected =
-  selector === 'all' ? FIXTURES : FIXTURES.filter(fixture => fixture.name === selector)
-if (!selected.length) {
+const rawFile = option('raw')
+const runtimeOnly = selector === 'runtime'
+const selected = runtimeOnly
+  ? []
+  : selector === 'all'
+    ? FIXTURES
+    : FIXTURES.filter(fixture => fixture.name === selector)
+if (!runtimeOnly && !selected.length) {
   console.error(
     `Unknown fixture "${selector}". Available: ${FIXTURES.map(f => f.name).join(', ')}, all.`,
   )
@@ -148,7 +155,16 @@ for (const fixture of selected) {
   results.set(fixture.name, perFramework)
 }
 
-const runtime = await measureRuntimeSizes()
+const runtime = args.includes('--no-runtime') ? [] : await measureRuntimeSizes()
+
+if (rawFile) {
+  await Bun.write(
+    path.resolve(rawFile),
+    JSON.stringify({ results: Object.fromEntries(results), runtime }, null, 2) + '\n',
+  )
+  console.log(`\n${rawFile} written`)
+  process.exit(0)
+}
 
 console.log('\n')
 console.log(
@@ -165,7 +181,12 @@ for (const fixture of selected) {
   console.log()
 }
 console.log('Client runtime bundles')
-console.log(consoleTable(['Runtime', 'Raw', 'Gzip', 'Brotli'], runtimeRows(runtime)))
+console.log(
+  consoleTable(
+    ['Rung', 'First paint raw', 'Gzip', 'Brotli', 'Deferred gzip'],
+    runtimeRows(runtime),
+  ),
+)
 console.log()
 
 const context: TargetContext = { results, runtime }

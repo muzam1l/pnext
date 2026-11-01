@@ -1,0 +1,108 @@
+name: bench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      fixture:
+        description: Fixture to bench
+        type: choice
+        default: all
+        options: [all, ssr, dashboard]
+      runs:
+        description: Runs per metric
+        default: '2'
+      record:
+        description: Record passing benchmark values
+        type: boolean
+        default: false
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: measure
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install
+      - name: Bench gate
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p .tmp
+          gate() {
+            : > .tmp/bench.md
+            for fixture in ${{ inputs.fixture || 'all' }}; do
+              bun bench/run.ts "$fixture" --runs=${{ inputs.runs || '3' }} || return
+              bun bench/check.ts --markdown=.tmp/bench.md ${{ inputs.record && '--record' || '' }} || return
+            done
+          }
+          gate || gate
+      # Both sides run this PR's harness and fixtures in one job, interleaved, so only pnext itself differs.
+      - name: Bench against base
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          AB=$PWD/.tmp/ab
+          BASE=$RUNNER_TEMP/pnext-base
+          mkdir -p "$AB/base" "$AB/head"
+          git fetch -q --depth=1 origin "$BASE_REF"
+          git worktree add -q --detach "$BASE" FETCH_HEAD
+          rm -rf "$BASE/bench" && cp -R bench "$BASE/bench"
+          (cd "$BASE" && bun install)
+          bench_base() { (cd "$BASE" && bun bench/run.ts "$1" --framework=pnext --runs=5 $2 --raw="$AB/base/$1.json"); }
+          bench_head() { bun bench/run.ts "$1" --runs=5 $2 --raw="$AB/head/$1.json"; }
+          n=0
+          for target in hello-world ssr dashboard runtime; do
+            only=$([ "$target" = runtime ] || echo --no-runtime)
+            # Alternate which side goes first so warm caches favor neither.
+            if [ $((n % 2)) = 0 ]; then
+              bench_base "$target" "$only"
+              bench_head "$target" "$only"
+            else
+              bench_head "$target" "$only"
+              bench_base "$target" "$only"
+            fi
+            n=$((n + 1))
+          done
+      # bench-comment.yml posts this on the PR: a fork PR's token here is read-only.
+      - name: Write PR report
+        if: always() && github.event_name == 'pull_request'
+        env:
+          OUTCOME: ${{ job.status }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p .tmp/bench-report .tmp/ab/base .tmp/ab/head
+          BASE_SHA=$(git -C "$RUNNER_TEMP/pnext-base" rev-parse HEAD 2>/dev/null || true)
+          {
+            echo '<!-- bench -->'
+            [ "$OUTCOME" = success ] || echo "**Bench failed** before every side finished; missing cells show —. [Run]($RUN_URL)"
+            echo
+            bun bench/compare.ts .tmp/ab/base .tmp/ab/head --base="$BASE_REF" --base-sha="$BASE_SHA" \
+              --head-sha="$HEAD_SHA" --verdict=.tmp/bench-report/verdict.json
+          } > .tmp/bench-report/comment.md
+          cat .tmp/bench-report/comment.md >> "$GITHUB_STEP_SUMMARY"
+          echo "$HEAD_SHA" > .tmp/bench-report/sha
+      - name: Upload PR report
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report
+          path: .tmp/bench-report
+      - name: Upload recorded baselines
+        if: inputs.record
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-baselines
+          path: bench/baselines.json

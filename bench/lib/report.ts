@@ -58,7 +58,13 @@ export function fixtureRows(result: Partial<Record<Framework, FixtureResult>>) {
 }
 
 export function runtimeRows(sizes: RuntimeSize[]) {
-  return sizes.map(size => [size.name, bytes(size.raw), bytes(size.gzip), bytes(size.brotli)])
+  return sizes.map(size => [
+    size.name,
+    bytes(size.raw),
+    bytes(size.gzip),
+    bytes(size.brotli),
+    bytes(size.deferredGzip),
+  ])
 }
 
 export function consoleTable(headers: string[], rows: string[][]) {

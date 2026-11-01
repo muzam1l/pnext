@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 
 interface Ratio {
@@ -26,6 +26,7 @@ const root = path.resolve(import.meta.dirname, '..')
 const args = process.argv.slice(2)
 const value = (name: string) => args.find(arg => arg.startsWith(`${name}=`))?.slice(name.length + 1)
 const record = args.includes('--record')
+const markdownFile = value('--markdown')
 const baselineFile = value('--baselines') ?? path.join(root, 'bench/baselines.json')
 const resultsFile = value('--bench') ?? path.join(root, '.tmp/bench.json')
 const baselines = JSON.parse(readFileSync(baselineFile, 'utf8')) as Record<string, Fixture>
@@ -115,6 +116,24 @@ console.log('-'.repeat(82))
 for (const row of rows) {
   console.log(
     `${width(row.cell, 31)}${width(fmt(row.measured, row.suffix), 13)}${width(fmt(row.baseline, row.suffix), 13)}${width(row.limit ?? '—', 13)}${row.status}`,
+  )
+}
+
+// Appended, one table body per fixture run: the CI step writes the header and posts the file.
+if (markdownFile) {
+  const delta = (row: Row) =>
+    row.measured === undefined || !row.baseline
+      ? '—'
+      : `${row.measured >= row.baseline ? '+' : ''}${(((row.measured - row.baseline) / row.baseline) * 100).toFixed(1)}%`
+  appendFileSync(
+    markdownFile,
+    rows
+      .filter(row => row.status !== 'skip')
+      .map(
+        row =>
+          `| ${row.cell} | ${fmt(row.measured, row.suffix)} | ${fmt(row.baseline, row.suffix)} | ${delta(row)} | ${row.limit ?? '—'} | ${row.status === 'FAIL' ? '**FAIL**' : row.status} |\n`,
+      )
+      .join(''),
   )
 }
 
