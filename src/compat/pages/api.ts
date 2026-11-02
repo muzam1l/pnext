@@ -20,6 +20,7 @@ import { canonicalUrlHref } from '../next/canonical-url'
 import { markPathRevalidated, normalizeRevalidatePath } from '../cache/revalidate'
 import { withPagesApiHandlerSpan } from '../otel/tracer'
 import { toNextRequest } from '../../api/server'
+import { decodePagesParams, PAGES_LAYOUT } from './router-state'
 
 type PagesApiHandler = (req: unknown, res: PagesApiResponse) => Promise<unknown>
 
@@ -83,7 +84,7 @@ export const pagesDataInterceptor: RequestInterceptor = async request => {
   )) as PagesDataModule
 
   setWorkUnitRoute('data', 'dynamic')
-  const params = selection.params ?? {}
+  const params = decodePagesParams(selection.params)
   const query = { ...Object.fromEntries(url.searchParams), ...params }
   if (typeof module.getServerSideProps === 'function') {
     const result = await module.getServerSideProps({
@@ -173,6 +174,16 @@ export function isMaterializedPagesRoute(config: ResolvedConfig, file: string): 
   } catch {
     return false
   }
+}
+
+const generatedLayouts = new Map<string, boolean>()
+
+/** Whether `file` is the root layout materialized for an app without one. */
+export function isGeneratedPagesLayout(file: string): boolean {
+  if (!file.includes('pnext-pages-compat')) return false
+  if (!generatedLayouts.has(file))
+    generatedLayouts.set(file, existsSync(file) && readFileSync(file, 'utf8') === PAGES_LAYOUT)
+  return generatedLayouts.get(file)!
 }
 
 /** The materialized pages-router wrappers of a pages-compat app, root-relative, for its release. */

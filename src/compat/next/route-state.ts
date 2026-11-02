@@ -12,7 +12,7 @@
 
 import type { RouteManifestEntry, RouteParamValue } from '../../types'
 import { getRequestRuntime } from '../../routing/request-environment'
-import { paramSetMatches } from '../static-params'
+import { closedParams, paramSetMatches } from '../static-params'
 import { getNextConfig } from './config-loader'
 
 interface RouteState {
@@ -28,6 +28,8 @@ interface RouteState {
    * route needs its own prefetch.
    */
   runtimePrefetch?: boolean
+  /** Some param only admits build-time values: the route exists only per value, so never predict it. */
+  closedParams?: boolean
   /**
    * The vary set of the BAKED SHELL these bytes came from (renderer's
    * `bakedShellPageVary`). Passed straight through by the spread below: the
@@ -145,13 +147,16 @@ export function nextClientRouteState(
     | 'segmentConfig'
     | 'prerenderedParams'
     | 'params'
+    | 'catchAll'
+    | 'paramMatching'
     | 'stream'
   >,
   state: RouteState,
 ): RouteState {
+  const closed = closedParams(route).length > 0 ? { closedParams: true } : {}
   const pattern = state.route.split('/').filter(Boolean)
   const routes = getRequestRuntime()?.routes
-  if (!routes) return state
+  if (!routes) return { ...state, ...closed }
   const staticChildrenBySegment = staticSiblingNamesBySegment(routes, pattern)
   const staticChildren = staticSiblingNames(routes, pattern)
   // Global `partialPrefetching: 'unstable_eager'` makes every route without a
@@ -182,6 +187,7 @@ export function nextClientRouteState(
     // Only runtime-prefetched shells are request-sampled per URL; a `partial` shell
     // is a static prerender the whole route shares.
     ...(routeRuntimePrefetch(route) ? { runtimePrefetch: true } : {}),
+    ...closed,
   }
 }
 

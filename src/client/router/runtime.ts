@@ -73,6 +73,8 @@ export interface BrowserRouteState {
 
 const ROUTE_STATE_PREFIX = 'window.__PNEXT_ROUTE__='
 
+const hrefUrl = (href: string) => new URL(href, location.href)
+
 function documentRouteState(doc: Document): BrowserRouteState | undefined {
   const source = [...doc.scripts]
     .map(script => script.textContent ?? '')
@@ -120,6 +122,7 @@ function routeParamsForPathname(
   route: string,
   pathname: string,
   catchAllOptional = false,
+  encode: (value: string) => string = encodeURIComponent,
 ): Record<string, string | string[]> | undefined {
   const pattern = route.split('/').filter(Boolean)
   const target = pathname.split('/').filter(Boolean).map(decodePathSegment)
@@ -131,13 +134,13 @@ function routeParamsForPathname(
       // Catch-all consumes the rest; `[...slug]` requires ≥1 remaining segment.
       const rest = target.slice(cursor)
       if (!catchAllOptional && rest.length === 0) return undefined
-      if (rest.length > 0) params[catchAll[1]!] = rest.map(encodeURIComponent)
+      if (rest.length > 0) params[catchAll[1]!] = rest.map(encode)
       return params
     }
     const value = target[cursor++]
     if (value === undefined) return undefined
     const dynamic = /^:([\w$]+)$/.exec(segment)
-    if (dynamic) params[dynamic[1]!] = encodeURIComponent(value)
+    if (dynamic) params[dynamic[1]!] = encode(value)
     else if (segment !== value) return undefined
   }
   return cursor === target.length ? params : undefined
@@ -162,7 +165,11 @@ export function isRewriteDocument(html: string, pathname: string): boolean {
   return (
     params === undefined ||
     (Object.keys(state.params ?? {}).length > 0 &&
-      stableParams(params) !== stableParams(state.params))
+      stableParams(params) !== stableParams(state.params) &&
+      // Core embeds decoded params, compat the encoded form.
+      stableParams(
+        routeParamsForPathname(state.route, pathname, state.catchAllOptional, String),
+      ) !== stableParams(state.params))
   )
 }
 
@@ -553,7 +560,7 @@ type SheetHold = (sheets: Promise<void>[]) => void
 
 function absoluteStylesheetHref(href: string) {
   try {
-    return new URL(href, location.href).href
+    return hrefUrl(href).href
   } catch {
     return
   }
@@ -567,7 +574,7 @@ function absoluteStylesheetHref(href: string) {
 function pruneStylesheets(doc: Document) {
   const keep = new Set(
     [...doc.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"][href]')].map(
-      link => new URL(link.getAttribute('href') ?? '', location.href).href,
+      link => hrefUrl(link.getAttribute('href') ?? '').href,
     ),
   )
   for (const link of document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"][href]')) {
@@ -581,7 +588,7 @@ const BUILT_SHEET = /^\/(?:assets|_next\/static)\//
 
 function pnextStylesheet(href: string) {
   try {
-    const url = new URL(href, location.href)
+    const url = hrefUrl(href)
     return url.origin === location.origin && BUILT_SHEET.test(url.pathname)
   } catch {
     return false
@@ -589,7 +596,7 @@ function pnextStylesheet(href: string) {
 }
 
 function findStylesheet(href: string) {
-  const target = new URL(href, location.href).href
+  const target = hrefUrl(href).href
   return [...document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"][href]')].find(
     link => link.href === target,
   )
@@ -607,7 +614,8 @@ function syncHeadMetadata(doc: Document) {
     if (managedHeadNode(node) || newResourceHint(node))
       document.head.append(document.importNode(node, true))
   }
-  document.title = titleText ?? ''
+  // Assigning with no <title> would create an empty one; pending streamed metadata has none.
+  if (titleText !== undefined) document.title = titleText
 }
 
 // Hints persist like React's resources: installed once per variant, never pruned.
@@ -1957,7 +1965,7 @@ function storeShell(
   } else {
     paths.add(pathname)
     try {
-      paths.add(new URL(page.finalUrl, location.href).pathname)
+      paths.add(hrefUrl(page.finalUrl).pathname)
     } catch {
       // finalUrl should always parse; the requested pathname alone is fine.
     }
@@ -2062,7 +2070,7 @@ function segmentDocumentCacheKey(
   href: string,
   mode: 'auto' | 'full',
 ): string {
-  const url = new URL(href, location.href)
+  const url = hrefUrl(href)
   const pathname = response?.headers.get('x-nextjs-rewritten-path') ?? url.pathname
   const rewrittenQuery = response?.headers.get('x-nextjs-rewritten-query') ?? null
   const search = rewrittenQuery === null ? url.search : rewrittenQuery ? `?${rewrittenQuery}` : ''
@@ -2131,7 +2139,7 @@ function segmentShellKey(href: string): string {
   // pathname-only alias would silently satisfy the second query's lookup from
   // the first one's shell and elide its body request. Cross-query reuse is the
   // per-segment (vary-aware) cache's job, not this alias's.
-  const url = new URL(href, location.href)
+  const url = hrefUrl(href)
   return `${url.pathname}${url.search}\u0000auto-shell`
 }
 
@@ -2158,7 +2166,7 @@ function decodeSearch(search: string): string {
 function stripRscQuery(href: string): string {
   if (!href) return href
   try {
-    const url = new URL(href, location.href)
+    const url = hrefUrl(href)
     if (!url.searchParams.has(RSC_UNION_QUERY)) return href
     url.searchParams.delete(RSC_UNION_QUERY)
     const search = url.search
@@ -2206,7 +2214,7 @@ const PAGE_SEGMENT_REQUEST_PATH = '/_page'
  * layout frame alone.
  */
 function prefetchBodySegmentPath(href: string): string {
-  const url = new URL(href, location.href)
+  const url = hrefUrl(href)
   return segmentCachePolicy?.needsLayoutFrameOnly?.({
     pathname: url.pathname,
     search: url.search,
@@ -2234,6 +2242,7 @@ function segmentCachePathname(url: URL | string): string {
  */
 function evictSegmentCache(options: { pageSegmentsOnly?: boolean } = {}): void {
   learnedRouteTrees.clear()
+  rejectedRouteTrees.clear()
   routeTreesEvicted.clear()
   segmentDocumentCache.clear()
   // A same-URL navigation refreshes the PAGE segments only — the shared layout
@@ -2258,10 +2267,7 @@ export function evictClientRouterCache(options: { rearmVisiblePrefetches?: boole
   bumpRouterCacheEpoch()
   revalidationPrefetchGeneration += 1
   revalidationPrefetchBlocked = options.rearmVisiblePrefetches !== false
-  learnedRouteTrees.clear()
-  routeTreesEvicted.clear()
-  segmentDocumentCache.clear()
-  segmentCachePolicy?.clear()
+  evictSegmentCache()
   const invalidated = Array.from(prefetchCache.values())
   prefetchCache.clear()
   shellCache.clear()
@@ -2724,19 +2730,26 @@ function learnRouteTree(pathname: string, search: string, route?: string, rewrit
   trimOldest(learnedRouteTrees, SEGMENT_CACHE_LIMIT)
 }
 
+// URLs whose `/_tree` the server refused (non-ok), by tree key: when Next's 10s REJECTION_BACKOFF_MS ends.
+const rejectedRouteTrees = new Map<string, number>()
+
+function routeTreeKey(href: string): string {
+  const url = hrefUrl(href)
+  return learnedRouteTreeKey(segmentCachePathname(url), url.search)
+}
+
 /**
  * Drop the tree learned for a URL key, used when that URL's prefetch data is evicted
  * under CACHE PRESSURE. A learned tree is a dedupe token for data the client still
  * holds; outliving that data turns an LRU eviction into a silently skipped refetch.
  */
 function forgetLearnedRouteTree(urlKey: string): void {
-  let url: URL
+  let key: string
   try {
-    url = new URL(urlKey, location.href)
+    key = routeTreeKey(urlKey)
   } catch {
     return
   }
-  const key = learnedRouteTreeKey(segmentCachePathname(url), url.search)
   learnedRouteTrees.delete(key)
   // A SIBLING of the same route must not paper over the gap either: the evicted URL's
   // own data is what the next reveal has to re-fetch. The marker survives until this
@@ -2759,7 +2772,7 @@ function routeTreeAlreadyLearned(href: string): boolean {
   const routeFor = policy?.routeFor
   const matchesRoute = policy?.matchesRoute
   if (!routeFor || !matchesRoute) return false
-  const url = new URL(href, location.href)
+  const url = hrefUrl(href)
   const pathname = segmentCachePathname(url)
   const search = url.search
   const ownKey = learnedRouteTreeKey(pathname, search)
@@ -2773,8 +2786,8 @@ function routeTreeAlreadyLearned(href: string): boolean {
     }
     learnedRouteTrees.delete(ownKey)
   }
-  if (routeTreesEvicted.has(ownKey)) return false
-  const ownRoute = routeFor(pathname)
+  if (routeTreesEvicted.has(ownKey) || rejectedRouteTrees.has(ownKey)) return false
+  const ownRoute = routeFor(pathname) ?? policy.predictRoute?.(pathname) ?? null
   if (ownRoute === null) return false
   // Most recently learned first, like the segment cache's own learned-route
   // prediction order.
@@ -2851,7 +2864,7 @@ function segmentBodyCovered(
   // asks for the whole page INCLUDING the parts that vary - a shell whose vary set
   // covers this URL says nothing about the dynamic content the full fetch exists to get.
   if (mode !== 'auto') return null
-  const url = new URL(href, location.href)
+  const url = hrefUrl(href)
   const covered = policy.prefetchCovered({
     pathname: url.pathname,
     search: url.search,
@@ -2932,14 +2945,19 @@ export function prefetchRoute(
     // commits without a fetch. Never for a `currentUrl` seed - the bfcache holds the very
     // document that seed is running for, and the point is to obtain the bytes it does NOT have.
     const bfDoc = takeBfDoc(key)
-    if (bfDoc && bfDocServesFullPrefetch(bfDoc.page)) {
+    // The document reuses for its reported window: a dynamic (0) window never stands in for a full prefetch.
+    const bfDocStaleTimeMs =
+      bfDoc?.page.staleTimeSeconds === undefined
+        ? shellStaleTimeMs()
+        : prefetchStaleTimeMs({ headerStaleTimeSeconds: bfDoc.page.staleTimeSeconds })
+    if (bfDoc && bfDocStaleTimeMs > 0 && bfDocServesFullPrefetch(bfDoc.page)) {
       const page = Promise.resolve(bfDoc.page)
       const state = currentNavState()
       prefetchCache.set(cacheKey, {
         time: bfDoc.time,
         page,
-        staleTimeMs: shellStaleTimeMs(),
-        lifetimeMs: shellStaleTimeMs(),
+        staleTimeMs: bfDocStaleTimeMs,
+        lifetimeMs: Math.max(bfDocStaleTimeMs, shellStaleTimeMs()),
         full: true,
         stateKey: navStateKey(state),
         slotsKey: slotsStateKey(state.slots ?? {}),
@@ -3126,7 +3144,7 @@ const RSC_UNION_QUERY = '_rsc'
 // router request headers: a CDN that keys on the URL alone (ignoring Vary)
 // must never serve the `/_tree` payload for the `/_index` request.
 function withRscQuery(href: string, variant = ''): string {
-  const url = new URL(href, location.href)
+  const url = hrefUrl(href)
   if (url.searchParams.has(RSC_UNION_QUERY)) return url.href
   const currentEpoch = routerCacheEpoch()
   const epoch = currentEpoch === 0 ? '' : `:${currentEpoch}`
@@ -3156,7 +3174,7 @@ async function fetchWithRedirectReplay(
   let response = await fetch(fetchHref, init)
   for (let replay = 0; replay < MAX_RSC_REDIRECT_REPLAYS; replay++) {
     if (!response.redirected) break
-    const requested = new URL(fetchHref, location.href)
+    const requested = hrefUrl(fetchHref)
     const resolved = new URL(response.url, fetchHref)
     // A cross-origin redirect is out of our hands (and its response is opaque
     // to the cache-busting contract).
@@ -3449,6 +3467,9 @@ async function fetchPage(
   let treePayloadStaleTime: number | undefined
   let treePayloadStatic = false
   let strippedBody: string | undefined
+  if (segmentPrefetch && (rejectedRouteTrees.get(routeTreeKey(href)) ?? 0) > clientClockNow()) {
+    return null
+  }
   try {
     if (options.prefetch === 'full' && !segmentSchedulerEnabled()) {
       // A `prefetch={true}` FULL prefetch on a CLASSIC (non-cacheComponents) app is a SINGLE
@@ -3484,6 +3505,7 @@ async function fetchPage(
       const cached = getSegmentDocument(segmentCacheKey, href, options.prefetch!)
       if (cached) return cached
       if (task?.cancelled) return null
+      if (segmentCachePolicy?.deferBodyPrefetch?.(href, options.prefetch === 'full')) return null
       if (needsOutlinedHeadFirst(href, false)) {
         outlinedHeadHtml = await fetchOutlinedHead(href, init, headers, rscVariant)
       }
@@ -3516,6 +3538,11 @@ async function fetchPage(
         init,
         `${rscVariant}:${TREE_SEGMENT_PATH}`,
       )
+      if (!treeResponse.ok) {
+        rejectedRouteTrees.set(routeTreeKey(href), clientClockNow() + 10_000)
+        trimOldest(rejectedRouteTrees, SEGMENT_CACHE_LIMIT)
+        return null
+      }
       segmentPayload = isSegmentPayload(treeResponse)
       let treePayload: ReturnType<typeof parseSegmentTreePayload> = null
       if (!segmentPayload && !treeResponse.headers.get('content-type')) {
@@ -3541,7 +3568,7 @@ async function fetchPage(
           if (treeText) treePayload = parseSegmentTreePayload(await treeText)
           // Remember this route's tree so a SIBLING URL of the same route never
           // asks for it again (Next keys the route tree by route, not by URL).
-          const treeUrl = new URL(href, location.href)
+          const treeUrl = hrefUrl(href)
           learnRouteTree(
             treeUrl.pathname,
             treeUrl.search,
@@ -3560,6 +3587,17 @@ async function fetchPage(
         // the segment phase (the in-flight tree request is never aborted, but no
         // follow-up request may be issued — Next's cancellation contract).
         if (task?.cancelled) {
+          await finishTree()
+          return null
+        }
+        // Decided on the tree HEADERS, in this task, like the body request.
+        if (
+          segmentCachePolicy?.deferBodyPrefetch?.(
+            href,
+            options.prefetch === 'full',
+            treeResponse.headers,
+          )
+        ) {
           await finishTree()
           return null
         }
@@ -3668,7 +3706,7 @@ async function fetchPage(
     // into it and go on as if the whole route had been fetched. Uncomposable means
     // the prefetch has nothing paintable — drop it and let the navigation fetch.
     if (bodySegment === LAYOUT_SEGMENT_REQUEST_PATH) {
-      const url = new URL(href, location.href)
+      const url = hrefUrl(href)
       const composed = segmentCachePolicy?.composeLayoutFrame?.({
         pathname: url.pathname,
         search: url.search,
@@ -3682,7 +3720,7 @@ async function fetchPage(
     // continuation chunks: merge them into the cached static shell so the entry
     // is a complete document the navigation commits without another fetch.
     if (response.headers.get('x-pnext-resume-only') === '1') {
-      const stored = takeShellForUrl(new URL(href, location.href))
+      const stored = takeShellForUrl(hrefUrl(href))
       if (!stored) return null
       html = mergeResumeDocument(stored.html, html)
     }
@@ -3787,7 +3825,7 @@ async function fetchPageFrameNavigation(
   // An app redirect (or a rewrite that moved the destination) is the whole
   // document path's business: the frame would compose into the WRONG layout.
   try {
-    if (new URL(response.url, location.href).pathname !== url.pathname) return null
+    if (hrefUrl(response.url).pathname !== url.pathname) return null
   } catch {
     return null
   }
@@ -3829,7 +3867,7 @@ function recordSegmentEntry(input: {
   /** The frame this response answered: `/_index`, or `/_layout` (w9 split). */
   segmentPath: string
 }): void {
-  const url = new URL(input.href, location.href)
+  const url = hrefUrl(input.href)
   const runtime = input.response.headers.get('x-pnext-runtime-prefetch') === '1'
   segmentCachePolicy?.record({
     pathname: url.pathname,
@@ -3857,6 +3895,7 @@ function recordSegmentEntry(input: {
     // and satisfies a sibling's prefetch without ever committing network-free.
     static: input.segmentPrerendered || input.shellPrerendered,
     runtime,
+    full: input.mode === 'full',
     // The server TRUNCATED this response at its postponed boundary: the payload is this
     // URL's own prerendered static stage, so a navigation may paint it however little of
     // the page sits outside the holes. A runtime sample is not that - it is request data.
@@ -3898,7 +3937,7 @@ async function fetchOutlinedHead(
 ): Promise<string | null> {
   headers[SEGMENT_PREFETCH_HEADER] = HEAD_SEGMENT_PATH
   try {
-    const headUrl = new URL(href, location.href)
+    const headUrl = hrefUrl(href)
     const headResponse = await fetch(withRscQuery(href, `${rscVariant}:${HEAD_SEGMENT_PATH}`), init)
     if (!headResponse.ok) return null
     const headBody = await headResponse.text()
@@ -3927,7 +3966,7 @@ async function fetchOutlinedHead(
  * covers this URL yet.
  */
 function needsOutlinedHeadFirst(href: string, announced: boolean): boolean {
-  const url = new URL(href, location.href)
+  const url = hrefUrl(href)
   if (!announced && !routeFetchesHeadFirst(url.pathname)) return false
   return (
     segmentCachePolicy?.take({
@@ -5350,7 +5389,7 @@ async function runSoftNavigation(href: string, options: SoftNavigateOptions = {}
   // dying with the navigation. Never for a cached entry: re-storing one resets its commit time.
   const abandonFetchedPage = (fetched: PrefetchedPage | null | undefined) => {
     if (!fetched || restorePage) return
-    const settled = new URL(fetched.finalUrl, location.href)
+    const settled = hrefUrl(fetched.finalUrl)
     storeBfDoc(bfRouteKey(settled.pathname, settled.search), fetched)
   }
   let page =
@@ -5421,7 +5460,7 @@ async function runSoftNavigation(href: string, options: SoftNavigateOptions = {}
     materializeStreamedSegments(doc)
   }
 
-  const targetUrl = new URL(page.finalUrl, location.href)
+  const targetUrl = hrefUrl(page.finalUrl)
   targetUrl.hash = url.hash
   if (targetUrl.origin !== location.origin) {
     hardNavigate(targetUrl.href, options.replace || options.pop)

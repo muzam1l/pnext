@@ -69,7 +69,14 @@ const useCacheHeaderFinalizer: ResponseFinalizer = ctx => {
   // Set unconditionally: the segment finalizer runs earlier and stamps a
   // mode-derived default, but the live render's own cacheLife is authoritative
   // (the header is internal — never user-supplied — so overwriting is safe).
-  if (staleSeconds !== undefined) {
+  // A navigation that resumed a postponed render is request data and keeps the dynamic window.
+  if (
+    staleSeconds !== undefined &&
+    (!ctx.request.headers.has('x-pnext-soft-nav') ||
+      ctx.request.headers.has('next-router-prefetch') ||
+      (ctx.headers.get('x-nextjs-postponed') !== '1' &&
+        ctx.headers.get('x-pnext-segment-postponed') !== '1'))
+  ) {
     ctx.headers.set('x-nextjs-stale-time', String(staleSeconds))
   }
 }

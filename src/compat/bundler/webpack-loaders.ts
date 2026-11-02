@@ -23,7 +23,8 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { Plugin } from 'esbuild'
 import type { ResolvedConfig } from '../../config'
-import { rewriteSpecifierLiterals } from '../../resolve/scan-facts'
+import { rewriteFacts, rewriteSpecifierLiterals } from '../../resolve/scan-facts'
+import { spliceSource } from '../../runtime/module-transform'
 import {
   EMPTY_ALIAS_MODULE,
   EMPTY_ALIAS_DYNAMIC_MODULE,
@@ -83,23 +84,14 @@ function ruleMatches(rule: WebpackLoaderRule, filePath: string): boolean {
     : path.basename(filePath) === rule.glob
 }
 
-function conditionMatches(rule: WebpackLoaderRule, resourceQuery: string): boolean {
-  if (!rule.condition) return true
+function conditionMatches(rule: WebpackLoaderRule, resourceQuery: string | undefined): boolean {
+  if (!rule.condition || resourceQuery === undefined) return true
   const query = rule.condition.query
   return typeof query === 'string' ? resourceQuery === query : query.test(resourceQuery)
 }
 
-/** First rule whose glob matches (ignoring any `condition`). */
-function findRule(rules: WebpackLoaderRule[], filePath: string): WebpackLoaderRule | undefined {
-  return rules.find(rule => ruleMatches(rule, filePath))
-}
-
-/** First rule whose glob matches AND whose `condition.query` accepts `resourceQuery`. */
-function findRuleForResource(
-  rules: WebpackLoaderRule[],
-  filePath: string,
-  resourceQuery: string,
-): WebpackLoaderRule | undefined {
+/** First rule whose glob matches AND whose `condition.query` accepts `resourceQuery` (if given). */
+function findRule(rules: WebpackLoaderRule[], filePath: string, resourceQuery?: string) {
   return rules.find(rule => ruleMatches(rule, filePath) && conditionMatches(rule, resourceQuery))
 }
 
@@ -111,9 +103,9 @@ function findRuleForResource(
  * implementation so all three asset-claiming resolvers share one check. Accepts a raw specifier with an
  * optional query or hash suffix and strips it here.
  */
-export function hasWebpackLoaderRuleFor(filePath: string): boolean {
+export function hasWebpackLoaderRuleFor(filePath: string, resourceQuery?: string): boolean {
   const [sourcePath = filePath] = filePath.split(/[?#]/, 1)
-  return findRule(turbopackLoaderRules(), sourcePath) !== undefined
+  return findRule(turbopackLoaderRules(), sourcePath, resourceQuery) !== undefined
 }
 
 /**
@@ -138,7 +130,7 @@ export function webpackLoaderRuleModule(
   const query = specifier.slice(base.length)
   const fromDir = path.dirname(originalResourcePath(importer, config))
   const resourcePath = resolveSpecifier(config.root, fromDir, base) ?? base
-  if (!findRuleForResource(rules, resourcePath, query)) return undefined
+  if (!findRule(rules, resourcePath, query)) return undefined
   const key = `${resourcePath}\0${query}`
   const existing = ruleModuleArtifacts.get(key)
   if (existing) return existing
@@ -206,9 +198,9 @@ function toStringContent(content: string | Buffer): string {
 // `resolveAlias`/`resolve.alias` entries.
 const PNEXT_RUNTIME_ROOT = path.resolve(import.meta.dirname, '../..')
 
-function isPNextRuntimeImporter(importer: string): boolean {
-  if (!importer) return false
-  const rel = path.relative(PNEXT_RUNTIME_ROOT, importer)
+export function isPNextRuntimeFile(file: string): boolean {
+  if (!file) return false
+  const rel = path.relative(PNEXT_RUNTIME_ROOT, file)
   return Boolean(rel) && !rel.startsWith('..') && !path.isAbsolute(rel)
 }
 
@@ -276,14 +268,31 @@ function resolveSpecifier(root: string, fromDir: string, specifier: string): str
 export function rewriteResolveAliasImports(source: string, file: string, root: string): string {
   const aliases = turbopackResolveAlias()
   if (Object.keys(aliases).length === 0) return source
+  // Bun links CJS named imports strictly: inline webpack's empty-module values for `false` aliases.
+  if (Object.values(aliases).includes(EMPTY_ALIAS_MODULE)) {
+    const { imports, reexports } = rewriteFacts(file, source)
+    const edits = [...imports, ...reexports]
+      .filter(statement => bareAliasTarget(statement.specifier, root) === EMPTY_ALIAS_MODULE)
+      .map(statement => {
+        const reexport = reexports.includes(statement)
+        const value = statement.bindings
+          .filter(binding => !binding.type)
+          .map(({ imported, local }, index) => {
+            const name = reexport ? `__pnext_empty_${statement.start}_${index}` : local
+            const empty = imported === '*' || imported === 'default' ? '{}' : 'undefined'
+            return `const ${name} = ${empty};${reexport ? ` export { ${name} as ${local} };` : ''}`
+          })
+          .join(' ')
+        return { start: statement.start, end: statement.end, value }
+      })
+    source = spliceSource(source, edits)
+  }
   return rewriteSpecifierLiterals(source, file, (specifier, kind) => {
     // Same scope as the `from`-anchored regex this replaced: side-effect
     // imports stay with the host resolver.
     if (kind === 'side-effect') return undefined
-    if (specifier.startsWith('.') || path.isAbsolute(specifier)) return undefined
-    const aliased = resolveAliasSpecifier(specifier, root)
-    if (!aliased) return undefined
-    const target = firstExisting(aliased) ?? aliased
+    const target = bareAliasTarget(specifier, root)
+    if (!target) return undefined
     if (target === EMPTY_ALIAS_MODULE && kind === 'dynamic')
       return JSON.stringify(EMPTY_ALIAS_DYNAMIC_MODULE)
     // A bare alias target (e.g. `'preact/compat': 'react'`) is not a file path;
@@ -291,6 +300,12 @@ export function rewriteResolveAliasImports(source: string, file: string, root: s
     if (!path.isAbsolute(target)) return undefined
     return JSON.stringify(target)
   })
+}
+
+function bareAliasTarget(specifier: string, root: string): string | undefined {
+  if (specifier.startsWith('.') || path.isAbsolute(specifier)) return undefined
+  const aliased = resolveAliasSpecifier(specifier, root)
+  return aliased && (firstExisting(aliased) ?? aliased)
 }
 
 // Same computed-key read as env.ts: NODE_ENV is set by pnext itself, not a turbo input.
@@ -538,7 +553,7 @@ async function loadRuleModule(
   target: LoaderContextTarget,
   config: ResolvedConfig | undefined,
 ): Promise<LoadedRuleModule | undefined> {
-  const rule = findRuleForResource(rules, resourcePath, resourceQuery)
+  const rule = findRule(rules, resourcePath, resourceQuery)
   if (!rule) return undefined
   if (rule.assetType) {
     return { contents: await loadTypeAssetModule(rule, resourcePath, config), loader: 'js' }
@@ -612,7 +627,7 @@ export function webpackLoaderRulesPlugin(
           // build the react shim, so a config alias redirecting preact/compat to react points the shim
           // at the module pnext maps back to the shim - a self-import that throws on client bundle
           // init, killing all client JS. Framework modules resolve unaliased.
-          if (isPNextRuntimeImporter(args.importer)) return undefined
+          if (isPNextRuntimeFile(args.importer)) return undefined
           const resolved = resolveAliasSpecifier(args.path, config.root)
           if (!resolved) return undefined
           if (resolved === EMPTY_ALIAS_MODULE && args.kind === 'dynamic-import') {
@@ -712,7 +727,7 @@ export function registerWebpackLoaderRuleRuntime(config: ResolvedConfig): void {
           if (args.path.includes('?')) return undefined
           // See the build-time alias hook: pnext's own runtime graph is exempt
           // from user aliases, or the react shim self-imports.
-          if (isPNextRuntimeImporter(args.importer)) return undefined
+          if (isPNextRuntimeFile(args.importer)) return undefined
           const resolved = resolveAliasSpecifier(args.path, root)
           if (!resolved) return undefined
           const target = firstExisting(resolved) ?? resolved

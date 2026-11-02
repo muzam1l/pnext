@@ -109,6 +109,8 @@ import {
   runWithRuntimePrefetchSyncIoAbort,
   runWithTaskBoundaryArmed,
   runWithTaskBoundarySuspended,
+  RUNTIME_PARAMS,
+  RUNTIME_URL,
   trackPrerenderDynamic,
 } from './ppr'
 import {
@@ -187,6 +189,7 @@ import {
   currentLayoutSegmentSnapshot,
   currentParamsSnapshot,
   fullLayoutSegments,
+  layoutParamNamesForDir,
   layoutParamsForDir,
   layoutSegmentDepth,
   paramsScopeParams,
@@ -629,6 +632,8 @@ interface PageModule {
   params?: () => Promise<Record<string, RouteParamValue>[]> | Record<string, RouteParamValue>[]
 }
 
+type LayoutProps = Omit<PageProps, 'searchParams'>
+
 interface LayoutModule {
   default?: ServerComponent<{ children: ComponentChildren }>
   metadata?: MetadataExport
@@ -726,6 +731,8 @@ interface StreamState {
   // component: a separate chunk render sits outside its providers. See
   // inlineSuspenseBoundary.
   inlineSuspense?: boolean
+  // Settles when the shell may flush; a boundary whose content settled first is inlined.
+  shellGate?: Promise<void>
   // Server-inserted HTML (CSS-in-JS registries) drained at the moment the shell finished rendering.
   // It belongs in the document head, so it is captured here rather than left for the deferred
   // tail's own drain - the tail's async body starts before the caller assembles the head and would
@@ -774,6 +781,8 @@ type PartialState =
       metadataDynamic: boolean
       shellPending?: boolean
       clientOnly?: boolean
+      /** RUNTIME_* bits of the runtime data the holes wait on. */
+      runtimeData: number
     }
   | {
       mode: 'request'
@@ -1508,8 +1517,9 @@ function createPageProps(options: RenderRequestOptions): PageProps {
     const concrete = encodedParams(options.fallbackConcreteParams)
     const keys = options.fallbackParamKeys ?? Object.keys(concrete)
     return {
-      params: Promise.resolve(subShellParamsProxy(concrete, keys)),
-      searchParams: hangingPromise('searchParams'),
+      // Awaiting params in a runtime App Shell arms the sync-IO abort like any runtime API.
+      params: markRuntimeApiOnAwait(Promise.resolve(subShellParamsProxy(concrete, keys))),
+      searchParams: hangingPromise('searchParams', RUNTIME_URL),
       request: options.request ? pageRequest(options.request) : undefined,
     }
   }
@@ -1518,8 +1528,8 @@ function createPageProps(options: RenderRequestOptions): PageProps {
   // shell), while a top-level await blocks the prerender (no fallback shell).
   if (options.fallbackParams) {
     return {
-      searchParams: hangingPromise('searchParams'),
-      params: hangingPromise('params'),
+      searchParams: hangingPromise('searchParams', RUNTIME_URL),
+      params: hangingPromise('params', RUNTIME_PARAMS),
       request: options.request ? pageRequest(options.request) : undefined,
     }
   }
@@ -1531,7 +1541,7 @@ function createPageProps(options: RenderRequestOptions): PageProps {
     if (!isRuntimePrefetchPrerender()) {
       return {
         params: settledPromise(trackedParams(options)),
-        searchParams: hangingPromise('searchParams'),
+        searchParams: hangingPromise('searchParams', RUNTIME_URL),
         request: options.request ? pageRequest(options.request) : undefined,
       }
     }
@@ -1613,19 +1623,19 @@ function subShellParamsProxy(
       get(target, prop: string | symbol): unknown {
         if (typeof prop === 'string' && keySet.has(prop) && !(prop in concrete)) {
           // An unfilled route param: postpone the boundary reading it.
-          throw new PostponeError(`params.${prop}`)
+          throw new PostponeError(`params.${prop}`, RUNTIME_PARAMS)
         }
         return (target as Record<string | symbol, unknown>)[prop]
       },
       has(target, prop: string | symbol): boolean {
         if (typeof prop === 'string' && keySet.has(prop) && !(prop in concrete)) {
-          throw new PostponeError(`params.${prop}`)
+          throw new PostponeError(`params.${prop}`, RUNTIME_PARAMS)
         }
         return prop in target
       },
       ownKeys(target): ArrayLike<string | symbol> {
         if (keySet.size > Object.keys(concrete).length) {
-          throw new PostponeError('params')
+          throw new PostponeError('params', RUNTIME_PARAMS)
         }
         return Reflect.ownKeys(target)
       },
@@ -1689,7 +1699,10 @@ export async function staticParamsFor(config: ResolvedConfig, route: RouteManife
   const allSets: Record<string, RouteParamValue>[] = []
   const modules = await loadSegmentModules(config, routeSegmentFiles(config, route))
   for (const { file, module: imported } of modules) {
-    const module = getStaticParamsExtensions().normalizeModule(imported) as StaticParamsModule
+    const module = getStaticParamsExtensions().normalizeModule(
+      imported,
+      route,
+    ) as StaticParamsModule
     const generate = module.params
     if (typeof generate !== 'function') continue
     const next: Record<string, RouteParamValue>[] = []
@@ -1866,7 +1879,7 @@ export async function renderPageResponse(options: RenderOptions) {
   // route.ppr stays false) is still upgrade-eligible: its prerendered params let a request's
   // concrete param prefix be promoted into a route shell. Enter the PPR path when EITHER holds so
   // the shell-miss branch below can schedule that upgrade.
-  const pprUpgrade = pprShellUpgradeFor(options.config, options.route, options.url)
+  const pprUpgrade = pprShellUpgradeFor(options.config, options.route, routeTargetUrl(options))
   if (
     (options.route.ppr || pprUpgrade !== undefined) &&
     !options.dev &&
@@ -1875,13 +1888,9 @@ export async function renderPageResponse(options: RenderOptions) {
     !isHtmlLimitedBotRequest(options) &&
     !/(?:^|;\s*)__prerender_bypass=/.test(options.request?.headers.get('cookie') ?? '')
   ) {
-    const prebuilt = await loadPprShell(options.config, options.route, options.url)
+    const prebuilt = await loadPprShell(options.config, options.route, routeTargetUrl(options))
     // A blocking policy waits for the concrete prefix; a shell without it is never served first.
-    if (
-      prebuilt &&
-      pprUpgrade?.foreground &&
-      !Object.keys(pprUpgrade.concreteParams).every(key => key in (prebuilt.concreteParams ?? {}))
-    ) {
+    if (pprUpgrade?.foreground && !shellFillsUpgrade(pprUpgrade, prebuilt)) {
       const shell = await promoteShell(options, pprUpgrade, false)
       if (shell) return renderPprResponse(options, shell)
     }
@@ -2019,6 +2028,8 @@ interface PrebuiltShell {
   shell: string
   holes: number[]
   metadataDynamic: boolean
+  /** RUNTIME_* bits of the runtime data the holes wait on (build renders only). */
+  runtimeData?: number
   concreteParams?: Record<string, RouteParamValue>
   /** Stale via a soft tag revalidation: servable once, regenerate in background. */
   softStale?: boolean
@@ -2056,6 +2067,16 @@ export async function renderPartialShell(options: RenderOptions): Promise<Prebui
   // it keeps the unbounded behavior - UNLESS it is a bounded shell upgrade, which must postpone
   // uncached request-time I/O exactly as the build-time base shell did.
   const taskBoundary = cacheComponents() && (!options.runtimeRegen || options.boundedRegen === true)
+  // Known params join the params scope so `use cache` root-param reads see them; the rest hang.
+  const scopedParams = (options.fallbackParams && options.params) || options.fallbackConcreteParams
+  const unfilledParams =
+    options.fallbackParams || options.fallbackConcreteParams
+      ? new Set(
+          (options.fallbackParamKeys ?? generatedStaticParamsRequiredParams(options.route)).filter(
+            key => !(key in (scopedParams ?? {})),
+          ),
+        )
+      : undefined
   const renderShellDocument = async (partial: PartialState, bounded: boolean) =>
     runInPrerender(
       async () => {
@@ -2069,9 +2090,7 @@ export async function renderPartialShell(options: RenderOptions): Promise<Prebui
               runWithCacheScope(() => pageRender({ ...options, partial }, false)),
             )
           const renderShell = () =>
-            options.fallbackParams && options.params
-              ? runInParamsScope(options.params, renderTree)
-              : renderTree()
+            scopedParams ? runInParamsScope(scopedParams, renderTree) : renderTree()
           return await (options.runtimeRegen
             ? renderShell()
             : runWithPrerenderDeterminism(renderShell))
@@ -2083,13 +2102,14 @@ export async function renderPartialShell(options: RenderOptions): Promise<Prebui
           completePrerender(scope)
         }
       },
-      { taskBoundary: bounded, ...(options.prefetchShell ? { prefetchShell: true } : {}) },
+      { taskBoundary: bounded, unfilledParams, prefetchShell: options.prefetchShell },
     )
   const freshPartial = (): BuildPartialState => ({
     mode: 'build',
     nextId: 0,
     holes: [],
     metadataDynamic: false,
+    runtimeData: 0,
   })
   let partial = freshPartial()
   try {
@@ -2111,6 +2131,7 @@ export async function renderPartialShell(options: RenderOptions): Promise<Prebui
       shell: renderDocumentStart(page),
       holes: partial.holes,
       metadataDynamic: partial.metadataDynamic,
+      ...(partial.runtimeData ? { runtimeData: partial.runtimeData } : {}),
     }
     // The prefetch-shell pass is a SECOND render of a route whose document shell
     // was already baked: persisting its sidecar would overwrite the document's
@@ -2146,6 +2167,7 @@ export async function renderRuntimePrefetchDocument(
     nextId: 0,
     holes: [],
     metadataDynamic: false,
+    runtimeData: 0,
   }
   const nextRequest = renderScopeRequest(options)
   try {
@@ -2161,7 +2183,7 @@ export async function renderRuntimePrefetchDocument(
             try {
               // Sync IO reached AFTER a runtime API resolved is content only the
               // navigation may render: the shims turn it into a postpone for the
-              // nearest boundary (silently — nothing is logged).
+              // nearest boundary.
               return await runWithRuntimePrefetchSyncIoAbort(() =>
                 runWithFontScope(() =>
                   runWithCacheScope(() => pageRender({ ...options, partial }, false)),
@@ -2173,7 +2195,11 @@ export async function renderRuntimePrefetchDocument(
               completePrerender(scope)
             }
           },
-          { runtimePrefetch: true },
+          {
+            runtimePrefetch: true,
+            route: options.route.route,
+            prefetchShell: options.prefetchShell,
+          },
         ),
       options.params ?? {},
     )
@@ -2323,7 +2349,7 @@ export function renderPprResponse(options: RenderOptions, prebuilt: PrebuiltShel
     options.request !== undefined &&
     getRouterProtocolExtensions().shellOnlyRequest(options.request, options.route)
   ) {
-    schedulePprShellUpgrade(options)
+    schedulePprShellUpgrade(options, prebuilt)
     return new Response(`${shell}${renderDocumentEnd()}`, {
       status: options.status ?? 200,
       headers: {
@@ -2336,7 +2362,7 @@ export function renderPprResponse(options: RenderOptions, prebuilt: PrebuiltShel
   // nothing to resume, and a buffered body (content-length, not chunked) lets
   // response-inspecting clients (test harnesses, intermediaries) read it.
   if (!postponed) {
-    schedulePprShellUpgrade(options)
+    schedulePprShellUpgrade(options, prebuilt)
     return new Response(`${shell}${renderDocumentEnd()}`, {
       status: options.status ?? 200,
       headers: { 'content-type': 'text/html; charset=utf-8' },
@@ -2367,7 +2393,7 @@ export function renderPprResponse(options: RenderOptions, prebuilt: PrebuiltShel
         const stamp = `<script${nonce ? ` nonce="${escapeHtml(nonce)}"` : ''}>${SHELL_TIME_SCRIPT}</script>`
         controller.enqueue(encoder.encode(stamp))
       }
-      schedulePprShellUpgrade(options)
+      schedulePprShellUpgrade(options, prebuilt)
       void (async () => {
         try {
           await seedPrerenderSidecar(options)
@@ -2510,7 +2536,7 @@ async function regenerateStalePprShell(options: RenderOptions): Promise<Prebuilt
  */
 export async function currentPprShellHtml(options: RenderOptions): Promise<string | null> {
   const shell =
-    (await loadPprShell(options.config, options.route, options.url)) ??
+    (await loadPprShell(options.config, options.route, routeTargetUrl(options))) ??
     (await regenerateStalePprShell(options))
   return shell?.shell ?? null
 }
@@ -2529,10 +2555,6 @@ async function loadPprShell(
       return null
     }
   }
-  const pprStale = await getRenderExtensions().prerenderSidecar.isStale(
-    prerenderSidecarContext({ config, route }),
-  )
-  if (pprStale === true) return null
   // Tag/path revalidation staleness: a shell baked with cache tags must stop serving once one of
   // those tags - or the route's path - is revalidated. The serving file's mtime is the freshness
   // mark; regeneration rewrites the base shell, self-healing it, and a stale sub-shell file is
@@ -2551,7 +2573,7 @@ async function loadPprShell(
       return true
     }
   }
-  const softStale = pprStale === 'soft'
+  // Checked before the build-time sidecar: a shell promoted after a revalidation is already fresh.
   const upgrade = pprShellUpgradeFor(config, route, url)
   if (upgrade) {
     const upgraded = pprShellUpgrades.get(upgrade.key)
@@ -2569,6 +2591,11 @@ async function loadPprShell(
       }
     }
   }
+  const pprStale = await getRenderExtensions().prerenderSidecar.isStale(
+    prerenderSidecarContext({ config, route }),
+  )
+  if (pprStale === true) return null
+  const softStale = pprStale === 'soft'
   // Sub-shell selection (Stage C.2): pick the deepest prebuilt sub-shell whose
   // concrete-param prefix matches the request. subShells are recorded on the
   // route at build in descending specificity; the base shell (route.id) is the
@@ -2613,10 +2640,17 @@ async function loadPprShell(
  * remaining fully dynamic suffix stays a hole forever.
  */
 export function schedulePprShellUpgrade(
-  options: Pick<RenderOptions, 'config' | 'route' | 'url'>,
+  options: Pick<RenderOptions, 'config' | 'route' | 'url' | 'nav'>,
+  served?: PrebuiltShell,
 ): void {
-  const upgrade = pprShellUpgradeFor(options.config, options.route, options.url)
-  if (!upgrade || pprShellUpgrades.has(upgrade.key) || rejectedPprShellUpgrades.has(upgrade.key)) {
+  const upgrade = pprShellUpgradeFor(options.config, options.route, routeTargetUrl(options))
+  if (
+    !upgrade ||
+    pprShellUpgrades.has(upgrade.key) ||
+    rejectedPprShellUpgrades.has(upgrade.key) ||
+    // The served shell already fills the promoted prefix (a prebuilt sub-shell): nothing to warm.
+    shellFillsUpgrade(upgrade, served)
+  ) {
     return
   }
   void promoteShell(options, upgrade, true).catch(() => undefined)
@@ -2639,6 +2673,9 @@ function promoteShell(
   upgrade: NonNullable<ReturnType<typeof pprShellUpgradeFor>>,
   background: boolean,
 ): Promise<PrebuiltShell | null> {
+  // A racing request may have finished this promotion after our shell lookup missed it.
+  const promoted = pprShellUpgrades.get(upgrade.key)
+  if (promoted) return Promise.resolve(promoted.shell)
   const pending = pendingPromotions.get(upgrade.key)
   if (pending) return pending
   const promotion = (async () => {
@@ -2725,6 +2762,19 @@ export function isPprShellUpgradeEligible(
   return pprShellUpgradeFor(config, route, url) !== undefined
 }
 
+/** The URL the route matched: a rewrite's destination, not the address the client requested. */
+function routeTargetUrl(options: Pick<RenderOptions, 'url' | 'nav'>): URL {
+  const target = options.nav?.targetPath
+  return target && target !== options.url.pathname ? new URL(target, options.url) : options.url
+}
+
+function shellFillsUpgrade(
+  upgrade: NonNullable<ReturnType<typeof pprShellUpgradeFor>>,
+  shell: PrebuiltShell | null | undefined,
+): boolean {
+  return Object.keys(upgrade.concreteParams).every(key => key in (shell?.concreteParams ?? {}))
+}
+
 function pprShellUpgradeFor(_config: ResolvedConfig, route: RouteManifestEntry, url?: URL) {
   // An explicit promotion policy names the concrete prefix and whether the request waits for it;
   // otherwise the longest generated prefix is promoted in the background under partial prefetching.
@@ -2771,7 +2821,13 @@ function selectSubShell(
   url: URL,
 ): NonNullable<RouteManifestEntry['pprSubShells']>[number] | undefined {
   const actual = matchRouteParams(route, url.pathname)
-  if (!actual) return undefined
+  return actual && subShellForParams(subShells, actual)
+}
+
+function subShellForParams(
+  subShells: NonNullable<RouteManifestEntry['pprSubShells']>,
+  actual: Record<string, RouteParamValue>,
+): NonNullable<RouteManifestEntry['pprSubShells']>[number] | undefined {
   for (const shell of subShells) {
     const ok = Object.entries(shell.concreteParams).every(([key, value]) => {
       const a = actual[key]
@@ -3851,9 +3907,9 @@ async function readSlotBranch(
     metadata: once(() => readSlotMetadata(options, layers, props, parentEntries)),
     viewport: once(async () => {
       const viewports: Viewport[] = []
-      for (const { module } of layers) {
+      for (const { file, module } of layers) {
         const viewport = await (extensions.readModuleViewport
-          ? extensions.readModuleViewport(module, props)
+          ? extensions.readModuleViewport(module, props, file)
           : readModuleViewport(module))
         if (viewport) viewports.push(viewport)
       }
@@ -4092,6 +4148,16 @@ async function renderTreeInFrame(
   await profileRenderStep(profile, 'discover client references', () =>
     addDiscoveredClientReferences(layoutRender.tree, clientComponents, clientReferences, options),
   )
+  // An HTML-limited bot's head blocks on its metadata, so it starts with the body; a boundary
+  // whose content settles before it is inlined rather than streamed (Next holds the shell for it).
+  const oneTask = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+  const blockingPageMetadata =
+    stream &&
+    !options.partial &&
+    typeof pageMetadata === 'function' &&
+    isHtmlLimitedBotRequest(options)
+      ? pageMetadata(mergeMetadataEntries(layoutRender.metadata))
+      : undefined
   const streamState: StreamState = {
     nextId: 0,
     deferred: [],
@@ -4101,6 +4167,7 @@ async function renderTreeInFrame(
     clientReferences,
     shellPending: Boolean(layoutRender.documentLayoutFile),
     inlineSuspense: stream && !options.partial && inlineSuspenseRoute(options),
+    shellGate: blockingPageMetadata?.then(oneTask, oneTask),
   }
   // A root layout that wraps its `<html>` in a Suspense must resolve that
   // boundary through in the partial (PPR) path too — never hole the shell.
@@ -4194,9 +4261,10 @@ async function renderTreeInFrame(
   // A router payload has no head to hoist into, so it always rides the body.
   const navMetadataRender = routerPayload(options)
   const startedPageMetadata =
-    metadataMayStream && !navMetadataRender && typeof pageMetadata === 'function'
+    blockingPageMetadata ??
+    (metadataMayStream && !navMetadataRender && typeof pageMetadata === 'function'
       ? runInCacheScope(() => pageMetadata(mergeMetadataEntries(layoutRender.metadata)))
-      : undefined
+      : undefined)
   const runtimeMetadataInBody =
     metadataMayStream &&
     (navMetadataRender ||
@@ -4494,7 +4562,7 @@ async function renderTreeInFrame(
     .join('\n')
   const compatBuildManifestScript =
     nextCompatEnabled(options.config) && !options.dev
-      ? `<script src="${escapeHtml(withAssetPrefix(options.config, '/_next/static/pnext/_buildManifest.js'))}"></script>`
+      ? `<script async src="${escapeHtml(withAssetPrefix(options.config, '/_next/static/pnext/_buildManifest.js'))}"></script>`
       : ''
   // Inlined CSS is a stylesheet, not a script: it belongs at the stylesheet slot so the cascade
   // (and the emitted order) matches the linked path.
@@ -6303,6 +6371,7 @@ async function resolvePartialSuspense(
     )
     if (tracked.dynamic) {
       if (!partial.clientOnly) partial.holes.push(id)
+      if (partial.mode === 'build') partial.runtimeData |= tracked.runtime
       const fallback = await resolveServerTree(node.props.fallback, opaque)
       return h(
         'pnext-suspense',
@@ -6345,6 +6414,7 @@ async function resolvePartialSuspense(
       return runWithTaskBoundarySuspended(() => resolveServerTree(node.props.children, state))
     }
     if (!partial.clientOnly) partial.holes.push(id)
+    if (partial.mode === 'build') partial.runtimeData |= error.runtime
     const fallback = await resolveServerTree(node.props.fallback, opaque)
     // Next's flight shell carries the boundary's STATIC wrapper markup even
     // though the UI shows the fallback (React postpones at the dynamic access,
@@ -6727,6 +6797,14 @@ function resolveServerTreeForStream(
     }
     if (!isPromise(children)) return children
     if (getRenderExtensions().streamingPromise?.shouldAwait(children)) return children
+    if (state.shellGate) {
+      let settled = false
+      const settle = () => (settled = true)
+      children.then(settle, settle)
+      return state.shellGate.then(() =>
+        settled ? children : streamSuspenseBoundary(node, children, state),
+      )
+    }
     return streamSuspenseBoundary(node, children, state)
   }
 
@@ -8225,32 +8303,34 @@ async function applyLayouts(
     })
   }
 
+  // Next passes layouts no searchParams; a hanging one would postpone a cached layout's key.
+  const { searchParams: _searchParams, ...layoutBaseProps } = layoutProps
   // Each layout receives only the params introduced AT or ABOVE its directory
   // (Next scopes params per layout level). Gated on next-compat so pure-core
   // layouts keep receiving the full param set.
-  const layoutPropsFor = (layoutFile: string): PageProps => {
+  const layoutPropsFor = (layoutFile: string): LayoutProps => {
     if (!withSegments) return layoutProps
     // Sub-shell (Stage C.2): a layout at/above a CONCRETE param renders it
     // buildtime; a layout at/above an unfilled param must hang so its boundary
     // postpones. Slice the concrete-prefix params per the layout's dir depth and
     // wrap in the sub-shell proxy so an unfilled key read throws PostponeError.
     if (options.fallbackConcreteParams) {
-      const scoped = layoutParamsForDir(
-        options.config.appPath,
-        dirname(layoutFile),
-        options.fallbackConcreteParams,
-      )
-      return {
-        ...layoutProps,
-        params: Promise.resolve(
-          subShellParamsProxy(scoped, options.fallbackParamKeys ?? Object.keys(scoped)),
-        ),
-      }
+      const names = layoutParamNamesForDir(options.config.appPath, dirname(layoutFile))
+      const concrete = encodedParams(options.fallbackConcreteParams)
+      const scoped = layoutParamsForDir(options.config.appPath, dirname(layoutFile), concrete)
+      // Only keys at or above this layout can hang; deeper ones are not in its params at all.
+      const keys = (options.fallbackParamKeys ?? []).filter(key => names.includes(key))
+      return { ...layoutBaseProps, params: Promise.resolve(subShellParamsProxy(scoped, keys)) }
     }
     // Base fallback shell (all params hang): a layout that awaits params must
     // postpone its boundary too (not read an empty object). Reuse the page-level
     // hanging params promise so the whole shell is param-independent.
-    if (options.fallbackParams) return { ...layoutProps, params: hangingPromise('params') }
+    if (options.fallbackParams) {
+      // A layout above every dynamic segment has no params to hang on.
+      return layoutParamNamesForDir(options.config.appPath, dirname(layoutFile)).length
+        ? { ...layoutBaseProps, params: hangingPromise('params', RUNTIME_PARAMS) }
+        : { ...layoutBaseProps, params: Promise.resolve({}) }
+    }
     // The scoped params go through the vary-tracking extension under the LAYOUT
     // segment kind: compat keys the layout's cache frame on the params this
     // layout reads, independently of the page's own set. Outside a tracking
@@ -8261,7 +8341,7 @@ async function applyLayouts(
       { kind: 'params', segment: 'layout' },
     )
     return {
-      ...layoutProps,
+      ...layoutBaseProps,
       params: legacySyncProps(Promise.resolve(scopedParams), 'params', scopedParams),
     }
   }
@@ -8276,6 +8356,7 @@ async function applyLayouts(
         const layoutDir = dirname(layoutPath)
         getRenderSpanExtensions().emitResolveSegmentSpan(
           layoutDir === options.config.appPath ? '' : basename(layoutDir),
+          layoutPath,
         )
       }
       const metadataExtensions = getActiveMetadataExtensions(options.config)
@@ -8304,7 +8385,7 @@ async function applyLayouts(
         })
       }
       const layoutViewport = metadataExtensions.readModuleViewport
-        ? await metadataExtensions.readModuleViewport(layoutModuleRecord, layoutProps)
+        ? await metadataExtensions.readModuleViewport(layoutModuleRecord, layoutProps, layoutPath)
         : prebuiltLayoutMetadata?.viewport
           ? prebuiltLayoutMetadata.viewport
           : await readModuleViewport(layoutModule)
@@ -8546,7 +8627,7 @@ async function wrapSegment(
   layoutFile: string,
   component: ServerComponent<{ children: ComponentChildren }> | undefined,
   tree: ComponentChildren,
-  layoutProps: PageProps,
+  layoutProps: LayoutProps,
   templateByDir: Map<string, string>,
   slotContext: SlotContext<RenderOptions>,
 ): Promise<ComponentChildren> {

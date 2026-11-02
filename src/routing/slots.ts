@@ -1,6 +1,6 @@
 import path from 'node:path'
-import { canonicalSegment } from '../utils/decode'
 import { readDirListing, toPosixPath } from '../utils/fs'
+import { getRoutingExtensions } from '../extensions'
 import type { InterceptionMarker, RouteParamValue } from '../types'
 
 // Parallel-route (@slot) and intercepting-route ((.)segment) tree matching.
@@ -35,6 +35,17 @@ export function isSlotSegment(name: string) {
 
 export function isGroupSegment(name: string) {
   return name.startsWith('(') && name.endsWith(')') && !interceptionMarkerOf(name)
+}
+
+/** The dynamic param names introduced AT or ABOVE `dir`. */
+export function layoutParamNamesForDir(appPath: string, dir: string): string[] {
+  const relativeDir = path.relative(appPath, dir)
+  if (relativeDir.startsWith('..')) return []
+  return relativeDir
+    .split(path.sep)
+    .flatMap(
+      name => optionalCatchAllName(name) ?? catchAllName(name) ?? dynamicParamName(name) ?? [],
+    )
 }
 
 /** Nearest existing `<base>.<ext>` convention file in `dir`. */
@@ -160,7 +171,7 @@ export function matchSegments(
       path.join(dir, name),
       rest,
       options,
-      { ...params, [param]: canonicalSegment(head) },
+      { ...params, [param]: getRoutingExtensions().paramValue(head) },
       [...dirs, name],
     )
     if (match) return match
@@ -175,7 +186,7 @@ export function matchSegments(
       path.join(dir, name),
       [],
       options,
-      { ...params, [param]: segments.map(canonicalSegment) },
+      { ...params, [param]: segments.map(getRoutingExtensions().paramValue) },
       [...dirs, name],
     )
     if (match) return match
@@ -477,8 +488,8 @@ export function matchSlotInterceptor(
     unit.params.forEach((param, index) => {
       const value = match[index + 1] ?? ''
       params[param.name] = param.catchAll
-        ? value.split('/').filter(Boolean).map(canonicalSegment)
-        : canonicalSegment(value)
+        ? value.split('/').filter(Boolean).map(getRoutingExtensions().paramValue)
+        : getRoutingExtensions().paramValue(value)
     })
     const rest = unit.catchAllTail ? [] : segments.slice(unit.targetSegments.length)
     const inner = matchSegments(unit.dir, rest, { markersAsSegments: true }, params, [])
@@ -518,8 +529,8 @@ function matchTargetTokens(
     .forEach((token, index) => {
       const value = match[index + 1] ?? ''
       params[token.param!] = token.catchAll
-        ? value.split('/').filter(Boolean).map(canonicalSegment)
-        : canonicalSegment(value)
+        ? value.split('/').filter(Boolean).map(getRoutingExtensions().paramValue)
+        : getRoutingExtensions().paramValue(value)
     })
   return params
 }

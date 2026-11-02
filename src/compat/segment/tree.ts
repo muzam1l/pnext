@@ -27,12 +27,15 @@ export const DEFAULT_STATIC_STALE_TIME_SECONDS = 300
 
 export const enum PrefetchHint {
   HasRuntimePrefetch = 0b00001,
+  SubtreeHasPartialPrefetching = 0b00010,
   IsRootLayout = 0b10000,
   ParentInlinedIntoSelf = 0b100000,
   InlinedIntoChild = 0b1000000,
   HeadInlinedIntoSelf = 0b10000000,
   HeadOutlined = 0b100000000,
   PrefetchDisabled = 0b10000000000,
+  ShouldAttemptStaticShell = 0b100000000000000,
+  ShouldAttemptStaticPrefetch = 0b1000000000000000,
 }
 
 /**
@@ -105,6 +108,11 @@ interface BuildTreeOptions {
   inlineBudgetBytes?: number
   runtimePrefetch?: boolean
   postponed?: boolean
+  partialPrefetching?: boolean
+  /** The App Shell render read no session data. */
+  shellStatic?: boolean
+  /** The document render read no session or URL data. */
+  prefetchStatic?: boolean
   /** Segment-M2 vary sets collected while rendering this route, when tracked. */
   vary?: SegmentVaryPayload
   /** The matched route pattern (client vary-key identity). */
@@ -157,7 +165,12 @@ function buildTree(options: BuildTreeOptions): SegmentTreeNode {
     name: '',
     param: null,
     slots: { children: child },
-    prefetchHints: PrefetchHint.IsRootLayout | (canInlineBody ? PrefetchHint.InlinedIntoChild : 0),
+    prefetchHints:
+      PrefetchHint.IsRootLayout |
+      (canInlineBody ? PrefetchHint.InlinedIntoChild : 0) |
+      (options.partialPrefetching ? PrefetchHint.SubtreeHasPartialPrefetching : 0) |
+      (options.shellStatic ? PrefetchHint.ShouldAttemptStaticShell : 0) |
+      (options.prefetchStatic ? PrefetchHint.ShouldAttemptStaticPrefetch : 0),
   }
 }
 
@@ -236,10 +249,10 @@ export function rootTreePrefetchText(
  */
 export function treePrefetchResponse(
   payload: RootTreePrefetch,
-  options: { format?: 'json' | 'flight' } = {},
+  options: { format?: 'json' | 'flight'; status?: number; headers?: Record<string, string> } = {},
 ): Response {
   return new Response(rootTreePrefetchText(payload, options.format), {
-    status: 200,
+    status: options.status ?? 200,
     headers: {
       'content-type': RSC_CONTENT_TYPE_HEADER,
       'x-nextjs-postponed': '2',
@@ -252,6 +265,7 @@ export function treePrefetchResponse(
       'cache-control': payload.isStatic
         ? 's-maxage=31536000, stale-while-revalidate'
         : 'private, no-store',
+      ...options.headers,
     },
   })
 }
@@ -367,6 +381,8 @@ export interface SegmentMeta {
   inlinedSegmentPaths?: string[]
   /** Route-level prefetch hints, mirrored into Next-shaped metadata. */
   prefetchHints?: Record<string, number>
+  /** `staleTime` comes from the route's own cacheLife(), so even 0 is the route's word, not a default. */
+  staleTimeDeclared?: boolean
   /**
    * The vary set the BUILD render tracked for this baked body, in the same wire encoding a live response
    * publishes. ABSENT means "unknown" - the client then keys the entry on its exact URL.
@@ -391,6 +407,7 @@ export function buildSegmentMeta(options: {
   bodySizeBytes?: number
   inlineBudgetBytes?: number
   prefetchHints?: Record<string, number>
+  staleTimeDeclared?: boolean
   /** The build render's tracked vary set — omitted when it is not trustworthy. */
   vary?: ResponseVaryParams
 }): SegmentMeta {
@@ -409,6 +426,7 @@ export function buildSegmentMeta(options: {
       : {}),
     ...(inlined ? { inlinedSegmentPaths: [ROUTE_SEGMENT_PATH] } : {}),
     ...(options.prefetchHints ? { prefetchHints: options.prefetchHints } : {}),
+    ...(options.staleTimeDeclared ? { staleTimeDeclared: true } : {}),
     ...(options.vary
       ? {
           vary: varyNamesFor(options.vary, 'body'),

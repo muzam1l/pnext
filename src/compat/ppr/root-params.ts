@@ -14,6 +14,7 @@ import {
   hangingPromise,
   isPrerendering,
   isRuntimePrefetchPrerender,
+  RUNTIME_PARAMS,
 } from '../../render/ppr'
 import { insideUnstableCacheProducer } from '../cache/revalidate'
 import {
@@ -106,7 +107,7 @@ export function rootParam<T = string | string[] | undefined>(name: string): Prom
     isPrerendering() &&
     !isRuntimePrefetchPrerender()
   ) {
-    return hangingPromise<T>(`rootParam(${name})`)
+    return hangingPromise<T>(`rootParam(${name})`, RUNTIME_PARAMS)
   }
   const params = currentUseCacheRootParams()
   return Promise.resolve(params[name] as T)

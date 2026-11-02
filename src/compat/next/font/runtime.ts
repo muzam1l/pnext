@@ -777,9 +777,9 @@ async function emitRemoteFontFile(context: FontResolveContext, url: string, emit
 }
 
 async function fetchFontFile(url: string) {
-  const mocked = mockedGoogleResponse(url)
-  if (mocked instanceof Uint8Array) return mocked
-  if (typeof mocked === 'string') return new TextEncoder().encode(mocked)
+  // Next's mocked mode never fetches a font file: a path is read, any other URL is its own bytes.
+  if (process.env.NEXT_FONT_GOOGLE_MOCKED_RESPONSES)
+    return new Uint8Array(url.startsWith('/') ? readFileSync(url) : Buffer.from(url))
 
   const response = await fetch(url)
   if (!response.ok) throw new Error(`Failed to fetch font file from \`${url}\`.`)
@@ -945,9 +945,6 @@ function mockedGoogleResponse(url: string) {
   const mocked = require(mockFile) as Record<string, string>
   const value = mocked[url]
   if (value === undefined) throw new Error(`Missing mocked response for URL: ${url}`)
-  if (typeof value === 'string' && value.startsWith('/') && existsSync(value)) {
-    return new Uint8Array(readFileSync(value))
-  }
   return value
 }
 

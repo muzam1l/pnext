@@ -30,6 +30,7 @@ import {
   diagnosticLeadsWithErrorLine,
   prerenderFailureFooter,
 } from '../validation/prerender-diagnostics'
+import { formatBuildError } from '../validation/errors'
 
 let registered = false
 // Host-scoped guard: a fresh host must be registered into again.
@@ -51,6 +52,8 @@ export function registerValidationExtensions(config: ResolvedConfig): void {
           checkComplete,
         )
       } catch (error) {
+        // The CLI prints a validation error once.
+        if ((error as Error).name === 'PnextBuildValidationError') throw error
         recordPrerenderError({
           kind: 'validation',
           route: route.route || '/',
@@ -80,6 +83,7 @@ export function registerValidationExtensions(config: ResolvedConfig): void {
   setBuildCompatExtensions({
     diagnoseCacheComponentsPrerender,
     diagnosticLeadsWithErrorLine,
+    formatBuildError,
     prerenderFailureFooter,
     recordBuildFlags: writeBuildFlags,
   })

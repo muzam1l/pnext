@@ -1621,9 +1621,14 @@ function createClientSourcePipeline(config: ResolvedConfig, dev = false, routeId
         name: 'pnext-client-source',
         setup(build) {
           if (config.workspaceRootExplicit) {
+            // A loader-rule file stays in the `file` namespace, where the rule's onLoad claims it.
+            const claimed = (file: string) =>
+              getAssetExtensions().hasLoaderRuleFor(file, '')
+                ? { path: file }
+                : { path: file, namespace: clientSourceNamespace }
             build.onResolve({ filter }, args => {
               if (!path.isAbsolute(args.path)) return undefined
-              return { path: path.resolve(args.path), namespace: clientSourceNamespace }
+              return claimed(path.resolve(args.path))
             })
             build.onResolve({ filter: /^\./, namespace: clientSourceNamespace }, args => {
               const resolved = resolveImport(
@@ -1635,7 +1640,7 @@ function createClientSourcePipeline(config: ResolvedConfig, dev = false, routeId
               if (!resolved || !filter.test(resolved)) {
                 return resolved ? { path: resolved } : undefined
               }
-              return { path: resolved, namespace: clientSourceNamespace }
+              return claimed(resolved)
             })
             build.onLoad({ filter: /.*/, namespace: clientSourceNamespace }, async args => {
               const resolved = path.resolve(args.path)

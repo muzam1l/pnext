@@ -24,6 +24,7 @@ import {
   interceptionMarkerOf,
   isGroupSegment,
   isSlotSegment,
+  layoutParamNamesForDir,
   slotConventionFile,
   slotDirectoriesIn,
   unrenderableSlots,
@@ -614,17 +615,15 @@ function pageOrHandlerFacts(
     // segment has no static params, the route renders on demand and the ancestor's dynamicParams config no
     // longer restricts it (Next treats the whole path as dynamic).
     const allDynamicParams = [...parts.params, ...(parts.catchAll ? [parts.catchAll] : [])]
-    const coveredParams = new Set<string>()
-    for (const entry of configEntries) {
-      if (!hasStaticParamsExport(entry.source)) continue
-      const covered = paramOfOwnSegment(appPath, entry.file, allDynamicParams)
-      if (covered) coveredParams.add(covered)
-    }
+    const coveredParams = new Set(
+      configEntries
+        .filter(entry => hasStaticParamsExport(entry.source))
+        .flatMap(entry => layoutParamNamesForDir(appPath, path.dirname(entry.file))),
+    )
+    // A fully generated route closes every param, like Next's route-wide fallback: false.
     if (allDynamicParams.some(param => !coveredParams.has(param))) {
       delete segmentConfig.dynamicParamsFalse
-    } else if (hasStaticParamsExport(source)) {
-      segmentConfig.strictDynamicParams = true
-    }
+    } else segmentConfig.dynamicParamsFalse = allDynamicParams
   }
   const hasStaticParams =
     hasStaticParamsExport(source) ||
@@ -1378,7 +1377,7 @@ function djb2Hash(value: string) {
   return hash >>> 0
 }
 
-function inferRouteMode(
+export function inferRouteMode(
   parts: RouteParts,
   usesRequest: boolean,
   config?: RouteSegmentConfig,
@@ -1400,6 +1399,7 @@ interface ParsedSegmentConfig {
   dynamicParams?: boolean
   runtime?: string
   prefetch?: RouteSegmentConfig['prefetch']
+  ensureStatic?: RouteSegmentConfig['ensureStatic']
   unstableInstant?: boolean
   stableInstant?: boolean
   /** Literal but invalid `export const revalidate` value (build error in Next). */
@@ -1442,6 +1442,11 @@ function parseSegmentConfig(source: string): ParsedSegmentConfig {
       searchable,
     )
   if (prefetchMatch) parsed.prefetch = prefetchMatch[1] as RouteSegmentConfig['prefetch']
+  const ensureStaticMatch =
+    /^\s*export\s+const\s+ensureStatic\s*=\s*['"](shell|prefetch|navigation)['"]/m.exec(searchable)
+  if (ensureStaticMatch) {
+    parsed.ensureStatic = ensureStaticMatch[1] as RouteSegmentConfig['ensureStatic']
+  }
   // Stable `instant` and its legacy alias share one runtime representation.
   const instantMatch =
     /^\s*export\s+const\s+(instant|unstable_instant)\s*=\s*(true|false|\{)/m.exec(searchable)
@@ -1459,9 +1464,9 @@ function parseSegmentConfig(source: string): ParsedSegmentConfig {
  * `force-dynamic` (any segment forces the whole route) and `revalidate`
  * (the lowest declared number wins, Next-style).
  *
- * `dynamicParams = false` is resolved per param: it governs the params that
- * appear in the declaring file's own directory prefix, taking the leaf-most
- * declaration for each param.
+ * `dynamicParams = false` is resolved per param: it closes the params that
+ * appear in the declaring file's own directory prefix, whatever any other
+ * segment declares.
  */
 function segmentConfigFromEntries(
   appPath: string,
@@ -1471,7 +1476,7 @@ function segmentConfigFromEntries(
   const config: RouteSegmentConfig = {}
   let lowestRevalidate: number | undefined
   let sawRevalidateFalse = false
-  const dynamicParamsByName = new Map<string, boolean>()
+  const closedParams = new Set<string>()
   const allParams = [...parts.params, ...(parts.catchAll ? [parts.catchAll] : [])]
 
   for (const entry of entries) {
@@ -1497,39 +1502,26 @@ function segmentConfigFromEntries(
     if (parsed.fetchCache && !config.fetchCache) config.fetchCache = parsed.fetchCache
     if (parsed.runtime && !config.runtime) config.runtime = parsed.runtime
     if (parsed.prefetch && !config.prefetch) config.prefetch = parsed.prefetch
+    if (parsed.ensureStatic && !config.ensureStatic) config.ensureStatic = parsed.ensureStatic
     // Leaf-most declaration wins (entries are page-first): a page's explicit
     // `unstable_instant = false` overrides a layout's opt-in.
     if (parsed.unstableInstant !== undefined && config.unstableInstant === undefined) {
       config.unstableInstant = parsed.unstableInstant
       if (parsed.stableInstant) config.stableInstant = true
     }
-    if (parsed.dynamicParams !== undefined) {
-      const param = paramOfOwnSegment(appPath, entry.file, allParams)
-      if (param !== undefined && !dynamicParamsByName.has(param)) {
-        dynamicParamsByName.set(param, parsed.dynamicParams)
+    if (parsed.dynamicParams === false) {
+      for (const param of layoutParamNamesForDir(appPath, path.dirname(entry.file))) {
+        closedParams.add(param)
       }
     }
   }
 
   if (lowestRevalidate !== undefined) config.revalidate = lowestRevalidate
   else if (sawRevalidateFalse) config.revalidate = false
-  const governed = allParams.filter(param => dynamicParamsByName.get(param) === false)
+  const governed = allParams.filter(param => closedParams.has(param))
   if (governed.length > 0) config.dynamicParamsFalse = governed
 
   return Object.keys(config).length > 0 ? config : undefined
-}
-
-/**
- * The route param introduced by the file's own directory segment, if any. A `dynamicParams` declaration
- * governs that segment only - it does not cascade to child segments (a layout at `[locale]/` governs
- * `locale` but not a `[slug]` below it).
- */
-function paramOfOwnSegment(appPath: string, file: string, params: string[]) {
-  const segments = toPosixPath(path.relative(appPath, path.dirname(file))).split('/')
-  const own = segments[segments.length - 1]
-  return params.find(
-    param => own === `[${param}]` || own === `[...${param}]` || own === `[[...${param}]]`,
-  )
 }
 
 // The parse is memoized per source, so the thousands of directive checks a

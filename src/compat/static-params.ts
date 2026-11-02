@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import type { RouteManifestEntry, RouteParamValue } from '../types'
+import { nextRoutePattern } from '../routing/match'
 
 // globalThis-anchored (this module can be loaded twice — original + built copy
 // — and both must observe the same scope; see the use-cache module-duplication
@@ -8,6 +9,8 @@ const GSP_SCOPE = Symbol.for('pnext.generateStaticParamsScope')
 interface GspScope {
   /** Params provided by parent generateStaticParams calls. */
   provided: Record<string, unknown>
+  functionName: 'generateStaticParams' | 'unstable_generateParamMatching'
+  route: string
 }
 const globals = globalThis as { [GSP_SCOPE]?: AsyncLocalStorage<GspScope> }
 const gspScope = (globals[GSP_SCOPE] ??= new AsyncLocalStorage<GspScope>())
@@ -19,6 +22,7 @@ export function generateStaticParamsScope(): GspScope | undefined {
 
 export function aliasGenerateStaticParams(
   module: Record<string, unknown>,
+  route: RouteManifestEntry,
 ): Record<string, unknown> {
   if (typeof module.params === 'function' || typeof module.generateStaticParams !== 'function') {
     return module
@@ -30,9 +34,20 @@ export function aliasGenerateStaticParams(
   // generateStaticParams call (and which parent params are available) —
   // reading a root param inside the generateStaticParams that defines it is a
   // build error (app-root-params-getters/generate-static-params-error).
+  const scope = {
+    functionName: 'generateStaticParams' as const,
+    route: nextRoutePattern(route.route, route.catchAllOptional),
+  }
   const params = (args?: { params?: Record<string, unknown> }) =>
-    gspScope.run({ provided: args?.params ?? {} }, () => generate(args))
+    gspScope.run({ ...scope, provided: args?.params ?? {} }, () => generate(args))
   return { ...module, params }
+}
+
+export function runParamMatchingGenerator<T>(route: string, generate: () => T): T {
+  return gspScope.run(
+    { provided: {}, functionName: 'unstable_generateParamMatching', route },
+    generate,
+  )
 }
 
 // Request-time admission of closed params: a `not-found` matching policy or a
@@ -111,11 +126,11 @@ export function paramPromotion(
   return length > 0 ? { length, foreground } : undefined
 }
 
-function closedParams(route: RouteManifestEntry): string[] {
+export function closedParams(
+  route: Pick<RouteManifestEntry, 'params' | 'catchAll' | 'segmentConfig' | 'paramMatching'>,
+): string[] {
   const names = [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
   const governed = route.segmentConfig?.dynamicParamsFalse ?? []
-  // The page's own static params export: the full tuple must match (Next's fallback: false).
-  if (governed.length > 0 && route.segmentConfig?.strictDynamicParams) return names
   const policy = route.paramMatching ?? {}
   return names.filter(name => governed.includes(name) || policy[name] === 'not-found')
 }

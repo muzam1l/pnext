@@ -357,6 +357,24 @@ const SYNC_IO_WAYS: Record<SyncIOFamily, string> = {
   ].join('\n'),
 }
 
+/** Next's unstable-value message for sync IO (`label`, e.g. `Date.now()`) reached in a prerender. */
+export function syncIoMessage(
+  route: string,
+  label: string,
+  family: SyncIOFamily = label.startsWith('crypto')
+    ? 'crypto'
+    : label.startsWith('Math.random')
+      ? 'random'
+      : 'current-time',
+): string {
+  return (
+    `Route "${route}": Next.js encountered the unstable value \`${label}\` while prerendering.\n\n` +
+    'This value can change between renders, so it must be either prerendered or computed later.\n\n' +
+    'Ways to fix this:\n' +
+    SYNC_IO_WAYS[family]
+  )
+}
+
 /** Node crypto member -> message label ('' keeps the default `(...)` form). */
 const NODE_CRYPTO_LABELS: Record<string, string> = {
   getRandomValues: 'crypto.getRandomValues()',
@@ -690,12 +708,7 @@ function syncIOBlock(
   finding: SyncIOFinding,
   debugPrerender: boolean,
 ): string {
-  const parts: string[] = [
-    `Error: Route "${route}": Next.js encountered the unstable value \`${finding.label}\` while prerendering.\n\n` +
-      'This value can change between renders, so it must be either prerendered or computed later.\n\n' +
-      'Ways to fix this:\n' +
-      SYNC_IO_WAYS[finding.family],
-  ]
+  const parts: string[] = [`Error: ${syncIoMessage(route, finding.label, finding.family)}`]
   if (debugPrerender) {
     for (const frame of finding.frames) {
       parts.push(`    at ${frame.name} (webpack:///${displayPath}:${frame.line}:${frame.col})`)
@@ -892,11 +905,10 @@ function detectPrivateInUseCache(
     ].join('\n')
   }
   // Minified: the runtime error is logged twice (Next's known double-log), each
-  // with a dist frame + a host-anonymous frame carrying the serialized digest.
+  // with one dist frame carrying the serialized digest.
   const loggedError = [
     `Error: ${createUseCachePrivateInsidePublicUseCacheError(route).message}`,
-    '    at r (.next/server/chunks/main.js:1:1)',
-    `    at ${privateFn.name} (<anonymous>)${digestTrailer()}`,
+    `    at r (.next/server/chunks/main.js:1:1)${digestTrailer()}`,
   ].join('\n')
   return [`⨯ ${loggedError}`, loggedError, minifiedTrailer(route)].join('\n')
 }

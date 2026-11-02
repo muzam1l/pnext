@@ -21,7 +21,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 // so client control-flow code can import isPostpone without pulling this module
 // (and its AsyncLocalStorage) into the browser bundle. Re-exported here so
 // every server caller keeps importing them from ppr.
-export { PostponeError, isPostpone } from './postpone'
+export { PostponeError, isPostpone, RUNTIME_PARAMS, RUNTIME_SESSION, RUNTIME_URL } from './postpone'
 import { isPostpone as isPostponeError, PostponeError } from './postpone'
 
 // The prerender scope carries an AbortController so a hanging promise whose
@@ -56,6 +56,10 @@ interface PrerenderScope {
    * awaitAtTaskBoundary). Only set for a cacheComponents build shell render.
    */
   readonly taskBoundary?: boolean
+  /** Runtime-prefetch prerenders: the route pattern, for the sync-IO report. */
+  readonly route?: string
+  /** A fallback or sub-shell prerender: the route params it leaves unfilled (reads of them hang). */
+  readonly unfilledParams?: ReadonlySet<string>
 }
 
 // Anchored on globalThis (like requestStorage in request/context.ts) so a
@@ -71,6 +75,8 @@ const csrBailoutStorage = ((globalThis as Record<PropertyKey, unknown>)[CSR_BAIL
 
 interface PrerenderDynamicTracker {
   dynamic: boolean
+  /** RUNTIME_* bits of the postpones seen. */
+  runtime: number
 }
 
 const prerenderDynamicTrackerStorage = new AsyncLocalStorage<PrerenderDynamicTracker>()
@@ -78,33 +84,23 @@ const prerenderDynamicTrackerStorage = new AsyncLocalStorage<PrerenderDynamicTra
 export async function trackPrerenderDynamic<T>(callback: () => Promise<T>): Promise<{
   value: T
   dynamic: boolean
+  runtime: number
 }> {
-  const tracker: PrerenderDynamicTracker = { dynamic: false }
+  const tracker: PrerenderDynamicTracker = { dynamic: false, runtime: 0 }
   const value = await prerenderDynamicTrackerStorage.run(tracker, callback)
-  return { value, dynamic: tracker.dynamic }
+  return { value, dynamic: tracker.dynamic, runtime: tracker.runtime }
 }
 
-function markPrerenderDynamic(): void {
+function markPrerenderDynamic(runtime: number): void {
   const tracker = prerenderDynamicTrackerStorage.getStore()
-  if (tracker) tracker.dynamic = true
+  if (!tracker) return
+  tracker.dynamic = true
+  tracker.runtime |= runtime
 }
 
 // ---------------------------------------------------------------------------
-// Build-shell dynamic-source tracking.
-//
-// A cacheComponents route whose only dynamic access is `params` inside a
-// <Suspense> boundary produces a hole during the partial-shell prerender, yet
-// must NOT be served as a postponed fallback shell: params are part of the URL
-// and always available at request time, so the route is served with a blocking
-// dynamic render (Next's fallback-shells "without IO should not postpone").
-// A hole caused by cached IO (`use cache`/cached fetch) or by request data
-// other than params (cookies()/headers()/connection()/searchParams) is a
-// genuine partial-shell postpone and keeps the fallback-shell path.
-//
-// Anchored on globalThis because the built compat-server bundle loads its own
-// copy of this module (same reason revalidate.ts / cache-fill state anchor
-// there): the cache runtime recording a fill lives in a different module copy
-// from the build driver that begins/reads the window.
+// Build-shell dynamic sources: a params-only hole renders blocking, cached IO or other request data postpones.
+// On globalThis: the compat-server bundle's own copy of this module records the cache fills.
 const SHELL_SOURCES = Symbol.for('pnext.shellDynamicSources')
 interface ShellSourceState {
   active: boolean
@@ -143,7 +139,7 @@ function recordShellRequestApi(api: string): void {
 }
 
 /** Record that cached IO (a `use cache`/fetch/unstable_cache fill) ran during the shell. */
-function recordShellCacheIO(): void {
+export function recordShellCacheIO(): void {
   const state = shellSourceState()
   if (state.active) state.cacheIO = true
 }
@@ -151,7 +147,13 @@ function recordShellCacheIO(): void {
 /** Render `callback` in prerender mode so request APIs postpone instead of throwing. */
 export function runInPrerender<T>(
   callback: () => T,
-  options: { runtimePrefetch?: boolean; prefetchShell?: boolean; taskBoundary?: boolean } = {},
+  options: {
+    runtimePrefetch?: boolean
+    prefetchShell?: boolean
+    taskBoundary?: boolean
+    route?: string
+    unfilledParams?: ReadonlySet<string>
+  } = {},
 ): T {
   const controller = new AbortController()
   activePrerenderControllers().add(controller)
@@ -161,6 +163,8 @@ export function runInPrerender<T>(
     ...(options.runtimePrefetch ? { runtimePrefetch: true, awaitedRuntimeApi: false } : {}),
     ...(options.prefetchShell ? { prefetchShell: true } : {}),
     ...(options.taskBoundary ? { taskBoundary: true } : {}),
+    ...(options.route !== undefined ? { route: options.route } : {}),
+    ...(options.unfilledParams ? { unfilledParams: options.unfilledParams } : {}),
   }
   return prerenderStorage.run(scope, callback)
 }
@@ -203,6 +207,11 @@ export function isCsrBailoutPrerender(): boolean {
   return csrBailoutStorage.getStore() === true
 }
 
+/** True when the current shell prerender leaves route param `name` unfilled. */
+export function isUnfilledShellParam(name: string): boolean {
+  return prerenderStorage.getStore()?.unfilledParams?.has(name) === true
+}
+
 /** True inside a runtime-prefetch prerender (see PrerenderScope.runtimePrefetch). */
 export function isRuntimePrefetchPrerender(): boolean {
   return prerenderStorage.getStore()?.runtimePrefetch === true
@@ -229,27 +238,8 @@ export function completePrerender(scope: PrerenderScope | undefined): void {
   scope.abort()
 }
 
-// Task-boundary prerender (cacheComponents build parity).
-//
-// Next ends a build prerender at the first TASK boundary: work that settles while the microtask queue
-// drains lands in the static shell, while anything needing a fresh macrotask (setTimeout, setImmediate,
-// real I/O) does NOT - the surrounding <Suspense> keeps its fallback and the content is filled in at request
-// time. Upstream that falls out of React's `prerender` being started in one task and aborted in the next.
-//
-// pnext resolves the server tree itself rather than through React's prerender, so the boundary is modelled
-// per server-component invocation: the component's promise races a deadline that fires once the microtask
-// queue has drained. A microtask-settled component always wins the race; a task-settled one loses and
-// postpones.
-//
-// The drain is counted in microtask turns rather than armed with `setImmediate`, because `setImmediate` is
-// only ordered against the CHECK phase of the loop: a component's already-expired `setTimeout` sitting in
-// the TIMERS phase beats it roughly half the time whenever a loop turn runs long, which baked Suspense
-// content into the static shell instead of postponing. Microtasks cannot be preempted by any timer or I/O
-// callback, so the verdict is the same on a quiet machine and under a saturated CPU.
-//
-// Arming the deadline per invocation, rather than once for the whole render, is what keeps a SIBLING static
-// subtree renderable after another subtree hit the boundary - the parallel-routes case, where the `@slot`
-// becomes a hole but `children` must still bake into the shell.
+// Task-boundary prerender: per server component, work settling after the microtask queue drains postpones.
+// Counted in microtask turns (no timer can preempt them), armed per invocation so siblings still bake.
 
 const taskPostponeSymbol = Symbol.for('pnext.taskPostpone')
 
@@ -463,12 +453,12 @@ export function isHangingPromise(value: unknown): boolean {
   )
 }
 
-export function hangingPromise<T = never>(api: string): Promise<T> {
+export function hangingPromise<T = never>(api: string, runtime = 0): Promise<T> {
   const scope = prerenderStorage.getStore()
   // Outside a prerender scope this should not be called; return a caught
   // rejection defensively so a stray await surfaces rather than hangs forever.
   if (!scope) {
-    const stray = Promise.reject<T>(new PostponeError(api))
+    const stray = Promise.reject<T>(new PostponeError(api, runtime))
     stray.catch(() => undefined)
     return stray
   }
@@ -482,7 +472,7 @@ export function hangingPromise<T = never>(api: string): Promise<T> {
   const promise = new Promise<T>((_resolve, reject) => {
     settle = (error: Error) => reject(error)
   })
-  const rejectAwaited = () => settle?.(new PostponeError(api))
+  const rejectAwaited = () => settle?.(new PostponeError(api, runtime))
   if (scope.signal.aborted) {
     settle?.(prerenderCompleteError(api))
   } else {
@@ -494,38 +484,36 @@ export function hangingPromise<T = never>(api: string): Promise<T> {
   // observed never surfaces as an unhandled rejection; an actual awaiter/handler
   // still observes the throw (it subscribes to the same promise).
   promise.catch(() => undefined)
-  return new Proxy(promise, {
+  const handler: ProxyHandler<Promise<T>> = {
     get(target, property) {
       // Before every observation arm: reading the tag must not mark dynamic.
       if (property === HANGING_PROMISE) return true
       if (property === 'then') {
         return (...args: Parameters<typeof target.then>) => {
+          // A bare `.then(fn)` only derives a promise: it postpones wherever that one is consumed.
+          if (typeof args[0] === 'function' && typeof args[1] !== 'function') {
+            return new Proxy(target.then(...args) as Promise<T>, handler)
+          }
           // A fulfillment handler means the value is being consumed (an await or
           // value-taking `.then`): mark the boundary dynamic and postpone.
           if (typeof args[0] === 'function') rejectAwaited()
-          markPrerenderDynamic()
+          markPrerenderDynamic(runtime)
           recordShellRequestApi(api)
           return target.then(...args)
         }
       }
-      if (property === 'catch') {
-        return (...args: Parameters<typeof target.catch>) => {
-          markPrerenderDynamic()
+      if (property === 'catch' || property === 'finally') {
+        return (...args: [never]) => {
+          markPrerenderDynamic(runtime)
           recordShellRequestApi(api)
-          return target.catch(...args)
-        }
-      }
-      if (property === 'finally') {
-        return (...args: Parameters<typeof target.finally>) => {
-          markPrerenderDynamic()
-          recordShellRequestApi(api)
-          return target.finally(...args)
+          return target[property](...args)
         }
       }
       const value: unknown = Reflect.get(target, property, target)
       return value
     },
-  })
+  }
+  return new Proxy(promise, handler)
 }
 
 // ---------------------------------------------------------------------------
@@ -704,12 +692,22 @@ export function markRuntimeApiOnAwait<T>(promise: Promise<T>): Promise<T> {
   })
 }
 
+// Reports each sync-IO abort of a runtime prefetch; anchored on globalThis for dual module copies.
+const SYNC_IO_REPORTER = Symbol.for('pnext.runtimePrefetchSyncIoReporter')
+type SyncIoReporter = (expression: string, route: string) => void
+const syncIoReporter = globalThis as { [SYNC_IO_REPORTER]?: SyncIoReporter }
+
+export function setRuntimePrefetchSyncIoReporter(reporter: SyncIoReporter): void {
+  syncIoReporter[SYNC_IO_REPORTER] = reporter
+}
+
 /** Throw the boundary-aborting postpone when sync IO happens post-runtime-API. */
-function abortOnSynchronousPlatformIOAccess(): void {
+function abortOnSynchronousPlatformIOAccess(expression: string): void {
   const scope = prerenderStorage.getStore()
   if (scope?.runtimePrefetch !== true || scope.awaitedRuntimeApi !== true) return
   // Sync IO inside a `use cache` body is legal — see insideUseCacheScope above.
   if (insideUseCacheScope()) return
+  syncIoReporter[SYNC_IO_REPORTER]?.(expression, scope.route || '/')
   throw new PostponeError('sync IO')
 }
 
@@ -762,11 +760,11 @@ function installSyncIoShims(): void {
   root[REAL_NOW] = RealDate.now.bind(RealDate)
   const PatchedDate = function (this: unknown, ...args: unknown[]) {
     if (!new.target) {
-      abortOnSynchronousPlatformIOAccess()
+      abortOnSynchronousPlatformIOAccess('Date()')
       return new RealDate().toString()
     }
     if (args.length === 0) {
-      abortOnSynchronousPlatformIOAccess()
+      abortOnSynchronousPlatformIOAccess('new Date()')
       return new RealDate()
     }
     return Reflect.construct(RealDate, args) as Date
@@ -774,13 +772,13 @@ function installSyncIoShims(): void {
   Object.setPrototypeOf(PatchedDate, RealDate)
   Object.defineProperty(PatchedDate, 'prototype', { value: RealDate.prototype })
   PatchedDate.now = () => {
-    abortOnSynchronousPlatformIOAccess()
+    abortOnSynchronousPlatformIOAccess('Date.now()')
     return RealDate.now()
   }
   // eslint-disable-next-line no-global-assign
   Date = PatchedDate
   Math.random = () => {
-    abortOnSynchronousPlatformIOAccess()
+    abortOnSynchronousPlatformIOAccess('Math.random()')
     return realRandom()
   }
   state.restore.push(() => {
@@ -794,7 +792,7 @@ function installSyncIoShims(): void {
     const realPerfNow = perf.now.bind(perf)
     state.restore.push(
       patchMethod(perf, 'now', () => {
-        abortOnSynchronousPlatformIOAccess()
+        abortOnSynchronousPlatformIOAccess('performance.now()')
         return realPerfNow()
       }),
     )
@@ -804,7 +802,7 @@ function installSyncIoShims(): void {
     const realGetRandomValues = webCrypto.getRandomValues.bind(webCrypto)
     state.restore.push(
       patchMethod(webCrypto, 'getRandomValues', (array: ArrayBufferView) => {
-        abortOnSynchronousPlatformIOAccess()
+        abortOnSynchronousPlatformIOAccess('crypto.getRandomValues()')
         return realGetRandomValues(array as never)
       }),
     )

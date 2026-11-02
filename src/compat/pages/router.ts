@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 import { hasUseClientDirective } from '../../client/reference-stub'
 import { listFiles, listFilesSync, toPosixPath } from '../../utils/fs'
 import { getNextConfig } from '../next/config-loader'
+import { PAGES_LAYOUT } from './router-state'
 
 const basePageExtensions = ['tsx', 'ts', 'jsx', 'js', 'mjs']
 
@@ -194,10 +195,7 @@ async function buildMaterializedApp(
     await materializeNativeApp(sourceApp, appPath)
   }
   if (!existsSync(path.join(appPath, 'layout.js'))) {
-    await writeFile(
-      path.join(appPath, 'layout.js'),
-      'export default function PagesLayout({ children }) {\n  return <html><body>{children}</body></html>\n}\n',
-    )
+    await writeFile(path.join(appPath, 'layout.js'), PAGES_LAYOUT)
   }
 
   for (const page of pages) {
@@ -418,13 +416,14 @@ function routerStateSnippet(pagesPattern: string | undefined): {
   imports: string
   render: string
 } {
+  const imports = `import { decodePagesParams, pagesRouterSsrState, serializePagesRouterState } from ${JSON.stringify(
+    routerStateModulePath(),
+  )};\n`
   if (!pagesPattern) {
-    return { imports: '', render: 'return createElement(Page, result?.props ?? {});' }
+    return { imports, render: 'return createElement(Page, result?.props ?? {});' }
   }
   return {
-    imports: `import { pagesRouterSsrState, serializePagesRouterState } from ${JSON.stringify(
-      routerStateModulePath(),
-    )};\n`,
+    imports,
     render: `const routerState = pagesRouterSsrState(${JSON.stringify(pagesPattern)}, resolvedParams);
   return createElement(
     Fragment,
@@ -462,7 +461,7 @@ ${routerState.imports}export * from ${JSON.stringify(specifier)};
 ${runtimeExport}${maxDurationExport}export default async function PagesCompatStaticPage({ params }) {
   // The otel compat exposes a span wrapper (Render.getStaticProps) at runtime.
   const withSpan = globalThis.__PNEXT_PAGES_DATA_SPAN__ ?? ((kind, fn) => fn());
-  const resolvedParams = await params;
+  const resolvedParams = decodePagesParams(await params);
   const invoke = async () => pageModule.getStaticProps?.({ params: resolvedParams });
   const result = await withSpan('getStaticProps', invoke);
   if (result?.notFound) notFound();
@@ -492,7 +491,7 @@ export const dynamic = 'force-dynamic';
 ${runtimeExport}${maxDurationExport}export default async function PagesCompatPage({ params, searchParams }) {
   // The otel compat exposes a span wrapper (Render.getServerSideProps) at runtime.
   const withSpan = globalThis.__PNEXT_PAGES_DATA_SPAN__ ?? ((kind, fn) => fn());
-  const resolvedParams = await params;
+  const resolvedParams = decodePagesParams(await params);
   // getServerSideProps reads a node-shaped \`req\`/\`res\`. This page is
   // force-dynamic, so headers()/cookies() are available; \`method\` is always
   // 'GET' and \`res\` is inert (writes are dropped) — a workable baseline until

@@ -31,6 +31,7 @@ interface ModernCacheHandlerState {
   handler?: ModernCacheHandler
   installedFor?: string
   sourceMap?: SourceMap
+  installing?: Promise<undefined>
 }
 
 const MODERN_CACHE_HANDLER_STATE = Symbol.for('pnext.compat.modernCacheHandler')
@@ -43,7 +44,22 @@ function state(): ModernCacheHandlerState {
   return (global[MODERN_CACHE_HANDLER_STATE] ??= {})
 }
 
-export async function installModernCacheHandlers(root: string): Promise<void> {
+export function installModernCacheHandlers(root: string): Promise<void> {
+  const installing = (state().installing = installHandlers(root))
+  // Like Next's entry preload, a failed load is logged once; requests and cache calls then reject.
+  return installing.then(
+    () => {
+      if (state().installing === installing) state().installing = undefined
+    },
+    error => console.error('Failed to preload entries:', error),
+  )
+}
+
+export function pendingModernCacheInstall(): Promise<undefined> | undefined {
+  return state().installing
+}
+
+async function installHandlers(root: string): Promise<undefined> {
   const configured = defaultCacheHandlerPath()
   const current = state()
   if (!configured) {
@@ -77,6 +93,10 @@ export async function installModernCacheHandlers(root: string): Promise<void> {
 
 export function hasModernCacheHandler(): boolean {
   return state().handler !== undefined
+}
+
+export function hasCustomModernCacheHandler(): boolean {
+  return (state().installedFor ?? DEFAULT_HANDLER_ID) !== DEFAULT_HANDLER_ID
 }
 
 export async function modernCacheRefreshTags(): Promise<void> {
@@ -135,12 +155,28 @@ function normalizeHandlerError(error: unknown, method: 'get' | 'set'): unknown {
     .replace(frame, (_match, line: string, column: string) => {
       const entry = state().sourceMap?.findEntry(Number(line) - 1, Number(column) - 1)
       if (entry && 'originalSource' in entry && entry.originalSource) {
-        return `\n    at Object.${method} (${path.basename(entry.originalSource)}:${entry.originalLine + 1}:${entry.originalColumn + 1})`
+        let originalColumn = entry.originalColumn
+        // JSC anchors a `new X()` frame on the callee; Node (what Next's logs show) anchors it on `new`.
+        const text = originalSourceLine(handlerPath, entry.originalSource, entry.originalLine)
+        if (text?.slice(0, originalColumn).endsWith('new ')) originalColumn -= 4
+        return `\n    at Object.${method} (${path.basename(entry.originalSource)}:${entry.originalLine + 1}:${originalColumn + 1})`
       }
       return `\n    at Object.${method} (${path.basename(handlerPath)}:${line}:${Math.max(1, Number(column) - 4)})`
     })
     .replace(/\n\s+at withNodeConsoleFormat \(/, '\n    at <unknown> (')
   return error
+}
+
+function originalSourceLine(handlerPath: string, source: string, line: number): string | undefined {
+  const { sources, sourcesContent } = state().sourceMap!.payload
+  try {
+    return (
+      sourcesContent?.[sources.indexOf(source)] ??
+      readFileSync(path.resolve(path.dirname(handlerPath), source), 'utf8')
+    ).split('\n')[line]
+  } catch {
+    return undefined
+  }
 }
 
 export async function modernCacheGetExpiration(
@@ -226,6 +262,7 @@ export function clearModernCacheHandlerForTest(): void {
   current.handler = undefined
   current.installedFor = undefined
   current.sourceMap = undefined
+  current.installing = undefined
 }
 
 function defaultCacheHandlerPath(): string | undefined {
@@ -307,14 +344,23 @@ function pickHandler(mod: unknown): ModernCacheHandler | undefined {
   return candidate && typeof candidate === 'object' ? candidate : undefined
 }
 
+/** Next's `cacheMaxMemorySize` default: the default handler's byte budget. */
+const DEFAULT_MAX_MEMORY_SIZE = 50 * 1024 * 1024
+
 export function createDefaultExternalHandler(): ModernCacheHandler {
-  const entries = new Map<string, ModernCacheEntry>()
+  // Map insertion order doubles as LRU order: a hit re-inserts at the back, eviction pops the front.
+  const entries = new Map<string, ModernCacheEntry & { size: number }>()
+  let totalSize = 0
   const pendingSets = new Map<string, Promise<void>>()
   const tagExpirations = new Map<string, number>()
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   const debug = process.env.NEXT_PRIVATE_DEBUG_CACHE
     ? console.debug.bind(console, 'DefaultCacheHandler:')
     : undefined
+  const remove = (cacheKey: string) => {
+    totalSize -= entries.get(cacheKey)?.size ?? 0
+    entries.delete(cacheKey)
+  }
   return {
     async get(cacheKey) {
       const pending = pendingSets.get(cacheKey)
@@ -331,8 +377,11 @@ export function createDefaultExternalHandler(): ModernCacheHandler {
       const maxAge = process.env.__NEXT_DEV_SERVER ? Math.max(entry.expire, 300) : entry.revalidate
       if (realNow() >= entry.timestamp + maxAge * 1000) {
         debug?.('get', cacheKey, 'expired')
+        remove(cacheKey)
         return undefined
       }
+      entries.delete(cacheKey)
+      entries.set(cacheKey, entry)
       const [value, saved] = entry.value.tee()
       entry.value = saved
       debug?.('get', cacheKey, 'found')
@@ -352,10 +401,24 @@ export function createDefaultExternalHandler(): ModernCacheHandler {
           debug?.('set', cacheKey, 'skipped dynamic entry')
           return
         }
+        const configured = (getNextConfig() as { cacheMaxMemorySize?: number }).cacheMaxMemorySize
+        // Like Next: size 0 disables the handler, except in dev where reloads still need hits.
+        const limit =
+          // eslint-disable-next-line turbo/no-undeclared-env-vars
+          configured === 0 && !process.env.__NEXT_DEV_SERVER
+            ? 0
+            : configured || DEFAULT_MAX_MEMORY_SIZE
         const [value, saved] = entry.value.tee()
         entry.value = saved
-        await drainStream(value)
-        entries.set(cacheKey, entry)
+        const size = (await drainStream(value)) + cacheKey.length
+        if (size > limit) {
+          debug?.('set', cacheKey, 'skipped oversized entry')
+          return
+        }
+        remove(cacheKey)
+        entries.set(cacheKey, { ...entry, size })
+        totalSize += size
+        while (totalSize > limit) remove(entries.keys().next().value!)
         debug?.('set', cacheKey, 'done')
       } catch (error) {
         debug?.('set', cacheKey, 'failed', error)
@@ -379,9 +442,12 @@ export function createDefaultExternalHandler(): ModernCacheHandler {
   }
 }
 
-async function drainStream(stream: ReadableStream<Uint8Array>): Promise<void> {
+async function drainStream(stream: ReadableStream<Uint8Array>): Promise<number> {
   const reader = stream.getReader()
-  while (!(await reader.read()).done) continue
+  let bytes = 0
+  let read
+  while (!(read = await reader.read()).done) bytes += read.value.byteLength
+  return bytes
 }
 
 function implicitSoftTags(): string[] {

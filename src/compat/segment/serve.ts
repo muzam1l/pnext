@@ -56,6 +56,7 @@ import {
   DEFAULT_STATIC_STALE_TIME_SECONDS,
   segmentMetaFile,
   segmentBodyResponse,
+  SEGMENT_ROUTE_HEADER,
   ROUTE_SEGMENT_PATH,
   TREE_SEGMENT_PATH,
   treeSegmentFile,
@@ -75,7 +76,9 @@ import { pageSlotFrame, stripPageSlotContent } from './page-slot'
 import { withoutInlineCss } from '../css/inline-css'
 import { getNextConfig } from '../next/config-loader'
 import { CACHE_BUSTING_REDIRECT_HEADER } from '../protocol'
-import { staticSiblingNames } from '../next/route-state'
+import { routeRuntimePrefetch, staticSiblingNames } from '../next/route-state'
+import { productionRelease } from '../../runtime/production'
+import { scanRootParams } from '../ppr/root-params-scan'
 import { loadCompatRewrites, resolveCompatRewrite, type CompatRewrite } from '../next/rewrites'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
@@ -159,11 +162,24 @@ function segmentPrefetchTarget(request: Request): string | null {
   return request.headers.get(NEXT_ROUTER_SEGMENT_PREFETCH_HEADER)
 }
 
+/** A runtime prefetch: `2` (this URL's own) or `3` (the route's runtime App Shell). */
 function runtimePrefetchRequest(request: Request): boolean {
   return (
-    request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) === '2' &&
+    /^[23]$/.test(request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) ?? '') &&
     !request.headers.has(NEXT_ROUTER_SEGMENT_PREFETCH_HEADER)
   )
+}
+
+const appRootParams = new WeakMap<ResolvedConfig, Set<string>>()
+
+/** The route's root params (at or above a root layout): a runtime App Shell keeps them concrete. */
+function rootParamNames(config: ResolvedConfig, route: RouteManifestEntry): string[] {
+  let names = appRootParams.get(config)
+  if (!names) {
+    names = new Set(productionRelease(config)?.compat?.rootParams ?? scanRootParams(config.appPath))
+    appRootParams.set(config, names)
+  }
+  return route.params.filter(name => names.has(name))
 }
 
 let segmentRevalidationVersion = 0
@@ -408,7 +424,7 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
           frame,
           // Rendered for the NAVIGATION: a dynamic route's frame carries
           // request data, so it reuses for the dynamic window only.
-          effectiveStaleTime(meta, isStatic),
+          rendered.postponed ? staleTimeSecondsFor(false) : effectiveStaleTime(meta, isStatic),
           // A page frame is never the whole document: whatever consumes it still
           // owns the layout chain around it.
           true,
@@ -530,6 +546,11 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
       // A runtime prefetch (`2`) is this URL's own: its params resolve even under App Shells.
       const fallbackParams =
         !runtimePrefetchRequest(request) && appShellFallbackParams(selection.route)
+      // `3` is the runtime App Shell: only root params stay concrete.
+      const appShell =
+        request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) === '3'
+          ? rootParamNames(config, selection.route)
+          : undefined
       const instant = await renderInstantPrefetchShell({
         config,
         selection,
@@ -537,6 +558,7 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
         url,
         request,
         fallbackParams,
+        appShell,
       })
       if (instant) {
         // A `pprMetadata` route's <title> is DYNAMIC (generateMetadata reads a param) while this shared
@@ -577,7 +599,7 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
             // This render always happened LIVE, so an explicit `allow-runtime`
             // route's empty set is the truth: nothing was read before the
             // render postponed, and every param shares one loading shell.
-            routeExplicitRuntimePrefetch(selection.route),
+            appShell !== undefined || routeExplicitRuntimePrefetch(selection.route),
           )
             ? segmentVaryInfo(instant.vary, 'body', selection)
             : undefined,
@@ -897,12 +919,15 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
     // the runtime-prefetch (unstable_instant) downgrade uses — the generic
     // postponed flags never downgrade a full prefetch (ordinary PPR full
     // renders carry them while streaming complete resumed content).
-    if (partialPrefetchDowngrade) bodyResponse.headers.set('x-pnext-runtime-prefetch', '1')
+    if (partialPrefetchDowngrade) {
+      bodyResponse.headers.set('x-pnext-runtime-prefetch', '1')
+      if (completePrerender) bodyResponse.headers.set('x-pnext-runtime-complete', '1')
+    }
     return withRewriteHeaders(bodyResponse, rewriteHeaders)
   }
 
-  // `/_tree`: the RootTreePrefetch. Unmatched/non-page targets get an empty
-  // (dynamic) tree so the client falls back to a full nav fetch (never 404s).
+  // `/_tree`: the RootTreePrefetch. Non-page targets get an empty (dynamic) tree so the client
+  // falls back to a full nav fetch; an unmatched (or closed-param rejected) URL is a routing 404.
   const routeId = selection?.route.id
   const bakedTree = routeId ? readSegmentTree(config.outPath, routeId) : undefined
   if (routeId && bakedTree) {
@@ -914,13 +939,15 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
     // encoded-slash-params back-navigation contract). Stamp the STATIC window on the
     // tree even for dynamic routes; the segment body branch keeps its own windows.
     const staleTime = isStatic
-      ? effectiveStaleTime(readSegmentMeta(config.outPath, routeId), true)
+      ? effectiveStaleTime(readSegmentMeta(config.outPath, routeId), true, false)
       : staleTimeSecondsFor(true)
+    const tree = treeWithStaleTime(bakedTree, staleTime, url.searchParams.has('_rsc'))
     return withRewriteHeaders(
-      new Response(treeWithStaleTime(bakedTree, staleTime, url.searchParams.has('_rsc')), {
+      new Response(tree.text, {
         status: 200,
         headers: {
           'content-type': RSC_CONTENT_TYPE_HEADER,
+          ...partialPrefetchingHeaders(selection?.route, tree.hints),
           'x-nextjs-postponed': '2',
           'x-nextjs-stale-time': String(staleTime),
           ...(isStatic ? { 'x-nextjs-prerender': '1' } : {}),
@@ -949,6 +976,8 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
     runtimePrefetch:
       (selection?.route.segmentConfig as { prefetch?: unknown } | undefined)?.prefetch ===
       'allow-runtime',
+    // No baked shell to judge from: a Partial Prefetching route goes straight to its runtime requests.
+    partialPrefetching: selection?.route.kind === 'page' && routeRuntimePrefetch(selection.route),
     postponed: Boolean(selection?.route.pprHoles?.length),
     // Segment-M2: route identity + this URL's params so the client can key
     // shared segment entries before it has fetched a body for this URL.
@@ -961,6 +990,8 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
   })
   const treeResponse = treePrefetchResponse(payload, {
     format: url.searchParams.has('_rsc') ? 'flight' : 'json',
+    status: selection ? 200 : 404,
+    headers: partialPrefetchingHeaders(selection?.route, payload.tree.prefetchHints),
   })
   // Mirror the payload's head-outlining on the HEADERS (see baked branch).
   if (selection?.route.pprMetadata === true) {
@@ -1237,6 +1268,7 @@ async function renderInstantPrefetchShell({
   url,
   request,
   fallbackParams = false,
+  appShell,
 }: {
   config: ResolvedConfig
   selection: NonNullable<ReturnType<typeof selectRouteForRequest>>
@@ -1245,6 +1277,8 @@ async function renderInstantPrefetchShell({
   request: Request
   /** App Shells: render the SHARED shell (params hang, request data resolves). */
   fallbackParams?: boolean
+  /** Runtime App Shell (`3`): these root params stay concrete, every other param and prefetch() hang. */
+  appShell?: string[]
 }): Promise<{
   html: string
   postponed: boolean
@@ -1273,6 +1307,15 @@ async function renderInstantPrefetchShell({
             url: renderUrl,
             request: new Request(renderUrl, { headers }),
             ...(fallbackParams ? { fallbackParams: true } : {}),
+            ...(appShell
+              ? {
+                  prefetchShell: true,
+                  fallbackConcreteParams: Object.fromEntries(
+                    appShell.map(name => [name, selection.params[name]!]),
+                  ),
+                  fallbackParamKeys: selection.route.params,
+                }
+              : {}),
           }),
         )
         // Read inside the collection scope: the shortest window any cache this
@@ -1291,7 +1334,10 @@ async function renderInstantPrefetchShell({
   return rendered
     ? {
         ...rendered,
-        vary: tracked.vary,
+        // An App Shell is keyed on its root params alone: everything else hung.
+        vary: appShell
+          ? responseVaryParamsFromWire({ vary: appShell, layoutVary: appShell, pageVary: [] })
+          : tracked.vary,
         ...(staleSeconds !== undefined ? { staleSeconds } : {}),
       }
     : null
@@ -1401,6 +1447,15 @@ const PAGE_SEGMENT_PATH = '/_page'
  * meaningful under `experimental.appShells`.
  */
 const APP_SHELL_PREFETCH_HEADER = 'x-pnext-app-shell'
+
+/** A Partial Prefetching page's route and hints on its tree HEADERS: the client picks its flow before the body. */
+function partialPrefetchingHeaders(
+  route: RouteManifestEntry | undefined,
+  hints: number,
+): Record<string, string> {
+  if (route?.kind !== 'page' || !routeRuntimePrefetch(route)) return {}
+  return { [SEGMENT_ROUTE_HEADER]: route.route, 'x-pnext-prefetch-hints': String(hints) }
+}
 
 /**
  * Marks the render behind a segment-prefetch response, after the segment header
@@ -1685,7 +1740,7 @@ export const prefetchStaleTimeFinalizer: ResponseFinalizer = ctx => {
   // dynamic data: it is a dynamic document and must reuse for the DYNAMIC
   // window (staleTimes.dynamic gates how long the client re-commits it), even
   // though the route's built segment meta carries the shell's static window.
-  if (!isStatic && postponedResponse) {
+  if (postponedResponse && !prefetchRequest) {
     ctx.headers.set('x-nextjs-stale-time', String(staleTimeSecondsFor(false)))
     return
   }
@@ -1730,9 +1785,15 @@ function readSegmentMeta(outPath: string, routeId: string): SegmentMeta | undefi
   }
 }
 
-function effectiveStaleTime(meta: SegmentMeta | undefined, isStatic: boolean): number {
+function effectiveStaleTime(
+  meta: SegmentMeta | undefined,
+  isStatic: boolean,
+  declared = true,
+): number {
   const configured = staleTimeSecondsFor(isStatic)
   if (!meta) return configured
+  // The route's own cacheLife() window - a declared 0 is "re-fetch on every reveal", not a default.
+  if (declared && meta.staleTimeDeclared) return meta.staleTime
   const builtDefault = isStatic
     ? DEFAULT_STATIC_STALE_TIME_SECONDS
     : DEFAULT_DYNAMIC_STALE_TIME_SECONDS
@@ -1754,16 +1815,21 @@ function readSegmentTree(outPath: string, routeId: string): string | undefined {
   }
 }
 
-function treeWithStaleTime(tree: string, staleTime: number, flight: boolean): string {
+/** The baked tree restamped with `staleTime`, and its root prefetch hints. */
+function treeWithStaleTime(
+  tree: string,
+  staleTime: number,
+  flight: boolean,
+): { text: string; hints: number } {
   const json = tree.startsWith('0:') ? tree.slice(2) : tree
   try {
-    const payload = JSON.parse(json) as { staleTime?: unknown }
+    const payload = JSON.parse(json) as { staleTime?: unknown; tree?: { prefetchHints?: number } }
     const body = JSON.stringify(
       payload.staleTime === staleTime ? payload : { ...payload, staleTime },
     )
-    return flight ? `0:${body}` : body
+    return { text: flight ? `0:${body}` : body, hints: payload.tree?.prefetchHints ?? 0 }
   } catch {
-    return tree
+    return { text: tree, hints: 0 }
   }
 }
 

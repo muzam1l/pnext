@@ -261,7 +261,9 @@ export function createUseCachePrivateOutsideRequestContextError(
   route: string,
   functionName: string,
 ): Error {
-  return new Error(
+  const error = new Error(
     `Route "${route}": \`"use cache: private"\` needs an active request, so it can't be used during \`${functionName}\` or other build-time contexts. Move it to a request-time component or function.\nLearn more: ${USE_CACHE_PRIVATE_COMPOSITION}`,
   )
+  error.name = 'PnextBuildValidationError'
+  return error
 }

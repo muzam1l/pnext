@@ -17,7 +17,7 @@ export default function LandingPage() {
   return (
     <main>
       <section className="hero">
-        <h1>Ship the interface, not the bundle HmrProbe1788380876263 HmrProbe1788380206858</h1>
+        <h1>Ship the interface, not the bundle</h1>
         <p>Server-rendered above the fold. One island, loaded when it is seen.</p>
       </section>
 

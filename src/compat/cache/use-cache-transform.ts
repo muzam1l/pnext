@@ -29,11 +29,11 @@ export function rewriteUseCacheSource(source: string, file: string, root?: strin
 
   const idBase = root ? path.relative(root, file) : file
   const wrapped = new Set<string>()
-  const privateWrapped = new Set<string>()
+  const kinds = new Map<string, string>()
   let out = source
   let usedBoundHelper = false
 
-  out = rewriteModuleLevelDirective(out, wrapped)
+  out = rewriteModuleLevelDirective(out, wrapped, kinds)
   // Nested cached closures capturing enclosing bindings (bound args) must be wrapped in place - a
   // module-level reassignment cannot reach a function-scoped binding, and the captured values
   // participate in the cache key. Runs before the top-level pass so it only claims genuinely-nested
@@ -58,7 +58,7 @@ export function rewriteUseCacheSource(source: string, file: string, root?: strin
   const staticMethods = rewriteStaticClassMethods(out, idBase)
   out = staticMethods.source
   const usedDirectHelper = staticMethods.wrapped
-  out = rewriteFunctionLevelDirectives(out, wrapped, privateWrapped)
+  out = rewriteFunctionLevelDirectives(out, wrapped, kinds)
 
   if (wrapped.size === 0 && !usedBoundHelper && !usedDirectHelper) return out
 
@@ -68,7 +68,7 @@ export function rewriteUseCacheSource(source: string, file: string, root?: strin
       `import { pnextUseCache as __pnextUseCache } from ${JSON.stringify(useCacheRuntimePath)};`,
     )
   }
-  if (privateWrapped.size > 0) {
+  if ([...kinds.values()].includes('private')) {
     imports.push(
       `import { pnextUseCachePrivate as __pnextUseCachePrivate } from ${JSON.stringify(useCacheRuntimePath)};`,
     )
@@ -97,15 +97,31 @@ export function rewriteUseCacheSource(source: string, file: string, root?: strin
   }
 
   const hoisted = hoistRootParamsImports(out)
+  const pageSegments = pageSegmentNames(source, file)
   const assignments = [...wrapped]
-    .map(name =>
-      privateWrapped.has(name)
-        ? `${name} = __pnextUseCachePrivate(${JSON.stringify(`${idBase}#${name}`)}, ${name});`
-        : `${name} = __pnextUseCache(${JSON.stringify(`${idBase}#${name}`)}, ${name});`,
-    )
+    .map(name => {
+      const kind = kinds.get(name)
+      const id = JSON.stringify(`${idBase}#${name}`)
+      if (kind === 'private') return `${name} = __pnextUseCachePrivate(${id}, ${name});`
+      const segment = pageSegments?.has(name) ? `${kindArg(kind) || ', undefined'}, true` : ''
+      return `${name} = __pnextUseCache(${id}, ${name}${segment || kindArg(kind)});`
+    })
     .join('\n')
   const suffix = assignments ? `\n;${assignments}${defaultExport}\n` : '\n'
   return `${hoisted.imports}${imports.join('\n')}\n${hoisted.source}${suffix}`
+}
+
+/** Trailing runtime argument naming a non-default cache kind (`'use cache: remote'`). */
+function kindArg(kind: string | undefined): string {
+  return kind && kind !== 'default' ? `, ${JSON.stringify(kind)}` : ''
+}
+
+/** Next's page-segment functions: a page file's default export, generateMetadata and generateViewport. */
+export function pageSegmentNames(source: string, file: string): Set<string> | undefined {
+  if (!/^page\.\w+$/.test(path.basename(file))) return undefined
+  const defaultName =
+    /\bexport\s+default\s+(?:async\s+)?(?:function\s*\*?\s*)?([A-Za-z_$][\w$]*)/.exec(source)?.[1]
+  return new Set(['generateMetadata', 'generateViewport', ...(defaultName ? [defaultName] : [])])
 }
 
 function hoistRootParamsImports(source: string): { imports: string; source: string } {
@@ -169,7 +185,7 @@ function rewriteNestedBoundClosures(
       out.slice(0, closure.declStart) +
       wrappedHead +
       bodyAfterDirective +
-      `}, () => [${captureList}])` +
+      `}, () => [${captureList}]${kindArg(directive[2])})` +
       rest.replace(/^\}/, '')
     wrapped = true
     searchFrom = closure.declStart + wrappedHead.length
@@ -223,7 +239,7 @@ function rewriteReturnedArrowClosures(
       out.slice(0, closure.declStart) +
       wrappedHead +
       bodyAfterDirective +
-      `}, () => [${captureList}])` +
+      `}, () => [${captureList}]${kindArg(directive[2])})` +
       rest.replace(/^\}/, '')
     wrapped = true
     searchFrom = closure.declStart + wrappedHead.length
@@ -598,11 +614,15 @@ function paramNames(params: string): string[] {
  * declaration. `export const` becomes `export let` so the binding is
  * reassignable.
  */
-function rewriteModuleLevelDirective(source: string, wrapped: Set<string>): string {
+function rewriteModuleLevelDirective(
+  source: string,
+  wrapped: Set<string>,
+  kinds: Map<string, string>,
+): string {
   const prologue = /^(?:#![^\n]*\n)?(?:\s|\/\/[^\n]*\n|\/\*[\s\S]*?\*\/)*/.exec(source)
   const offset = prologue?.[0].length ?? 0
   const head = source.slice(offset)
-  const directive = /^(['"])use cache(?:\s*:\s*[\w-]+)?\1\s*;?/.exec(head)
+  const directive = /^(['"])use cache(?:\s*:\s*([\w-]+))?\1\s*;?/.exec(head)
   if (!directive) return source
 
   let out = source.slice(0, offset) + head.slice(directive[0].length)
@@ -663,6 +683,7 @@ function rewriteModuleLevelDirective(source: string, wrapped: Set<string>): stri
         out.slice(declMatch.index + declMatch[0].length)
     }
   }
+  if (directive[2]) for (const name of wrapped) kinds.set(name, directive[2])
   return out
 }
 
@@ -694,7 +715,7 @@ function rewriteObjectMethods(
       out.slice(0, method.declStart) +
       wrappedHead +
       out.slice(index + directive[0].length, method.bodyEnd) +
-      `}, () => [${captureList}])` +
+      `}, () => [${captureList}]${kindArg(directive[2])})` +
       out.slice(method.bodyEnd + 1)
     wrapped = true
     searchFrom = method.declStart + wrappedHead.length
@@ -784,7 +805,7 @@ function rewriteStaticClassMethods(
       out.slice(0, method.declStart) +
       wrappedHead +
       out.slice(index + directive[0].length, method.bodyEnd) +
-      `})` +
+      `}${kindArg(directive[2])})` +
       out.slice(method.bodyEnd + 1)
     wrapped = true
     searchFrom = method.declStart + wrappedHead.length
@@ -866,7 +887,7 @@ function findEnclosingClassName(source: string, pos: number): string | null {
 function rewriteFunctionLevelDirectives(
   source: string,
   wrapped: Set<string>,
-  privateWrapped: Set<string>,
+  kinds: Map<string, string>,
 ): string {
   let out = source
   let searchFrom = 0
@@ -893,7 +914,7 @@ function rewriteFunctionLevelDirectives(
         prefix.slice(declaration.constKeywordIndex + 'const'.length)
     }
     wrapped.add(declaration.name)
-    if (directive[2] === 'private') privateWrapped.add(declaration.name)
+    if (directive[2]) kinds.set(declaration.name, directive[2])
     out = head + out.slice(index + directive[0].length)
     searchFrom = index
   }

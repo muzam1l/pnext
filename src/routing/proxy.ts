@@ -412,14 +412,16 @@ async function importProxyModule(
   options: ProxyRunOptions,
   runnerOptions: ProxyRunnerOptions,
 ) {
-  const href = options.dev
-    ? await devServerModuleHref(config, file, options.devImportVersion ?? 'dev', {
-        conditionTarget: 'edge',
-        externalLoadTarget: proxyExternalLoadTarget(file),
-        reactServerLayer: true,
-      })
-    : (runnerOptions.compiledModuleHref ?? pathToFileHref(file))
-  return import(href) as Promise<ProxyModule>
+  return getProxyExtensions().importModule(file, async () => {
+    const href = options.dev
+      ? await devServerModuleHref(config, file, options.devImportVersion ?? 'dev', {
+          conditionTarget: 'edge',
+          externalLoadTarget: proxyExternalLoadTarget(file),
+          reactServerLayer: true,
+        })
+      : (runnerOptions.compiledModuleHref ?? pathToFileHref(file))
+    return import(href) as Promise<Record<string, unknown>>
+  }) as Promise<ProxyModule>
 }
 
 function proxyBases(config: ResolvedConfig) {

@@ -21,8 +21,5 @@ export function connection(): Promise<Record<never, never>> {
   assertRequestApiAllowedInAfter('connection()')
   assertDynamicErrorRequestApi('connection()')
   assertNoDynamicApiInsideCache('connection()')
-  return requestApiPromise('connection()', () => {
-    requireRequest('connection()')
-    return {}
-  })
+  return requestApiPromise('connection()', () => requireRequest('connection()') && {}, 0)
 }

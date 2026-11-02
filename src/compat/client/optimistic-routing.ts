@@ -27,6 +27,7 @@ interface RouteState {
   prefetchKind?: 'shell' | 'eager'
   /** `prefetch = 'allow-runtime'`: the shell is request-sampled PER URL. */
   runtimePrefetch?: boolean
+  closedParams?: boolean
 }
 
 interface PredictedShell {
@@ -58,7 +59,8 @@ export function predictNextLoadingShell(
   // Most recently stored shells first (Map preserves insertion order).
   for (const [pathname, html] of [...shells.entries()].reverse()) {
     const state = routeStateFromShell(html)
-    if (!state) continue
+    // A closed param decides whether the route exists at all: the server must resolve the URL.
+    if (!state || state.closedParams) continue
     // A shell's own URL must fit its route pattern before it can teach the
     // route trie. This catches rewrites, including a dynamic response served
     // for a known static sibling.

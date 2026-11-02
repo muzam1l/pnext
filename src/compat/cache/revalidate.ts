@@ -524,6 +524,10 @@ export interface RenderCacheMeta {
   handler?: boolean
   /** True when `dynamic = 'error'` must reject request API access. */
   dynamicError?: boolean
+  /** On-demand render of a build-prerendered route: dynamic usage fails it (Next's static-to-dynamic error). */
+  onDemandPrerender?: boolean
+  /** The render read a request API or a no-store signal. */
+  dynamicUsage?: boolean
   /**
    * after() work queued during a static-generation render. There is no response close to flush against,
    * so the render itself drains the queue once `produce` settles - Next's semantics: a build prerender
@@ -540,6 +544,10 @@ const cacheMetaStorage = revalidateGlobal(
 
 export function currentRenderCacheMeta() {
   return cacheMetaStorage.getStore()
+}
+
+export function runOutsideRenderCacheMeta<T>(callback: () => T): T {
+  return cacheMetaStorage.exit(callback)
 }
 
 /**
@@ -607,12 +615,38 @@ export function recordCacheStale(seconds: number) {
     meta.staleSeconds === undefined ? seconds : Math.min(meta.staleSeconds, seconds)
 }
 
-export function recordCacheNoStore() {
+export function recordCacheNoStore(reason: string) {
   // Inside a data-cache producer (unstable_cache / 'use cache') the cache
   // boundary wins: no-store signals do not leak out to the route.
   if (insideProducerStorage.getStore()) return
   const meta = cacheMetaStorage.getStore()
+  recordDynamicUsage(meta, reason)
   if (meta) meta.noStore = true
+}
+
+export function currentRenderIsOnDemandPrerender(): boolean {
+  return cacheMetaStorage.getStore()?.onDemandPrerender === true
+}
+
+/** A failed SSR pass keeps an on-demand prerender out of the cache (the pipeline answers 500). */
+export function failOnDemandPrerender(): void {
+  const meta = cacheMetaStorage.getStore()
+  if (meta?.onDemandPrerender) meta.noStore = true
+}
+
+/** Request API or no-store use: marks a build prerender dynamic and fails an on-demand one. */
+export function recordDynamicUsage(meta: RenderCacheMeta | undefined, reason: string): void {
+  if (!meta || insideProducerStorage.getStore()) return
+  meta.dynamicUsage = true
+  if (!meta.onDemandPrerender) return
+  // Caught by user code, it still fails the render (Next's revalidate 0 before the throw).
+  meta.noStore = true
+  const error = new Error(
+    `Page changed from static to dynamic at runtime ${meta.route ?? '/'}, reason: ${reason}\n` +
+      `see more here https://nextjs.org/docs/messages/app-static-to-dynamic-error`,
+  )
+  error.name = 'DynamicServerError'
+  throw error
 }
 
 const insideProducerStorage = revalidateGlobal(
@@ -708,6 +742,7 @@ export async function collectRenderCacheMeta<T>(
     prerender?: boolean
     handler?: boolean
     dynamicError?: boolean
+    onDemandPrerender?: boolean
   } = {},
 ): Promise<{
   value: T
@@ -716,6 +751,7 @@ export async function collectRenderCacheMeta<T>(
   expireSeconds?: number
   staleSeconds?: number
   noStore?: boolean
+  dynamicUsage?: boolean
 }> {
   const meta: RenderCacheMeta = {
     tags: new Set(),
@@ -726,6 +762,7 @@ export async function collectRenderCacheMeta<T>(
     prerender: options.prerender,
     handler: options.handler,
     dynamicError: options.dynamicError,
+    onDemandPrerender: options.onDemandPrerender,
   }
   const value = await cacheMetaStorage.run(meta, produce)
   await drainStaticAfterTasks(meta)
@@ -736,6 +773,7 @@ export async function collectRenderCacheMeta<T>(
     ...(meta.expireSeconds !== undefined ? { expireSeconds: meta.expireSeconds } : {}),
     ...(meta.staleSeconds !== undefined ? { staleSeconds: meta.staleSeconds } : {}),
     ...(meta.noStore ? { noStore: true } : {}),
+    ...(meta.dynamicUsage ? { dynamicUsage: true } : {}),
   }
 }
 

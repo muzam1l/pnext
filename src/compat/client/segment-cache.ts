@@ -134,6 +134,8 @@ export interface SegmentHit {
    * postponed PPR shell, or an extracted route-wide App Shell.
    */
   postponedShell: boolean
+  /** The entry is a route-wide App Shell (its params hung), not this URL's own content. */
+  appShell?: boolean
 }
 
 interface LearnedRoute {
@@ -292,16 +294,10 @@ function recordOneSegment(rawInput: SegmentRecordInput): void {
   const input: SegmentRecordInput = isRewriteResponse(rawInput)
     ? { ...rawInput, route: null, vary: null }
     : rawInput
-  if (rawInput.route) {
-    // LRU-bound like `entries`: one record per distinct pathname otherwise
-    // grows without limit (memory-pressure leak-slope test).
-    resolvedRoutes.delete(input.pathname)
-    // The resolved-route record stays TRUE even for a rewrite: the server
-    // really did answer this pathname with that route, and the sibling guard
-    // in `candidateKeys` reads it to keep other routes off this URL.
-    resolvedRoutes.set(rawInput.pathname, rawInput.route)
-    trimOldest(resolvedRoutes)
-  }
+  // The resolved-route record stays TRUE even for a rewrite: the server
+  // really did answer this pathname with that route, and the sibling guard
+  // in `candidateKeys` reads it to keep other routes off this URL.
+  if (rawInput.route) recordResolvedRoute(rawInput.pathname, rawInput.route)
   const key = entryKey(input.segmentPath, input.route, input.params, input.search, input.vary, {
     pathname: input.pathname,
   })
@@ -468,7 +464,30 @@ export function takeSegment(options: {
       // with route params deliberately hanging and is the server's shell stage
       // for every sibling param, so it retains that licence.
       postponedShell: entry.postponedShell && (!shared || entry.sharedAppShell),
+      appShell: entry.sharedAppShell,
     }
+  }
+  return null
+}
+
+/** Record the route the server answered `pathname` with. */
+export function recordResolvedRoute(pathname: string, route: string): void {
+  // LRU-bound like `entries`: one record per distinct pathname otherwise
+  // grows without limit (memory-pressure leak-slope test).
+  resolvedRoutes.delete(pathname)
+  resolvedRoutes.set(pathname, route)
+  trimOldest(resolvedRoutes)
+}
+
+/** The most recently learned dynamic route matching `pathname` (optimistic routing only). */
+export function predictedRouteFor(pathname: string): string | null {
+  const byRoute = optimisticRoutingEnabled() ? learnedRoutes.get('/_index') : undefined
+  if (!byRoute) return null
+  for (const candidate of [...byRoute.values()].reverse()) {
+    if (!candidate.route.includes(':')) continue
+    if (matchRoutePattern(candidate.route, pathname, candidate.catchAllOptional) === null) continue
+    if (namesStaticSibling(pathname, candidate.staticSiblings)) continue
+    return candidate.route
   }
   return null
 }
@@ -1064,7 +1083,8 @@ export function decodeSegmentPayload(
     return null
   }
   if (payload.segment !== expectedSegment || typeof payload.html !== 'string') return null
-  const payloadSiblings = staticSiblingsFromPayloadHtml(payload.html)
+  const state = documentRouteState(payload.html)
+  const payloadSiblings = state ? staticSiblingsOf(state) : undefined
   return {
     html: payload.html,
     vary: Array.isArray(payload.vary) ? payload.vary.map(String) : null,
@@ -1072,7 +1092,7 @@ export function decodeSegmentPayload(
     // stays byte-identical to the pre-split payload for every such response.
     ...(Array.isArray(payload.layoutVary) ? { layoutVary: payload.layoutVary.map(String) } : {}),
     ...(Array.isArray(payload.pageVary) ? { pageVary: payload.pageVary.map(String) } : {}),
-    route: typeof payload.route === 'string' ? payload.route : null,
+    route: typeof payload.route === 'string' && !state?.closedParams ? payload.route : null,
     params: normalizeWireParams(payload.params),
     ...(payloadSiblings ? { staticSiblings: payloadSiblings } : {}),
     ...(appShellOf(payload.shell) ? { shell: appShellOf(payload.shell)! } : {}),
@@ -1104,7 +1124,8 @@ export function decodeDocumentSegmentMeta(html: string): SegmentPayloadMeta {
   const siblings = staticSiblingsOf(state)
   return {
     vary: Array.isArray(state.pageVary) ? state.pageVary.map(String) : null,
-    route: typeof state.route === 'string' ? state.route : null,
+    // A closed param decides whether the route exists: its payloads key on their exact URL only.
+    route: typeof state.route === 'string' && !state.closedParams ? state.route : null,
     params: normalizeWireParams(state.params),
     ...(siblings ? { staticSiblings: siblings } : {}),
   }
@@ -1116,6 +1137,7 @@ interface WireRouteState {
   pageVary?: unknown
   staticChildren?: unknown
   staticChildrenBySegment?: unknown
+  closedParams?: unknown
 }
 
 /** The `window.__PNEXT_ROUTE__` state embedded in a rendered document. */
@@ -1150,12 +1172,6 @@ function staticSiblingsOf(state: WireRouteState): Record<string, string[]> | und
     }
   }
   return Object.keys(siblings).length > 0 ? siblings : undefined
-}
-
-/** A framed segment payload's static siblings, read off the HTML it carries. */
-function staticSiblingsFromPayloadHtml(html: string): Record<string, string[]> | undefined {
-  const state = documentRouteState(html)
-  return state ? staticSiblingsOf(state) : undefined
 }
 
 /**

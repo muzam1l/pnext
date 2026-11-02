@@ -20,6 +20,7 @@ import path from 'node:path'
 import type { ResolvedConfig } from '../../config'
 import { onExtensionHostReset, setRenderExtensions } from '../../extensions'
 import { setReactCompatActive } from '../react/preact'
+import { currentRenderIsOnDemandPrerender } from '../cache/revalidate'
 
 // preact's global vnode hook cannot be uninstalled, so it follows the host.
 onExtensionHostReset(() => setReactCompatActive(false))
@@ -200,6 +201,7 @@ function canStreamNextRoute(input: {
   route: { client?: boolean; stream?: unknown }
 }) {
   if (!nextCompatEnabled(input.config)) return true
+  if (currentRenderIsOnDemandPrerender()) return false
   // Whole-page client routes stream through a single Preact render, preserving
   // ancestor provider context across their Suspense boundaries.
   if (input.route.client) return true

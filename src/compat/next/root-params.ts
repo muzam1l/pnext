@@ -4,8 +4,10 @@ import {
   hangingPromise,
   isPrerendering,
   isRuntimePrefetchPrerender,
+  isUnfilledShellParam,
+  RUNTIME_PARAMS,
 } from '../../render/ppr'
-import { currentRenderCacheMeta, insideUnstableCacheProducer } from '../cache/revalidate'
+import { insideUnstableCacheProducer } from '../cache/revalidate'
 import {
   currentUseCacheRootParams,
   insideUseCacheProducer,
@@ -98,15 +100,15 @@ export function rootParam<T = string | string[] | undefined>(name: string): Prom
   const gsp = generateStaticParamsScope()
   if (gsp) {
     if (name in gsp.provided) return Promise.resolve(gsp.provided[name] as T)
-    const route = (currentRenderCacheMeta()?.route ?? '')
-      .replace(/:\.\.\.([^/*]+)\*?/g, '[...$1]')
-      .replace(/:([^/*]+)\*/g, '[...$1]')
-      .replace(/:([^/*]+)/g, '[$1]')
+    const reason =
+      gsp.functionName === 'generateStaticParams'
+        ? `was not provided by a parent \`generateStaticParams\`. ` +
+          `In \`generateStaticParams\`, root params are only available for segments nested below the segment that provides them.`
+        : 'is not available in this build-time generator.'
     return Promise.reject(
       new Error(
-        `Route ${route} used \`import('${['next', 'root-params'].join('/')}').${name}()\` inside \`generateStaticParams\`, ` +
-          `but the \`${name}\` parameter was not provided by a parent \`generateStaticParams\`. ` +
-          `In \`generateStaticParams\`, root params are only available for segments nested below the segment that provides them.`,
+        `Route ${gsp.route} used \`import('${['next', 'root-params'].join('/')}').${name}()\` inside \`${gsp.functionName}\`, ` +
+          `but the \`${name}\` parameter ${reason}`,
       ),
     )
   }
@@ -125,8 +127,10 @@ export function rootParam<T = string | string[] | undefined>(name: string): Prom
     isPrerendering() &&
     !isRuntimePrefetchPrerender()
   ) {
-    return hangingPromise<T>(`rootParam(${name})`)
+    return hangingPromise<T>(`rootParam(${name})`, RUNTIME_PARAMS)
   }
+  // An unfilled fallback-shell root param hangs: its cache fill becomes a request-time hole.
+  if (isUnfilledShellParam(name)) return hangingPromise<T>(`rootParam(${name})`, RUNTIME_PARAMS)
   const value = currentUseCacheRootParams()[name]
   return Promise.resolve((Array.isArray(value) && value.length === 0 ? undefined : value) as T)
 }

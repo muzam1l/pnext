@@ -11,6 +11,9 @@ import {
 import { cacheControlFinalizers } from '../cache-control'
 import { protocolFinalizers, protocolInterceptors } from '../protocol'
 import { registerResourceHintFinalizer } from '../next/resource-hints'
+import { toBracketPattern } from '../ppr/missing-root-params'
+import { syncIoMessage } from '../validation/prerender-diagnostics'
+import { setRuntimePrefetchSyncIoReporter } from '../../render/ppr'
 
 /**
  * The router-state-tree validation interceptor, registered on its own so the
@@ -53,4 +56,8 @@ export function registerProtocolExtensions(config: ResolvedConfig): void {
   })
   registerResponseFinalizers(...protocolFinalizers(config), ...cacheControlFinalizers(config))
   registerResourceHintFinalizer()
+  // A runtime prefetch leaves sync IO behind a runtime API for the navigation; Next logs where.
+  setRuntimePrefetchSyncIoReporter((expression, route) => {
+    console.error(syncIoMessage(toBracketPattern(route), expression))
+  })
 }

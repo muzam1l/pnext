@@ -6,7 +6,7 @@ import {
   requireRequest,
   requestApiPromise as coreRequestApiPromise,
 } from '../../request/context'
-import { isHangingPromise } from '../../render/ppr'
+import { isHangingPromise, RUNTIME_SESSION } from '../../render/ppr'
 import { withSyncAccess } from './legacy-request-apis'
 import type { NextRequestCookies } from '../../types'
 import {
@@ -14,7 +14,11 @@ import {
   assertRequestApiAllowedInAfter,
   lifecycleError,
 } from '../lifecycle/after-scope'
-import { assertNoDynamicApiInsideCache, currentRenderCacheMeta } from '../cache/revalidate'
+import {
+  assertNoDynamicApiInsideCache,
+  currentRenderCacheMeta,
+  recordDynamicUsage,
+} from '../cache/revalidate'
 import { assertNavigationPrerenderAccess } from '../cache/build-prerender-errors'
 
 const COOKIE_MUTATION_ERROR =
@@ -22,7 +26,7 @@ const COOKIE_MUTATION_ERROR =
   'Read more: https://nextjs.org/docs/app/api-reference/functions/cookies#options'
 
 function requestApiPromise<T>(api: string, produce: () => T): Promise<T> {
-  const promise = coreRequestApiPromise(api, produce)
+  const promise = coreRequestApiPromise(api, produce, RUNTIME_SESSION)
   if (!isHangingPromise(promise)) return promise
   // Next's tracked session-data promises follow the underlying rejection in a second microtask.
   let delayed: Promise<T> | undefined
@@ -183,6 +187,7 @@ export function assertDynamicErrorRequestApi(
 ): void {
   const meta = currentRenderCacheMeta()
   if (meta?.prerender) assertNavigationPrerenderAccess(meta.route ?? '/', api)
+  recordDynamicUsage(meta, api.slice(0, -2))
   if (!meta?.dynamicError) return
   throw lifecycleError(
     `Route ${meta.route ?? ''} with \`dynamic = "error"\` couldn't be rendered statically because it used \`${api}\`.`,

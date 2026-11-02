@@ -8,9 +8,10 @@ import { recordRewrite } from '../protocol'
 import { recordCanonicalUrl } from '../next/canonical-url'
 import { getNextConfig, nextPageExtensions } from '../next/config-loader'
 import { activateTestProxy } from '../lifecycle/testmode'
+import { importEdgeMiddleware, isSandboxedMiddleware } from '../edge-runtime'
 import { legacyRequestAPIs } from '../../request/context'
 
-export function registerProxyExtensions(_config: ResolvedConfig): void {
+export function registerProxyExtensions(config: ResolvedConfig): void {
   setProxyResponseProtocol({
     nextHeader: 'x-middleware-next',
     rewriteHeader: 'x-middleware-rewrite',
@@ -20,6 +21,8 @@ export function registerProxyExtensions(_config: ResolvedConfig): void {
     fileExtensions: nextPageExtensions,
     validateFiles: validateNextProxyFiles,
     handlerExport: module => module.proxy ?? module.default ?? module.middleware,
+    importModule: (file, load) =>
+      isSandboxedMiddleware(config, file) ? importEdgeMiddleware(config, file) : load(),
     skipUrlNormalize: () => getNextConfig().skipProxyUrlNormalize === true,
     locale: proxyLocale,
     onExternalRewrite: request => activateTestProxy(request.headers),

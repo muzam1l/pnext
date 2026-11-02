@@ -21,7 +21,7 @@ try {
 } catch (error) {
   result =
     error instanceof PnextTypecheckError
-      ? { ok: false, messages: error.message.split('\n\n') }
+      ? { ok: false, messages: error.messages }
       : {
           ok: false,
           failure: error instanceof Error ? error.stack || error.message : String(error),

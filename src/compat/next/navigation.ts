@@ -16,7 +16,7 @@ import {
   ReadonlyURLSearchParams,
   redirect as pnextRedirect,
 } from '../../api/navigation'
-import { isPostpone, PostponeError } from '../../render/postpone'
+import { isPostpone, PostponeError, RUNTIME_URL } from '../../render/postpone'
 import { currentParams, currentRequest } from '../../request/context'
 import { useContext } from 'preact/hooks'
 import {
@@ -101,7 +101,7 @@ export function usePathname() {
 
 export function useSearchParams(): ReadonlyURLSearchParams {
   if (useContext(CsrBailoutContext) && isStaticCsrBailout()) {
-    throw new PostponeError('useSearchParams')
+    throw new PostponeError('useSearchParams', RUNTIME_URL)
   }
   return new ReadonlyURLSearchParams(currentUrl().search)
 }

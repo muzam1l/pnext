@@ -52,7 +52,6 @@ import {
   getExternalPackagePolicy,
   isEsmModuleEntry,
   isEsmModuleFile,
-  isWorkspacePackage,
   isPackageSubpathUnexported,
   resolveLinkedPackageSpecifier,
   resolveNestedPackageFromImporter,
@@ -3047,8 +3046,9 @@ async function bundleExternalPackageImpl(
   if (
     packageName &&
     resolvedEntry?.match(/\.[cm]?tsx?$/) &&
-    !getExternalPackagePolicy().transpile(packageName) &&
-    !isWorkspacePackage(config.root, packageName, config.workspaceRoot)
+    // Next compiles any file whose real path is outside node_modules (linked workspace sources).
+    /[\\/]node_modules[\\/]/.test(resolvedEntry) &&
+    !getExternalPackagePolicy().transpile(packageName)
   ) {
     const parseFailure = `${path.relative(config.root, resolvedEntry)}\nModule parse failed: Unexpected token`
     // Printed directly as well: the digest log path inspects the error's stack,

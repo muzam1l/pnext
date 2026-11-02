@@ -840,7 +840,7 @@ export async function startDevServer(options: DevServerOptions) {
   // route's warm compile. The .d.ts is for the editor, not for serving.
   void Promise.resolve(warmup).then(typegenInBackground)
 
-  return Object.assign(server, { warmup })
+  return Object.assign(server, { warmup, dispose: () => watcher?.stop() })
 }
 
 /**

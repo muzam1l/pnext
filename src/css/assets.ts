@@ -159,17 +159,11 @@ export function registerCssRuntime() {
   Bun.plugin({
     name: 'pnext-css-runtime',
     setup(plugin) {
-      plugin.onLoad({ filter: /\.(?:css|scss|sass)$/ }, async ({ path: file }) =>
-        isCssModuleFile(file)
-          ? {
-              exports: { default: await cssModuleMapping(file) },
-              loader: 'object',
-            }
-          : {
-              contents: 'export default undefined;',
-              loader: 'js',
-            },
-      )
+      plugin.onLoad({ filter: /\.(?:css|scss|sass)$/ }, async ({ path: file }) => {
+        if (!isCssModuleFile(file)) return { contents: 'export default undefined;', loader: 'js' }
+        const map = await cssModuleMapping(file)
+        return { exports: { ...map, default: map }, loader: 'object' }
+      })
     },
   })
 }
@@ -191,6 +185,18 @@ export async function cssModuleMapping(file: string) {
   return Object.fromEntries(
     [...classNames].map(className => [className, cssModuleClassName(file, className)]),
   )
+}
+
+// Named imports read the class map.
+export function cssModuleSourceFromMap(map: Record<string, string>) {
+  const json = JSON.stringify(map)
+  const names = Object.keys(map).filter(
+    name => name !== 'default' && /^[A-Za-z_$][\w$]*$/.test(name),
+  )
+  if (!names.length) return `export default ${json};`
+  const locals = names.map((name, index) => `${name}: __pnext_css_${index}`)
+  const exported = names.map((name, index) => `__pnext_css_${index} as ${name}`)
+  return `const __pnext_css = ${json};\nexport default __pnext_css;\nconst { ${locals.join(', ')} } = __pnext_css;\nexport { ${exported.join(', ')} };\n`
 }
 
 export function cssClassNames(source: string) {

@@ -23,10 +23,16 @@ import {
   type SegmentPayloadMeta,
 } from './segment-cache'
 import {
+  deferBodyPrefetch,
+  followPartialPrefetch,
+  predictPartialRoute,
   resetSegmentPrefetchDedupe,
   scheduleAppShellPrefetch,
   scheduleRuntimePrefetch,
 } from './segment-prefetch'
+
+// Runtime and Partial Prefetching ship only to an app with a runtime-prefetched route (usage.ts).
+declare const __PNEXT_RUNTIME_PREFETCHING__: boolean
 
 export function installSegmentCachePolicy(): SegmentCachePolicy {
   return {
@@ -58,6 +64,10 @@ export function installSegmentCachePolicy(): SegmentCachePolicy {
     composePageFrame: composeCachedLayout,
     recordDocumentLayout: recordDocumentLayoutFrame,
     prefetchCovered: segmentPrefetchCovered,
+    // Partial Prefetching: the `/_tree` hints pick a static attempt or the policy's own runtime requests.
+    ...((typeof __PNEXT_RUNTIME_PREFETCHING__ === 'boolean' ? __PNEXT_RUNTIME_PREFETCHING__ : true)
+      ? { predictRoute: predictPartialRoute, deferBodyPrefetch }
+      : {}),
     evictPageSegments,
     // A revalidation invalidates every window: the prefetch dedupe state (tree cache + app-shell request
     // set) must fall with the entries, or a revalidated route stays deduped - and stale - for its whole
@@ -91,14 +101,29 @@ function record(input: SegmentCacheRecord): void {
     complete: input.complete,
     runtime: input.runtime,
   })
-  if (input.kind !== 'document' && input.segmentPath === '/_index') {
-    scheduleRuntimePrefetch({
+  // A Partial Prefetching full body arrives marked runtime (the shell downgrade), yet it is the static
+  // attempt: it never covers the URL's own `2`.
+  let partial = false
+  if (
+    (typeof __PNEXT_RUNTIME_PREFETCHING__ === 'boolean' ? __PNEXT_RUNTIME_PREFETCHING__ : true) &&
+    input.kind !== 'document' &&
+    input.segmentPath === '/_index'
+  ) {
+    partial = followPartialPrefetch({
       pathname: input.pathname,
       search: input.search,
-      route: decoded.route,
-      runtime: input.runtime,
+      full: input.full === true,
       complete: input.complete,
     })
+    if (!partial) {
+      scheduleRuntimePrefetch({
+        pathname: input.pathname,
+        search: input.search,
+        route: decoded.route,
+        runtime: input.runtime,
+        complete: input.complete,
+      })
+    }
   }
   recordSegment({
     segmentPath: input.segmentPath,
@@ -108,7 +133,7 @@ function record(input: SegmentCacheRecord): void {
     staleTimeMs: input.staleTimeMs,
     complete: input.complete,
     static: input.static,
-    runtime: input.runtime,
+    runtime: input.runtime && !partial,
     ...(input.postponedShell ? { postponedShell: true } : {}),
     vary: decoded.vary,
     // w9-segment-split: pass the layout/page vary sets through so the cache can

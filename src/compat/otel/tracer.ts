@@ -9,7 +9,7 @@
 // Everything is inert unless @opentelemetry/api resolves from the app AND a work unit is active.
 
 import { getWorkUnit, queueAfterTask, type WorkUnit } from '../../request/context'
-import { getOtelApi, type OtelApi, type OtelContext, type OtelSpan } from './api'
+import { edgeSandbox, getOtelApi, type OtelApi, type OtelContext, type OtelSpan } from './api'
 
 // next.span_type taxonomy (exact strings Next emits; asserted verbatim).
 export const SPAN_TYPE = {
@@ -81,7 +81,8 @@ interface OtelState {
   middlewareRequest?: boolean
   middlewareInvoked?: boolean
   traceparent?: string | null
-  bubbleSpan?: OtelSpan
+  /** The middleware-invoke request's state, whose root span parents this render pass. */
+  bubble?: OtelState
   /** Request method, kept for the pattern-rename span name. */
   method: string
   /** Whether this was an RSC request, kept for the pattern-rename span name. */
@@ -151,6 +152,8 @@ interface OtelState {
   }
   /** A route handler threw: Next never reaches `start response` on that path. */
   handlerErrored?: boolean
+  /** Layout `generateMetadata` spans of this render, replayed when the error document renders. */
+  layoutMetadata?: { name: string; attributes: Record<string, unknown> }[]
 }
 
 /** The runtime label for a child span of the given next.span_type. */
@@ -193,7 +196,7 @@ export function startRootSpan(input: {
   if (!unit) return
   unit.compat ??= {}
   const previous = stateOf(unit)
-  if (previous && (!previous.middlewareRequest || previous.bubbleSpan || input.middleware)) return
+  if (previous && (!previous.middlewareRequest || previous.bubble || input.middleware)) return
   if (previous && !previous.middlewareInvoked) return
 
   // Extract incoming context (traceparent + any custom propagators, e.g. the
@@ -259,7 +262,7 @@ export function startRootSpan(input: {
     ...(verboseSpan ? { verboseSpan } : {}),
     currentContext: rootContext,
     ...(input.middleware || previous?.middlewareRequest ? { middlewareRequest: true } : {}),
-    ...(previous ? { bubbleSpan: previous.rootSpan } : {}),
+    ...(previous ? { bubble: previous } : {}),
   }
   unit.compat[OTEL_STATE] = state
 }
@@ -333,17 +336,22 @@ export function endRootSpan(status: number): void {
     rootSpan.setStatus({ code: a.SpanStatusCode.UNSET })
   }
   endSpan(rootSpan, state.edgeMode === 'page' ? 'edge' : 'nodejs')
-  if (state.bubbleSpan) {
-    state.bubbleSpan.setAttribute('http.status_code', status)
-    state.bubbleSpan.setStatus({
-      code: status >= 500 ? a.SpanStatusCode.ERROR : a.SpanStatusCode.UNSET,
-    })
-    endSpan(state.bubbleSpan, 'nodejs')
-  }
+  if (state.bubble) endBubbleSpan(state.bubble, status)
   if (state.verboseSpan) {
     state.verboseSpan.setStatus({ code: a.SpanStatusCode.UNSET })
     endSpan(state.verboseSpan, 'nodejs')
   }
+}
+
+/** Close the middleware-invoke span: Next's invoke pass ends with its own status before the render pass. */
+function endBubbleSpan(bubble: OtelState, status: number): void {
+  if (bubble.rootEnded) return
+  bubble.rootEnded = true
+  bubble.rootSpan.setAttribute('http.status_code', status)
+  bubble.rootSpan.setStatus({
+    code: status >= 500 ? bubble.api.SpanStatusCode.ERROR : bubble.api.SpanStatusCode.UNSET,
+  })
+  endSpan(bubble.rootSpan, 'nodejs')
 }
 
 /** Close abandoned requests after their work unit drains. */
@@ -460,6 +468,11 @@ export function withChildSpan<T>(
   )
   const childContext = a.trace.setSpan(parentContext, span)
   state.currentContext = childContext
+  if (
+    spanType === SPAN_TYPE.generateMetadata &&
+    String(attributes['next.page']).endsWith('/layout')
+  )
+    (state.layoutMetadata ??= []).push({ name, attributes })
   const settle = (error?: unknown) => {
     // Restore the enclosing context so siblings parent correctly.
     state.currentContext = parentContext
@@ -775,8 +788,15 @@ export function emitStartResponseSpan(): void {
   const state = stateOf(getWorkUnit())
   // A handler that threw never starts piping a response in Next; a render that threw still does.
   if (state?.pagesFallback || state?.pagesApi || state?.handlerErrored) return
-  if (state?.middlewareInvoked && !state.bubbleSpan) return
+  if (state?.middlewareInvoked && !state.bubble) return
   emitNodeLeafSpan('start response', SPAN_TYPE.startResponse, {})
+}
+
+/** A synchronous page error renders Next's error document, whose layouts run `generateMetadata` again. */
+export function emitErrorDocumentMetadataSpans(): void {
+  const state = stateOf(getWorkUnit())
+  for (const { name, attributes } of state?.layoutMetadata ?? [])
+    emitNodeLeafSpan(name, SPAN_TYPE.generateMetadata, attributes)
 }
 
 /**
@@ -887,13 +907,18 @@ function emitNodeLeafSpan(
 }
 
 /** Run middleware under the middleware-invoke span, or the incoming context without one. */
-export function withMiddlewareSpan<T>(request: Request, fn: () => T): T {
-  const a = api()
-  if (!a) return fn()
+export function withMiddlewareSpan<T>(
+  request: Request,
+  fn: () => T,
+  continues: (result: unknown) => boolean,
+): T {
   // The proxy runner already entered the middleware's declared runtime (edge for `middleware.*`,
   // node for `proxy.*` / `config.runtime = 'nodejs'`); Next exports the span with that same label.
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   const runtime: SpanRuntime = process.env.NEXT_RUNTIME === 'nodejs' ? 'nodejs' : 'edge'
+  const sandbox = runtime === 'edge' ? edgeSandbox.otel : undefined
+  const a = sandbox ?? api()
+  if (!a) return fn()
   const method = request.method.toUpperCase()
   let target = ''
   try {
@@ -911,9 +936,10 @@ export function withMiddlewareSpan<T>(request: Request, fn: () => T): T {
     state.middlewareInvoked = true
     state.rootSpan.setAttribute('next.bubble', true)
   }
-  const parentCtx = state?.middlewareRequest
-    ? state.rootContext
-    : a.propagation.extract(a.context.active(), carrier, headerGetter)
+  const parentCtx =
+    state?.middlewareRequest && !sandbox
+      ? state.rootContext
+      : a.propagation.extract(sandbox ? a.ROOT_CONTEXT : a.context.active(), carrier, headerGetter)
   const name = `middleware ${method}`
   const tracer = a.trace.getTracer('next.js', '0.0.1')
   const span = tracer.startSpan(
@@ -941,7 +967,11 @@ export function withMiddlewareSpan<T>(request: Request, fn: () => T): T {
   }
   return runSettled(
     () => a.context.with(spanCtx, fn),
-    () => settle(),
+    result => {
+      settle()
+      // The invoke pass answers 200 when the middleware lets the request continue; the render pass follows.
+      if (state?.middlewareRequest && continues(result)) endBubbleSpan(state, 200)
+    },
     settle,
   )
 }

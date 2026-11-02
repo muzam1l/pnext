@@ -16,12 +16,12 @@ import {
 } from './segment/vary-params'
 
 type NextGenerateMetadata = (
-  props: Pick<PageProps, 'params' | 'searchParams'>,
+  props: ReturnType<typeof headSegmentProps>,
   parent: Promise<Metadata>,
 ) => Metadata | Promise<Metadata>
 
 type NextGenerateViewport = (
-  props: Pick<PageProps, 'params' | 'searchParams'>,
+  props: ReturnType<typeof headSegmentProps>,
 ) => Viewport | Promise<Viewport>
 
 export async function readNextModuleMetadata(
@@ -32,12 +32,8 @@ export async function readNextModuleMetadata(
 ): Promise<Metadata | undefined> {
   if (typeof module.generateMetadata === 'function') {
     const generate = module.generateMetadata as NextGenerateMetadata
-    const headProps = headVaryTrackedProps(props)
     const run = () =>
-      generate(
-        { params: headProps.params, searchParams: headProps.searchParams },
-        Promise.resolve(resolvedParentMetadata(parent)),
-      )
+      generate(headSegmentProps(props, modulePath), Promise.resolve(resolvedParentMetadata(parent)))
     const name = metadataSpanName(modulePath)
     return await (name
       ? withChildSpan(
@@ -60,15 +56,18 @@ function metadataSpanName(modulePath: string | undefined): string | undefined {
 export async function readNextModuleViewport(
   module: Record<string, unknown>,
   props: PageProps,
+  modulePath?: string,
 ): Promise<Viewport | undefined> {
   if (typeof module.generateViewport === 'function') {
-    const headProps = headVaryTrackedProps(props)
-    return (module.generateViewport as NextGenerateViewport)({
-      params: headProps.params,
-      searchParams: headProps.searchParams,
-    })
+    return (module.generateViewport as NextGenerateViewport)(headSegmentProps(props, modulePath))
   }
   return module.viewport as Viewport | undefined
+}
+
+/** Like Next, a layout's `generateMetadata`/`generateViewport` gets no `searchParams`. */
+function headSegmentProps(props: PageProps, modulePath?: string) {
+  const head = headVaryTrackedProps(props)
+  return modulePath && /(?:^|[\\/])layout\.\w+$/.test(modulePath) ? { params: head.params } : head
 }
 
 /**

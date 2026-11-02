@@ -1170,8 +1170,8 @@ function coreStaticAssetModule(
 export async function serverCssModuleSource(file: string) {
   const registered = getCssExtensions().loadCssModuleForClient(file)
   if (registered !== undefined || !file.endsWith('.module.css')) return registered
-  const { cssModuleMapping } = await import('../css/assets')
-  return `export default ${JSON.stringify(await cssModuleMapping(file))};`
+  const { cssModuleMapping, cssModuleSourceFromMap } = await import('../css/assets')
+  return cssModuleSourceFromMap(await cssModuleMapping(file))
 }
 
 export function serverAssetPlugin(config?: ResolvedConfig): Plugin {

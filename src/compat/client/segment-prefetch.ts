@@ -1,7 +1,10 @@
 import {
   decodeSegmentPayload,
+  predictedRouteFor,
   recordAppShell,
+  recordResolvedRoute,
   recordSegment,
+  resolvedRouteFor,
   segmentPrefetchCovered,
   takeSegment,
 } from './segment-cache'
@@ -13,12 +16,16 @@ const INDEX_SEGMENT_PATH = '/_index'
 const TREE_SEGMENT_PATH = '/_tree'
 const RSC_QUERY = '_rsc'
 const SEGMENT_CACHE_LIMIT = 64
+/** Next's REJECTION_BACKOFF_MS: a rejected route (a 404 tree) is not re-requested for this long. */
+const REJECTION_BACKOFF_MS = 10_000
 
 type Priority = 'low' | 'high'
 
 interface SegmentEntry {
   time: number
   staleTimeMs: number
+  /** A non-ok tree: the route is backed off, not prefetched. */
+  rejected?: boolean
 }
 
 interface ScheduledPrefetch {
@@ -114,7 +121,8 @@ async function prefetchSegments(
   options: { priority: Priority; signal: AbortSignal },
 ): Promise<void> {
   const staleTimeMs = await prefetchSegment(url, TREE_SEGMENT_PATH, options)
-  if (options.signal.aborted) return
+  // A rejected route (a closed param's 404 tree) has no body to prefetch.
+  if (options.signal.aborted || staleTimeMs === undefined) return
   await prefetchSegment(url, INDEX_SEGMENT_PATH, options, staleTimeMs)
 }
 
@@ -123,7 +131,7 @@ async function prefetchSegment(
   segment: string,
   options: { priority: Priority; signal: AbortSignal },
   fallbackStaleTimeMs = 30_000,
-): Promise<number> {
+): Promise<number | undefined> {
   // Dedupe against the VARY-AWARE segment cache, never a second URL-keyed map in
   // front of it: `recordSegment` files every body response under its vary key, so
   // a route whose segments read no params already has an entry serving this URL
@@ -131,7 +139,9 @@ async function prefetchSegment(
   // The tree response carries no vary metadata, so it keeps its own pathname map.
   if (segment === TREE_SEGMENT_PATH) {
     const cached = treeCache.get(url.pathname)
-    if (cached && Date.now() - cached.time < cached.staleTimeMs) return cached.staleTimeMs
+    if (cached && Date.now() - cached.time < cached.staleTimeMs) {
+      return cached.rejected ? undefined : cached.staleTimeMs
+    }
   } else {
     // A hit alone is not a dedupe: `takeSegment` also returns PAINT-only
     // entries (a postponed body, a shared shell, another URL's runtime
@@ -167,7 +177,16 @@ async function prefetchSegment(
     priority: options.priority,
     signal: options.signal,
   })
-  if (!response.ok) return fallbackStaleTimeMs
+  if (!response.ok) {
+    if (segment !== TREE_SEGMENT_PATH) return fallbackStaleTimeMs
+    treeCache.set(url.pathname, {
+      time: Date.now(),
+      staleTimeMs: REJECTION_BACKOFF_MS,
+      rejected: true,
+    })
+    trim(treeCache)
+    return undefined
+  }
   const body = await response.text()
   const staleTimeMs = getStaleTimeMs(headerStaleTimeSeconds(response))
   // The RECORDED entry keeps the response's own window: a `stale: 0` /
@@ -268,7 +287,7 @@ function isBotUserAgent(): boolean {
   )
 }
 
-function trim(cache: Map<string, SegmentEntry>): void {
+function trim(cache: Map<string, unknown>): void {
   while (cache.size > SEGMENT_CACHE_LIMIT) {
     const oldest = cache.keys().next().value
     if (oldest === undefined) return
@@ -353,10 +372,135 @@ async function fetchAppShell(pathname: string): Promise<void> {
   })
 }
 
-// Runtime prefetches in flight or still fresh, by URL (pathname + search): expiry time.
-const runtimeRequested = new Map<string, number>()
+interface RuntimeResult {
+  complete: boolean
+  staleTimeMs: number
+}
+
+// Runtime prefetches in flight (until: Infinity) or still fresh, by header + URL.
+const runtimeRequested = new Map<string, { until: number; result: Promise<RuntimeResult | null> }>()
 // Bumped by every invalidation, so a response in flight across one never repopulates the caches.
 let runtimeGeneration = 0
+// Static prefetches that landed before the async `_buildManifest.js` ran, by URL; replayed by its callback.
+let manifestPending: Map<string, Parameters<typeof scheduleRuntimePrefetch>[0]> | undefined
+
+// Partial Prefetching: an App Shell first (`3` or static), then a per-URL `2` only for a full link.
+export const PARTIAL_PREFETCHING = 0b10
+export const STATIC_SHELL = 0b100000000000000
+export const STATIC_PREFETCH = 0b1000000000000000
+/** Partial Prefetching route pattern (colon form) → the root node's prefetch hints. */
+const routeHints = new Map<string, number>()
+// Pathname → its Partial Prefetching route; like the hints, it outlives an invalidation.
+const partialRoutes = new Map<string, string>()
+
+/** Learn a Partial Prefetching route's hints from its `/_tree` response headers. */
+export function recordRouteTree(href: string, headers: Headers): void {
+  const route = headers.get('x-pnext-segment-route')
+  const hints = Number(headers.get('x-pnext-prefetch-hints'))
+  if (!route || !(hints & PARTIAL_PREFETCHING)) return
+  const { pathname } = new URL(href, location.href)
+  recordResolvedRoute(pathname, route)
+  routeHints.set(route, hints)
+  partialRoutes.delete(pathname)
+  partialRoutes.set(pathname, route)
+  trim(partialRoutes)
+}
+
+/** The learned Partial Prefetching route predicted to serve `pathname`: its tree needs no request. */
+export function predictPartialRoute(pathname: string): string | null {
+  if (routeHints.size === 0) return null
+  const route = predictedRouteFor(pathname)
+  return route && routeHints.has(route) ? route : null
+}
+
+/** The Partial Prefetching hints of the route serving `pathname`, or 0. */
+function partialHints(pathname: string): number {
+  const route =
+    resolvedRouteFor(pathname) ?? partialRoutes.get(pathname) ?? predictedRouteFor(pathname)
+  return route ? (routeHints.get(route) ?? 0) : 0
+}
+
+/** True when this issues a Partial Prefetching route's runtime requests in place of the static body. */
+export function deferBodyPrefetch(href: string, full: boolean, treeHeaders?: Headers): boolean {
+  if (treeHeaders) recordRouteTree(href, treeHeaders)
+  if (routeHints.size === 0) return false
+  const url = new URL(href, location.href)
+  url.searchParams.delete(RSC_QUERY)
+  const hints = partialHints(url.pathname)
+  if (!hints) return false
+  const hit = takeSegment({
+    pathname: url.pathname,
+    search: url.search,
+    segmentPath: INDEX_SEGMENT_PATH,
+  })
+  if (!hit) {
+    if (hints & STATIC_SHELL) return false
+    void runPartialPrefetch(url, full)
+    return true
+  }
+  if (!full || hit.networkFree) return true
+  // A per-URL runtime prefetch whose published vary set covers this URL is byte-identical for it.
+  if (hit.runtime && !hit.appShell) return true
+  if (hints & STATIC_PREFETCH) return false
+  void runtimePrefetchOnce(url, '2')
+  return true
+}
+
+/** A static body prefetch of a Partial Prefetching route landed: follow up with its runtime requests. */
+export function followPartialPrefetch(input: {
+  pathname: string
+  search: string
+  full: boolean
+  complete: boolean
+}): boolean {
+  if (routeHints.size === 0) return false
+  const hints = partialHints(input.pathname)
+  if (!hints) return false
+  const url = new URL(input.pathname + input.search, location.href)
+  url.searchParams.delete(RSC_QUERY)
+  if (!(hints & STATIC_SHELL)) void runPartialPrefetch(url, input.full)
+  else if (input.full && !input.complete && !(hints & STATIC_PREFETCH)) {
+    void runtimePrefetchOnce(url, '2')
+  }
+  return true
+}
+
+/** The App Shell request, then (for a full link) the per-URL prefetch unless the shell was complete. */
+async function runPartialPrefetch(url: URL, full: boolean): Promise<void> {
+  const shell = await runtimePrefetchOnce(url, '3')
+  if (full && shell?.complete !== true) await runtimePrefetchOnce(url, '2')
+}
+
+/** One runtime request per header + URL while in flight or fresh; later callers share its result. */
+function runtimePrefetchOnce(url: URL, header: '2' | '3'): Promise<RuntimeResult | null> {
+  const search = header === '3' ? '' : url.search
+  const key = `${header}:${url.pathname}${search}`
+  const pending = runtimeRequested.get(key)
+  // A settled request dedupes only while its entry survives (a refresh evicts page segments).
+  if (
+    pending &&
+    pending.until > Date.now() &&
+    (pending.until === Number.POSITIVE_INFINITY ||
+      takeSegment({ pathname: url.pathname, search, segmentPath: INDEX_SEGMENT_PATH }))
+  ) {
+    return pending.result
+  }
+  const generation = runtimeGeneration
+  const result = fetchRuntimePrefetch(url, generation, header).then(
+    done => {
+      if (generation === runtimeGeneration) {
+        runtimeRequested.set(key, { until: Date.now() + done.staleTimeMs, result })
+      }
+      return done
+    },
+    () => {
+      if (generation === runtimeGeneration) runtimeRequested.delete(key)
+      return null
+    },
+  )
+  runtimeRequested.set(key, { until: Number.POSITIVE_INFINITY, result })
+  return result
+}
 
 /**
  * Next's runtime prefetch: once the static body prefetch of a route the build lists as runtime-prefetchable
@@ -370,28 +514,40 @@ export function scheduleRuntimePrefetch(input: {
   runtime: boolean
   complete: boolean
 }): void {
-  const routes = (globalThis as { __PNEXT_RUNTIME_PREFETCH__?: string[] })
-    .__PNEXT_RUNTIME_PREFETCH__
-  if (input.runtime || input.complete || !input.route || !routes?.includes(input.route)) return
+  if (input.runtime || input.complete || !input.route) return
+  const manifest = globalThis as {
+    __BUILD_MANIFEST?: object
+    __BUILD_MANIFEST_CB?: () => void
+    __PNEXT_RUNTIME_PREFETCH__?: string[]
+  }
+  if (!manifest.__BUILD_MANIFEST) {
+    // Dev documents carry no manifest script, so nothing would ever replay the queue.
+    if (!document.querySelector('script[src$="/_buildManifest.js"]')) return
+    if (!manifestPending) {
+      const pending = (manifestPending = new Map<string, typeof input>())
+      const previous = manifest.__BUILD_MANIFEST_CB
+      manifest.__BUILD_MANIFEST_CB = () => {
+        previous?.()
+        for (const queued of pending.values()) scheduleRuntimePrefetch(queued)
+        pending.clear()
+      }
+    }
+    manifestPending.set(input.pathname + input.search, input)
+    return
+  }
+  if (!manifest.__PNEXT_RUNTIME_PREFETCH__?.includes(input.route)) return
   const url = new URL(input.pathname + input.search, location.href)
   url.searchParams.delete(RSC_QUERY)
-  const key = url.pathname + url.search
-  if ((runtimeRequested.get(key) ?? 0) > Date.now()) return
-  runtimeRequested.set(key, Number.POSITIVE_INFINITY)
-  const generation = runtimeGeneration
-  void fetchRuntimePrefetch(url, generation).then(
-    staleTimeMs => {
-      if (generation === runtimeGeneration) runtimeRequested.set(key, Date.now() + staleTimeMs)
-    },
-    () => {
-      if (generation === runtimeGeneration) runtimeRequested.delete(key)
-    },
-  )
+  void runtimePrefetchOnce(url, '2')
 }
 
-async function fetchRuntimePrefetch(url: URL, generation: number): Promise<number> {
-  const response = await fetch(withRscQuery(url.href, 'runtime'), {
-    headers: { rsc: '1', 'next-router-prefetch': '2' },
+async function fetchRuntimePrefetch(
+  url: URL,
+  generation: number,
+  header: '2' | '3',
+): Promise<RuntimeResult> {
+  const response = await fetch(withRscQuery(url.href, header === '3' ? 'shell' : 'runtime'), {
+    headers: { rsc: '1', 'next-router-prefetch': header },
     credentials: 'same-origin',
     priority: 'low',
   })
@@ -399,21 +555,24 @@ async function fetchRuntimePrefetch(url: URL, generation: number): Promise<numbe
   const decoded = decodeSegmentPayload(await response.text(), INDEX_SEGMENT_PATH)
   const seconds = headerStaleTimeSeconds(response)
   const staleTimeMs = (Number.isFinite(seconds) ? seconds : 30) * 1000
-  if (!decoded || generation !== runtimeGeneration) return staleTimeMs
+  const complete = response.headers.get('x-pnext-runtime-complete') === '1'
+  if (!decoded || generation !== runtimeGeneration) return { complete, staleTimeMs }
   recordSegment({
     segmentPath: INDEX_SEGMENT_PATH,
     pathname: url.pathname,
-    search: url.search,
+    // An App Shell hangs searchParams, so it serves every query of its URL.
+    search: header === '3' ? '' : url.search,
     html: decoded.html,
     staleTimeMs,
-    complete: response.headers.get('x-pnext-runtime-complete') === '1',
+    complete,
     static: false,
     runtime: true,
+    ...(header === '3' ? { sharedAppShell: true } : {}),
     vary: decoded.vary,
     route: decoded.route,
     params: decoded.params,
   })
-  return staleTimeMs
+  return { complete, staleTimeMs }
 }
 
 function appShellsEnabled(): boolean {
@@ -424,6 +583,8 @@ function appShellsEnabled(): boolean {
 /** Test seam: forget which routes have already primed their shared shell. */
 export function resetAppShellPrefetches(): void {
   appShellRequested.clear()
+  routeHints.clear()
+  partialRoutes.clear()
 }
 
 /** Drop all prefetch dedupe state — a revalidation invalidated every window. */
@@ -431,5 +592,7 @@ export function resetSegmentPrefetchDedupe(): void {
   treeCache.clear()
   appShellRequested.clear()
   runtimeRequested.clear()
+  // Route hints outlive it: they describe the build, and a refetched tree replaces them.
   runtimeGeneration += 1
+  manifestPending = undefined
 }

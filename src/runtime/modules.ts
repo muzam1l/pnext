@@ -1301,11 +1301,9 @@ async function resolveRouteBundleSpecifier(
     }
   }
 
-  // A `turbopack.rules` loader chain owns this specifier (see the same check in
-  // resolveDevModuleSpecifier): import its materialized output.
-  const pendingRuleModule = getAssetExtensions().loaderRuleModule(specifier, importer)
+  const pendingRuleModule = loaderRuleSource(config, specifier, importer, options)
   const ruleModule = pendingRuleModule === undefined ? undefined : await pendingRuleModule
-  if (ruleModule) return { path: pathToFileHref(ruleModule), external: true }
+  if (ruleModule) return { path: ruleModule, namespace }
 
   if (isServerIgnoredAssetSpecifier(specifier)) return undefined
 
@@ -2605,15 +2603,19 @@ async function resolveDevModuleSpecifier(
     return { path: specifier, external: true }
   }
 
-  // A `turbopack.rules` loader chain owns this specifier (`?query` and all):
-  // import the module its output was materialized to. The seam answers a bare
-  // `undefined` when nothing is configured, so the common path stays sync.
-  const pendingRuleModule = getAssetExtensions().loaderRuleModule(
+  const pendingRuleModule = loaderRuleSource(
+    config,
     specifier,
     importer && !importer.startsWith('<') ? importer : file,
+    options,
   )
   const ruleModule = pendingRuleModule === undefined ? undefined : await pendingRuleModule
-  if (ruleModule) return { path: pathToFileHref(ruleModule), external: true }
+  if (ruleModule) {
+    return {
+      path: pathToFileHref(await writeDevModule(config, ruleModule, visited, options)),
+      external: true,
+    }
+  }
 
   const { sourcePath, hash } = splitHash(specifier)
 
@@ -3215,6 +3217,22 @@ async function writeClientReferenceModule(file: string, sourceFile: string, expo
     file,
     clientReferenceModuleSource(sourceFile, exportNames, portableReference(file, sourceFile)),
   )
+}
+
+// Loader-rule output compiles as app source; a raw 'use client' file falls through to its stub.
+function loaderRuleSource(
+  config: ResolvedConfig,
+  specifier: string,
+  importer: string,
+  options: DevModuleOptions,
+) {
+  const pending = getAssetExtensions().loaderRuleModule(specifier, importer)
+  if (pending === undefined || !options.stubClientImports) return pending
+  return Promise.resolve(pending).then(async file => {
+    const base = splitResourceQuery(specifier).path
+    const original = file && resolveImport(config.root, importer, base, config.workspaceRoot)
+    return original && (await fileHasUseClientDirective(original)) ? undefined : file
+  })
 }
 
 async function fileHasUseClientDirective(file: string) {

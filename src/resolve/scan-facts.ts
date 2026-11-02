@@ -76,6 +76,8 @@ export interface ImportStatement {
 export interface RewriteFacts {
   edges: SpecifierEdge[]
   imports: ImportStatement[]
+  /** `export … from` statements; a binding's `local` is its exported name, `export * from` binds none. */
+  reexports: ImportStatement[]
   importMetas: { start: number; end: number }[]
   /** `import()` calls whose argument is not a plain string literal. */
   computedImports: { start: number; end: number }[]
@@ -148,6 +150,7 @@ const emptyFacts: ScanFacts = {
 const emptyRewriteFacts: RewriteFacts = {
   edges: [],
   imports: [],
+  reexports: [],
   importMetas: [],
   computedImports: [],
   unreliable: false,
@@ -321,8 +324,9 @@ function parseFacts(file: string, source: string, lang: ParserLang) {
     })
   }
 
-  // One `export { a, b } from 'x'` reports the same moduleRequest per entry.
-  const seenExportRequests = new Set<number>()
+  // One `export { a, b } from 'x'` repeats its request per entry, `export { a }` repeats an import's.
+  const seenExportRequests = new Set<number>(edges.map(edge => edge.start))
+  const reexports: ImportStatement[] = []
   for (const statement of result.module.staticExports) {
     for (const entry of statement.entries) {
       const request = entry.moduleRequest
@@ -333,6 +337,18 @@ function parseFacts(file: string, source: string, lang: ParserLang) {
         start: request.start,
         end: request.end,
         kind: 'export',
+      })
+      reexports.push({
+        specifier: request.value,
+        start: statement.start,
+        end: statement.end,
+        specifierStart: request.start,
+        specifierEnd: request.end,
+        bindings: statement.entries.flatMap(({ importName, exportName, isType }) =>
+          exportName.name
+            ? [{ imported: importName.name ?? '*', local: exportName.name, type: isType }]
+            : [],
+        ),
       })
     }
   }
@@ -426,6 +442,7 @@ function parseFacts(file: string, source: string, lang: ParserLang) {
     rewrite: {
       edges,
       imports: importStatements,
+      reexports,
       importMetas: result.module.importMetas.map(meta => ({ start: meta.start, end: meta.end })),
       computedImports,
       unreliable: result.errors.length > 0,

@@ -8,4 +8,6 @@ Review for three things, in this order:
 2. Compatibility with stable Next.js (not canary): wording of errors and warnings, headers, status codes, redirect and RSC wire formats, router behavior. Also flag Next or React specifics leaking into core outside `src/compat`.
 3. Security: path traversal in file serving or caches, request data reaching file paths, headers or HTML unescaped, server-only values or secrets serialized to the client, open redirects, unsafe server action or proxy handling.
 
-Report only defects with a concrete failure scenario. Skip style nits and comment wording.
+4. Bloat: code that could be deleted or reuse an existing helper, parallel paths for one concern, defensive branches for impossible cases, speculative options. Name what to delete.
+
+Report only defects with a concrete failure scenario, or bloat with the lines to delete. Skip style nits and comment wording.

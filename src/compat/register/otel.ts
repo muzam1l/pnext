@@ -14,7 +14,9 @@
 // opentelemetry suite. Everything is inert unless next compat is on AND @opentelemetry/api resolves from
 // the app.
 
-import { isMaterializedPagesRoute } from '../pages/api'
+import { nextResponseMeta } from '../../api/server'
+import { conventionFileExists } from '../../runtime/production'
+import { isGeneratedPagesLayout, isMaterializedPagesRoute } from '../pages/api'
 import type { ResolvedConfig } from '../../config'
 import type { RouteManifestEntry } from '../../types'
 import {
@@ -45,12 +47,14 @@ import {
   beginClientModuleLoad,
   recordClientComponent,
   emitLeafSpan,
+  emitErrorDocumentMetadataSpans,
   emitStartResponseSpan,
   endRootSpanIfUnclosed,
   markRenderSpanError,
   markHandlerSpanError,
   markRootSpanError,
   recordResponseStatus,
+  rootOtelContext,
   forwardRootTraceHeaders,
   setOtelAppRoot,
   setRootSpanRoute,
@@ -223,10 +227,14 @@ export function registerOtelExtensions(config: ResolvedConfig): void {
       )
     },
     withComponentTreeSpan: fn => withComponentTreeSpan(fn),
-    emitResolveSegmentSpan: segment =>
+    emitResolveSegmentSpan: (segment, file) => {
+      if (!rootOtelContext()) return
+      // pnext's own root layouts (synthesized, or the hybrid app's PagesLayout) are no Next segment.
+      if (file && (!conventionFileExists(file) || isGeneratedPagesLayout(file))) return
       emitLeafSpan('resolve segment modules', SPAN_TYPE.getLayoutOrPageModule, {
         'next.segment': segment,
-      }),
+      })
+    },
     withRouteHandlerSpan: (route, fn) => {
       if (isPagesCompatRoute(route))
         return withPagesApiHandlerSpan(routePatternToDisplay(route), fn)
@@ -248,14 +256,22 @@ export function registerOtelExtensions(config: ResolvedConfig): void {
   })
 
   // Middleware and render requests share the middleware-invoke parent.
-  setProxyRunObserver((request, fn) => withMiddlewareSpan(request, fn))
+  setProxyRunObserver((request, fn) =>
+    withMiddlewareSpan(
+      request,
+      fn,
+      result =>
+        result == null || (result instanceof Response && nextResponseMeta(result) !== undefined),
+    ),
+  )
 
   const previousOnRequestError = getRequestExtensions().onRequestError
   setRequestExtensions({
     onRequestError: async (error, requestInfo, context) => {
       markRenderSpanError(error)
       markHandlerSpanError(error)
-      markRootSpanError(error)
+      // A render error only fails the request span through its 5xx status: a streamed error keeps 200.
+      if (context.routeKind !== 'html') markRootSpanError(error)
       await previousOnRequestError(error, requestInfo, context)
     },
   })
@@ -287,8 +303,13 @@ export function registerOtelExtensions(config: ResolvedConfig): void {
           ctx.request.url.pathname,
           undefined,
         )
-        queueClientComponentLoadingSpan(clientComponentLoadCount(matched?.route))
+        // Next's pages router reports no client component loading; a 5xx error document loads 3 more.
+        if (!matched || !isPagesCompatRoute(matched.route.route))
+          queueClientComponentLoadingSpan(
+            clientComponentLoadCount(matched?.route) + (ctx.status >= 500 ? 3 : 0),
+          )
       }
+      if (ctx.routeKind === 'html' && ctx.status >= 500) emitErrorDocumentMetadataSpans()
       if (ctx.routeKind === 'html' || ctx.routeKind === 'route-handler') {
         emitStartResponseSpan()
       }

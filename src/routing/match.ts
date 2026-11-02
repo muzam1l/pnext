@@ -4,7 +4,7 @@
  */
 import path from 'node:path'
 import { readDirListing, toPosixPath } from '../utils/fs'
-import { canonicalSegment, safeDecode } from '../utils/decode'
+import { safeDecode } from '../utils/decode'
 import { extraPageExtensions, getRoutingExtensions } from '../extensions'
 import type { NavState, RouteManifestEntry, RouteParamValue } from '../types'
 
@@ -78,13 +78,20 @@ export function matchRoute(routes: RouteManifestEntry[], pathname: string, heade
   return null
 }
 
+/** `/:lang/docs/:parts*` in Next's `/[lang]/docs/[...parts]` form. */
+export function nextRoutePattern(route: string, catchAllOptional = false): string {
+  return route.replace(/:([^/*]+)(\*?)/g, (_match, name: string, star: string) =>
+    !star ? `[${name}]` : catchAllOptional ? `[[...${name}]]` : `[...${name}]`,
+  )
+}
+
 export function normalizePathname(pathname: string) {
   return pathname.length > 1 ? pathname.replace(/\/+$/, '') || '/' : pathname
 }
 
 function routeMatchParams(route: RouteManifestEntry, match: RegExpExecArray) {
-  // Page params keep their canonical encoded form; handlers read decoded values.
-  const value = route.kind === 'handler' ? safeDecode : canonicalSegment
+  // Handlers read decoded values; page params are the registered form (core decoded, compat encoded).
+  const value = route.kind === 'handler' ? safeDecode : getRoutingExtensions().paramValue
   const params: Record<string, RouteParamValue> = {}
   route.params.forEach((name, index) => {
     params[name] = value(match[index + 1] ?? '')

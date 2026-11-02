@@ -208,6 +208,7 @@ export interface MetadataExtensions {
   readModuleViewport: (
     module: Record<string, unknown>,
     props: PageProps,
+    modulePath?: string,
   ) => Promise<Viewport | undefined>
   shouldRenderMetadataInBody: (input: { config: ResolvedConfig; request?: Request }) => boolean
   /** Which parallel-route slot branches feed the head, and which deliver errors where they render. */
@@ -321,7 +322,10 @@ export function setDocumentScriptExtensions(overrides: Partial<DocumentScriptExt
 // ---------------------------------------------------------------------------
 
 export interface StaticParamsExtensions {
-  normalizeModule: (module: Record<string, unknown>) => Record<string, unknown>
+  normalizeModule: (
+    module: Record<string, unknown>,
+    route: RouteManifestEntry,
+  ) => Record<string, unknown>
   validateResult?: (
     config: ResolvedConfig,
     route: RouteManifestEntry,
@@ -428,7 +432,7 @@ export interface RenderSpanExtensions {
    * `__PAGE__` for the leaf page or the dynamic/literal dir label for a layout.
    * Default: noop.
    */
-  emitResolveSegmentSpan: (segment: string) => void
+  emitResolveSegmentSpan: (segment: string, file?: string) => void
 
   /**
    * Wrap a route-handler invocation so compat emits the

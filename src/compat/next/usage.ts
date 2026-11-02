@@ -35,8 +35,6 @@ const opaquePlaceholder = /\bplaceholder\s*[=:]\s*(?!\{?\s*['"`])/
  */
 const opaqueProps = /\{\s*\.\.\.|export\s[^;]*from\s*['"]next\/(?:legacy\/)?image/
 
-const cache = new Map<string, boolean>()
-
 /**
  * Roots to scan: the app, plus the workspace's own packages when the app sits in one - a linked
  * `@scope/ui` is first-party source that compiles into the same client graph, so a `placeholder="blur"`
@@ -58,13 +56,7 @@ function scanRoots(root: string) {
   return roots
 }
 
-export function appUsesBlurPlaceholder(root: string) {
-  const cached = cache.get(root)
-  if (cached !== undefined) return cached
-  const used = scanFirstPartySource(root, blurSource)
-  cache.set(root, used)
-  return used
-}
+export const appUsesBlurPlaceholder = scanOncePerRoot(blurSource)
 
 function blurSource(source: string): boolean {
   // The common case is one `test` and out: almost no file in an app names an
@@ -76,6 +68,15 @@ function blurSource(source: string): boolean {
 /** Walk the app's first-party source (plus workspace packages) until `match`. */
 export function scanFirstPartySource(root: string, match: (source: string) => boolean): boolean {
   return scanRoots(root).some(dir => scan(dir, match))
+}
+
+function scanOncePerRoot(match: (source: string) => boolean) {
+  const cache = new Map<string, boolean>()
+  return (root: string) => {
+    let used = cache.get(root)
+    if (used === undefined) cache.set(root, (used = scanFirstPartySource(root, match)))
+    return used
+  }
 }
 
 function scan(dir: string, match: (source: string) => boolean): boolean {
@@ -120,15 +121,13 @@ const legacyProp = /\blegacyBehavior\b/
  * back to `next/link`, so treat the re-export itself as usage. */
 const reexportedLink = /export\s[^;]*from\s*['"]next\/link['"]/
 
-const legacyLinkCache = new Map<string, boolean>()
+export const appUsesLegacyLink = scanOncePerRoot(
+  source => legacyProp.test(source) || reexportedLink.test(source),
+)
 
-export function appUsesLegacyLink(root: string) {
-  const cached = legacyLinkCache.get(root)
-  if (cached !== undefined) return cached
-  const used = scanFirstPartySource(
-    root,
-    source => legacyProp.test(source) || reexportedLink.test(source),
-  )
-  legacyLinkCache.set(root, used)
-  return used
-}
+/** A segment export that runtime-prefetches its route, in routes.ts's own segment-config form. */
+const runtimePrefetchExport =
+  /^\s*export\s+const\s+(?:prefetch\s*=\s*['"](?:allow-runtime|partial)['"]|(?:unstable_)?instant\s*=)/m
+
+/** Build-time app fact: can any route be runtime-prefetched? Only then does the client ship that protocol. */
+export const appUsesRuntimePrefetch = scanOncePerRoot(source => runtimePrefetchExport.test(source))

@@ -8,6 +8,7 @@
 // registers its behavior here. Types stay intentionally structural (plain function shapes,
 // `unknown` payloads) so core carries no type dependency on any compat module.
 
+import { safeDecode } from './utils/decode'
 import type { OnLoadResult, Plugin } from 'esbuild'
 import type { CompatAliasTarget, ResolvedConfig } from './config'
 import type { StaticMetadataFile } from './routing/metadata-files'
@@ -204,6 +205,8 @@ export interface RenderCacheMetaResult<T> {
   expireSeconds?: number
   staleSeconds?: number
   noStore?: boolean
+  /** The render read a request API or a no-store signal. */
+  dynamicUsage?: boolean
 }
 
 /** Options threaded into a cache-meta collection scope. */
@@ -218,6 +221,8 @@ export interface CollectRenderMetaOptions {
   handler?: boolean
   /** True when a static render must reject dynamic request APIs. */
   dynamicError?: boolean
+  /** True when rendering an unbuilt param of a route the build prerendered statically. */
+  onDemandPrerender?: boolean
 }
 
 export interface RenderExtensions {
@@ -237,6 +242,8 @@ export interface RenderExtensions {
       | 'segmentConfig'
       | 'prerenderedParams'
       | 'params'
+      | 'catchAll'
+      | 'paramMatching'
       | 'stream'
     >,
     state: {
@@ -1025,7 +1032,10 @@ export interface BuildCompatExtensions {
    * work unit before it unwinds. No-op default for pure-core apps.
    */
   takeFontLinkHeader: () => string | undefined
-  normalizeStaticParamsModule: (module: Record<string, unknown>) => Record<string, unknown>
+  normalizeStaticParamsModule: (
+    module: Record<string, unknown>,
+    route: RouteManifestEntry,
+  ) => Record<string, unknown>
   defaultDynamicStaleTimeSeconds: number
   defaultStaticStaleTimeSeconds: number
   buildRootTreePrefetch: (options: {
@@ -1038,7 +1048,13 @@ export interface BuildCompatExtensions {
     inlineBudgetBytes?: number
     runtimePrefetch?: boolean
     postponed?: boolean
+    partialPrefetching?: boolean
+    routePattern?: string
+    shellStatic?: boolean
+    prefetchStatic?: boolean
   }) => SegmentPrefetchTree
+  /** The route uses Partial Prefetching (a shared App Shell, then per-link prefetches). */
+  routePartialPrefetching: (route: RouteManifestEntry) => boolean
   rootTreePrefetchText: (payload: SegmentPrefetchTree, format?: 'json' | 'flight') => string
   buildSegmentMeta: (options: {
     status: number
@@ -1047,6 +1063,7 @@ export interface BuildCompatExtensions {
     bodySizeBytes?: number
     inlineBudgetBytes?: number
     prefetchHints?: Record<string, number>
+    staleTimeDeclared?: boolean
   }) => SegmentMetaLike
   /**
    * `--experimental-build-mode generate` prerender diagnostics: Next's exact
@@ -1072,6 +1089,8 @@ export interface BuildCompatExtensions {
   ) => string
   /** Whether a diagnostic block already opens with the prerender-error line. */
   diagnosticLeadsWithErrorLine: (diagnostic: string) => boolean
+  /** The CLI's text for an error that failed `build`. Pure-core default: the message as is. */
+  formatBuildError: (error: unknown, message: string) => string
   /**
    * Persist build inputs the SERVING runtime needs (compat: the
    * `--debug-prerender` flag, which selects the shape of the runtime
@@ -1126,6 +1145,7 @@ function createBuildExtensions(): BuildExtensions {
     normalizeStaticParamsModule: module => module,
     defaultDynamicStaleTimeSeconds: 30,
     defaultStaticStaleTimeSeconds: 300,
+    routePartialPrefetching: () => false,
     buildRootTreePrefetch: options => {
       const staleTime =
         options.staleTimeSeconds ??
@@ -1179,6 +1199,7 @@ function createBuildExtensions(): BuildExtensions {
     diagnoseCacheComponentsPrerender: () => undefined,
     prerenderFailureFooter: () => '',
     diagnosticLeadsWithErrorLine: () => false,
+    formatBuildError: (_error, message) => message,
     recordBuildFlags: () => undefined,
     segmentDir: (outPath, routeId) => `${outPath}/segments/${routeId}`,
     treeSegmentFile: (outPath, routeId) =>
@@ -1340,6 +1361,8 @@ export interface RoutingExtensions {
     params: Record<string, RouteParamValue>,
     headers?: Headers,
   ) => boolean
+  /** A matched page path segment as `params` exposes it: core decodes, compat keeps Next's encoded form. */
+  paramValue: (segment: string) => string
 }
 
 function createRoutingExtensions(): RoutingExtensions {
@@ -1351,6 +1374,7 @@ function createRoutingExtensions(): RoutingExtensions {
     pageExtensions: [],
     alwaysClientEntryReasons: new Set(),
     admitRoute: () => true,
+    paramValue: safeDecode,
   }
 }
 
@@ -1433,6 +1457,11 @@ export function registerRouteAdmission(admit: RoutingExtensions['admitRoute']): 
   activeHost.routing.admitRoute = admit
 }
 
+/** Register how a matched page segment becomes a param value (compat: percent-encoded). */
+export function registerParamValue(value: RoutingExtensions['paramValue']): void {
+  activeHost.routing.paramValue = value
+}
+
 /** Why every page ships the router entry; empty for a pure-core app. */
 export function alwaysClientEntryReasons(): ClientEntryReason[] {
   return [...activeHost.routing.alwaysClientEntryReasons]
@@ -1491,6 +1520,11 @@ export interface ProxyExtensions {
   validateFiles: (config: ResolvedConfig) => Promise<void>
   /** Pick the handler export from a loaded proxy module. */
   handlerExport: (module: Record<string, unknown>) => unknown
+  /** Load the proxy module of `file`; `load` imports pnext's compile of it (compat: the edge sandbox). */
+  importModule: (
+    file: string,
+    load: () => Promise<Record<string, unknown>>,
+  ) => Promise<Record<string, unknown>>
   /** Preserve the original proxy URL and Flight headers for advanced routing. */
   skipUrlNormalize: () => boolean
   /** Framework locale derived from the proxy request URL. */
@@ -1510,6 +1544,7 @@ function createProxyExtensions(): ProxyExtensions {
     names: ['proxy'],
     validateFiles: () => Promise.resolve(),
     handlerExport: module => module.proxy ?? module.default,
+    importModule: (_file, load) => load(),
     skipUrlNormalize: () => false,
     locale: () => '',
     onExternalRewrite: request => void request,
@@ -1931,8 +1966,9 @@ export interface AssetExtensions {
    * plugins) steps aside so the compat loader-rule plugin runs the chain
    * instead (e.g. a `*.svg` loader rule preempting the default image pipeline).
    * Compat registers `hasWebpackLoaderRuleFor`; pure-core apps keep the default.
+   * A `resourceQuery` also checks the rule's query condition.
    */
-  hasLoaderRuleFor: (filePath: string) => boolean
+  hasLoaderRuleFor: (filePath: string, resourceQuery?: string) => boolean
 
   /**
    * Run the `turbopack.rules` loader chain configured for `specifier` (which may carry a query) as imported

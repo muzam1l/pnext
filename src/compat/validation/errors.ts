@@ -156,5 +156,15 @@ export function unresolvedCodemodCommentMessage(note: string): string {
 }
 
 export function isBundlerCompilationFailure(output: string): boolean {
-  return /(?:^|\n)(?:error: )?Build failed with \d+ errors?:/.test(output)
+  // Next decodes metadata images in a loader, so a bad image is a compilation error.
+  return /(?:^|\n)(?:error: )?Build failed with \d+ errors?:|Error: Process image "[^"]+" failed/.test(
+    output,
+  )
+}
+
+/** Next's CLI heads a failed build's error with this line, except type errors and its own `> ` messages. */
+export function formatBuildError(error: unknown, message: string): string {
+  return (error as Error | undefined)?.name === 'PnextTypecheckError' || /(?:^|\n)> /.test(message)
+    ? message
+    : `> Build error occurred\n${message}`
 }

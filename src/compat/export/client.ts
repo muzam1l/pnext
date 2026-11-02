@@ -29,14 +29,14 @@ interface ExportedDocument {
 // Installed by the deferred navigation tier, which finishes before the runtime issues its first
 // prefetch; the marker is an inline script in <head>, so it is already set by then.
 export function installExportDocumentFetcher(set: (fetcher: ExportDocumentFetcher) => void) {
-  if (outputExportMode()) set(fetchExportedDocument)
+  if (exportMarker()) set(fetchExportedDocument)
 }
 
-/** Whether the running document was served out of an export tree. */
-function outputExportMode(): boolean {
+/** The export marker of the running document, set only when served out of an export tree. */
+function exportMarker(): unknown {
   return (
     (process.browser || typeof window !== 'undefined') &&
-    (window as { __PNEXT_OUTPUT_EXPORT__?: boolean }).__PNEXT_OUTPUT_EXPORT__ === true
+    (window as { __PNEXT_OUTPUT_EXPORT__?: unknown }).__PNEXT_OUTPUT_EXPORT__
   )
 }
 
@@ -83,8 +83,9 @@ async function fetchExportedDocument(
   if (!response.ok) return null
   const html = await response.text()
   // Static hosts answer an unknown path with a catch-all document or a
-  // directory listing rather than a 404; neither is a pnext document.
-  if (!html.includes('<html')) return null
+  // directory listing rather than a 404; neither is a pnext document. A document
+  // from another deployment hard-navigates instead.
+  if (!html.includes('<html') || !html.includes(JSON.stringify(exportMarker()))) return null
   return {
     html,
     finalUrl: prefetch ? pageUrl.href : navigatedUrl(response, url),

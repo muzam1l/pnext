@@ -17,6 +17,7 @@ import {
   type BuildStepContext,
   getCompatModeExtensions,
   getRenderExtensions,
+  getRoutingExtensions,
   runInitHooks,
   withRouteRuntime,
 } from '../extensions'
@@ -77,6 +78,9 @@ import {
   beginShellSourceTracking,
   cacheComponents,
   endShellSourceTracking,
+  RUNTIME_PARAMS,
+  RUNTIME_SESSION,
+  RUNTIME_URL,
 } from '../render/ppr'
 import { handleRouteModule, staticRouteParams, type RouteHandlerModule } from '../routing/handler'
 import { runWithCacheScope } from '../request/cache'
@@ -98,9 +102,11 @@ import {
   addClientEntryReason,
   assertNoServerActionsWithoutCompat,
   findLayouts,
+  inferRouteMode,
   materializeRouteFacts,
   scanRoutes,
 } from '../routing/routes'
+import { nextRoutePattern } from '../routing/match'
 import { interceptionMarkerLevels } from '../routing/slots'
 import { writeTypegen } from './typegen'
 import { lookupBuildCache, writeBuildCache } from './build/cache'
@@ -184,10 +190,10 @@ export async function buildProject(root?: string, options: BuildOptions = {}) {
   try {
     return await runBuild(root, options, lifecycle)
   } catch (error) {
-    // A parallel phase that already failed (a type error) is the root cause of
-    // whatever broke downstream; report it instead of the symptom.
-    const phaseError = buildParallelPhaseError()
-    throw phaseError ?? error
+    // A failed parallel phase (a type error) is the root cause of whatever broke downstream; like
+    // Next, which typechecks first, wait for it and report it instead of the symptom.
+    await Promise.allSettled(getBuildExtensions().parallelPhases.map(phase => phase.run))
+    throw buildParallelPhaseError() ?? error
   } finally {
     lifecycle.warm?.kill()
     endSourceScope()
@@ -326,6 +332,15 @@ async function runBuild(
     // eslint-disable-next-line @typescript-eslint/require-await
     async () => materializeRouteFacts(routes, route => clientSources.warmRoutes([route])),
   )
+  const staticExport =
+    config.output === 'export' || (nextCompatEnabled(config) && buildCompat().nextOutputExport())
+  // A static export renders every page at build time; a request API it really calls fails that prerender.
+  for (const route of staticExport ? routes : []) {
+    if (route.kind !== 'page' || route.interception) continue
+    if (route.segmentConfig?.dynamic === 'force-static') continue
+    route.usesRequest = false
+    route.mode = inferRouteMode(route, false, route.segmentConfig)
+  }
   // Before anything renders: core cannot dispatch a server action, so an app with
   // one fails the build by name instead of shipping forms that go nowhere.
   assertNoServerActionsWithoutCompat(routes, nextCompatEnabled(config), config.root)
@@ -350,10 +365,7 @@ async function runBuild(
   // output:'export' with trailingSlash:false lays prerendered pages out flat
   // (`/a.html` rather than `/a/index.html`). Only meaningful under compat (the
   // Next config carries `output`); pure-core apps always use the dir layout.
-  const flatExportLayout =
-    (config.output === 'export' ||
-      (nextCompatEnabled(config) && buildCompat().nextOutputExport())) &&
-    config.trailingSlash !== true
+  const flatExportLayout = staticExport && config.trailingSlash !== true
   // The proxy bundle is independent of the remaining build steps; overlap them.
   const proxyBuild = log.step('proxy module', () => buildProxyModule(config))
   proxyBuild.catch(() => undefined)
@@ -512,6 +524,8 @@ async function runBuild(
   // statically; Next fails the build naming each offending route + API. Collect
   // them all (matching prerenderEarlyExit:false) and fail once at the end.
   let hadDynamicErrorFailure = false
+  // output: export pages whose prerender threw: no runtime server can serve them instead.
+  const failedExportPages: string[] = []
 
   // A handler route whose logical output path doubles as a parent directory for a descendant
   // route's static output cannot be written as a plain file AND host a child directory on one
@@ -544,7 +558,7 @@ async function runBuild(
   for (const route of routes) {
     if (route.dynamicErrorApi) {
       console.error(
-        `Error: Route ${toNextRoutePattern(route.route || '/')} with \`dynamic = "error"\` ` +
+        `Error: Route ${toNextRoutePattern(route)} with \`dynamic = "error"\` ` +
           `couldn't be rendered statically because it used ${route.dynamicErrorApi}. ` +
           `See more info here: https://nextjs.org/docs/app/building-your-application/rendering/static-and-dynamic#dynamic-rendering`,
       )
@@ -592,7 +606,7 @@ async function runBuild(
     if (isGenerate && cacheComponents() && !route.client && !route.interception) {
       // Next names the route by its source pattern (`/use-cache-params/[slug]`),
       // not pnext's `:param` form — the diagnostics quote it verbatim.
-      const diagnosticRoute = toNextRoutePattern(route.route || '/')
+      const diagnosticRoute = toNextRoutePattern(route)
       const diagnostic = buildCompat().diagnoseCacheComponentsPrerender({
         route: diagnosticRoute,
         pageFile: route.file,
@@ -685,7 +699,7 @@ async function runBuild(
         // Next reports a generateStaticParams failure with this exact prefix
         // (naming the route in `[param]` form), followed by the underlying
         // error (the thrown after() message).
-        console.error(`Failed to collect page data for ${toNextRoutePattern(route.route)}`)
+        console.error(`Failed to collect page data for ${toNextRoutePattern(route)}`)
         console.error(error instanceof Error ? (error.stack ?? error.message) : String(error))
         hadAfterPrerenderError = true
         continue
@@ -747,14 +761,13 @@ async function runBuild(
     }
     if (!forceStatic && (await needsRequestOriginForMetadataImages(config.appPath, route))) continue
 
+    let onDemandStatic = staticParams !== null && !forceStatic && !cacheComponents()
     await log.step(
       `prerender ${route.route} (${paramSets.length} page${paramSets.length === 1 ? '' : 's'})`,
       async () => {
         for (const rawParams of paramSets) {
-          // Next derives prerender params from the encoded URL it builds for a
-          // generateStaticParams value, so a page sees `sticks%20%26%20stones`,
-          // never the raw `sticks & stones` (prerender-encoding suite). File
-          // layout and dynamicParams matching keep the raw values.
+          // The page sees params as a request for this URL would (compat: `sticks%20%26%20stones`);
+          // file layout and dynamicParams matching keep the raw values.
           const params = encodeStaticRouteParams(rawParams)
           const routePath = fillRoutePath(route.route, rawParams)
           const file = staticHtmlPath(config.outPath, routePath, flatExportLayout)
@@ -797,6 +810,8 @@ async function runBuild(
                     fetchCache: segmentConfig?.fetchCache,
                     route: routePath || '/',
                     prerender: true,
+                    // Next turns an unset/auto `dynamic` into 'error' under output: export.
+                    dynamicError: staticExport && (segmentConfig?.dynamic ?? 'auto') === 'auto',
                   },
                 ),
               )
@@ -809,6 +824,10 @@ async function runBuild(
               fontLinkHeader = buildCompat().takeFontLinkHeader()
               return result
             })
+            if (staticExport && rendered.value.status >= 500) {
+              throw new Error(`the page rendered status ${rendered.value.status}`)
+            }
+            if (rendered.dynamicUsage || prerenderVary?.search) onDemandStatic = false
             // Explicit no-store signals (fetch no-store/no-cache, revalidate
             // 0, unstable_noStore) keep the route dynamic — unless the
             // segment config explicitly opts into static/ISR output.
@@ -889,11 +908,19 @@ async function runBuild(
           } catch (error) {
             rethrowIfProgrammingError(error)
             if (isAfterPrerenderError(error)) hadAfterPrerenderError = true
-            warnSkippedStatic(routePath, error instanceof Error ? error.message : String(error))
+            const reason = error instanceof Error ? error.message : String(error)
+            if (staticExport) {
+              console.error(
+                `Error occurred prerendering page "${routePath || '/'}". Read more: https://nextjs.org/docs/messages/prerender-error\n${reason}`,
+              )
+              failedExportPages.push(routePath || '/')
+            } else warnSkippedStatic(routePath, reason)
+            onDemandStatic = false
           }
         }
       },
     )
+    if (onDemandStatic) route.onDemandStatic = true
   }
 
   // Generate-mode prerender diagnostics fail the pass with Next's exact
@@ -927,6 +954,11 @@ async function runBuild(
   if (hadDynamicErrorFailure) {
     throw new Error(
       'Build failed because a route with `dynamic = "error"` read dynamic data during prerendering.',
+    )
+  }
+  if (failedExportPages.length > 0) {
+    throw new Error(
+      `Export encountered errors on ${failedExportPages.length} ${failedExportPages.length === 1 ? 'path' : 'paths'}:\n\t${failedExportPages.sort().join('\n\t')}`,
     )
   }
 
@@ -1120,7 +1152,7 @@ function interceptionDisplayRoute(route: RouteManifestEntry, filled?: string): s
   if (!interception) return route.route
   const base = interception.base === '/' ? [] : interception.base.split('/').filter(Boolean)
   const levels = interceptionMarkerLevels(interception.marker)
-  const target = (filled ?? toNextRoutePattern(route.route)).split('/').filter(Boolean)
+  const target = (filled ?? toNextRoutePattern(route)).split('/').filter(Boolean)
   // `route.route` is `<kept base>/<segments below the marker>`; the marker dir
   // itself is the first segment past what the rewind kept.
   const cut = Number.isFinite(levels) ? Math.max(0, base.length - levels) : 0
@@ -1177,6 +1209,8 @@ function printBuildSummary(
   console.log('')
   console.log('Route (app)')
   const usedMarkers = new Set<string>()
+  const tableLines: string[] = []
+  const tree = nextCompatEnabled(config)
   for (const route of routes) {
     const intercepted = interceptionPrerenders.get(route.id)
     const staticHandler =
@@ -1209,15 +1243,19 @@ function printBuildSummary(
         ? (route.metadataRoute?.generatedRoutes ?? [label])
         : [label]
     for (const routeLabel of labels) {
-      console.log(
-        `  ${marker} ${nextCompatEnabled(config) ? toNextRoutePattern(routeLabel) : routeLabel}`,
-      )
+      tableLines.push(`${marker} ${tree ? toNextRoutePattern(route, routeLabel) : routeLabel}`)
     }
   }
   for (const file of staticMetadataSummaryFiles(staticFiles)) {
     usedMarkers.add('○')
-    console.log(`  ${dim('○')} /${file}`)
+    tableLines.push(`${dim('○')} /${file}`)
   }
+  // Next draws its table as a tree (`┌ ○ /`, `├`, `└`); e2e suites parse those prefixes.
+  const last = tableLines.length - 1
+  tableLines.forEach((line, index) => {
+    const prefix = !tree ? ' ' : index === last ? (index ? '└' : '─') : index ? '├' : '┌'
+    console.log(`${prefix} ${line}`)
+  })
   if (hasMiddleware) {
     usedMarkers.add('ƒ')
     console.log('')
@@ -1418,28 +1456,37 @@ function routeDeclaresShortLivedCache(route: RouteManifestEntry): boolean {
   return false
 }
 
-/**
- * The shell to publish as the route's PREFETCH body segment. pnext bakes ONE shell and serves it
- * both as the HTML document and as the body segment, so a route with a short-lived cache gets a
- * SECOND prerender whose `use cache` gate omits that cache. Only that render feeds the segment
- * artifacts - the prerendered document keeps the cached block inline. Undefined when the route needs
- * no separate prefetch body, or the gated render produced no shell.
- */
+/** The route's prefetch body (a short-lived-cache-free render when needed) and its static-attempt hints. */
 async function renderPrefetchBody(
   config: Awaited<ReturnType<typeof loadConfig>>,
   route: RouteManifestEntry,
+  document: { prebuilt: PrebuiltShell; vary: BuildResponseVary | undefined },
   render: () => Promise<PrebuiltShell | null>,
-): Promise<{ prebuilt: PrebuiltShell; vary: BuildResponseVary | undefined } | undefined> {
-  if (!routeDeclaresShortLivedCache(route)) return undefined
-  try {
-    const { prebuilt, vary } = await renderShellWithCacheMeta(config, route, render)
-    return prebuilt ? { prebuilt, vary } : undefined
-  } catch {
-    // Best-effort: the document shell doubles as the prefetch body, as before.
-    return undefined
-  } finally {
-    abortActivePrerenderScopes()
+) {
+  const shortLived = routeDeclaresShortLivedCache(route)
+  let shell: typeof document | undefined
+  if (shortLived || buildCompat().routePartialPrefetching(route)) {
+    try {
+      const { prebuilt, vary } = await renderShellWithCacheMeta(config, route, render)
+      if (prebuilt) shell = { prebuilt, vary }
+    } catch {
+      // Best-effort: the document shell doubles as the prefetch body, as before.
+    } finally {
+      abortActivePrerenderScopes()
+    }
   }
+  // Fallback params read in a shell ISR later upgrades are not worth a runtime request.
+  const urlData = RUNTIME_SESSION | RUNTIME_URL | (route.hasStaticParams ? 0 : RUNTIME_PARAMS)
+  const ensureStatic = route.segmentConfig?.ensureStatic
+  const hints = {
+    shellStatic:
+      ensureStatic !== undefined ||
+      !(((shell ?? document).prebuilt.runtimeData ?? 0) & RUNTIME_SESSION),
+    prefetchStatic:
+      (ensureStatic !== undefined && ensureStatic !== 'shell') ||
+      !((document.prebuilt.runtimeData ?? 0) & urlData),
+  }
+  return { ...(shortLived && shell ? shell : document), hints }
 }
 
 async function buildPprShell(
@@ -1466,14 +1513,15 @@ async function buildPprShell(
   const file = pprShellPath(config.outPath, route.id)
   await mkdir(path.dirname(file), { recursive: true })
   await writeText(file, prebuilt.shell)
-  const prefetchBody = (await renderPrefetchBody(config, route, () =>
+  const prefetchBody = await renderPrefetchBody(config, route, { prebuilt, vary }, () =>
     renderPartialShell({ config, route, url, prefetchShell: true }),
-  )) ?? { prebuilt, vary }
+  )
   await emitSegmentArtifacts(
     config,
     route,
     prefetchBody.prebuilt.shell,
     prefetchBody.prebuilt.holes.length > 0,
+    prefetchBody.hints,
     meta,
     undefined,
     prefetchBody.vary,
@@ -1513,6 +1561,8 @@ async function emitSegmentArtifacts(
   route: RouteManifestEntry,
   body: string,
   postponed: boolean,
+  /** Whether a static App Shell / per-URL prefetch attempt suffices (no runtime data before the stage). */
+  hints: { shellStatic: boolean; prefetchStatic: boolean },
   cacheMeta?: ShellCacheMeta,
   statusOverride?: number,
   vary?: BuildResponseVary,
@@ -1524,8 +1574,9 @@ async function emitSegmentArtifacts(
 ): Promise<void> {
   const isStatic = route.mode === 'static' && !postponed
   const compat = buildCompat()
+  const declaredStaleTime = staleTimeFromRouteSources(route)
   const staleTime =
-    staleTimeFromRouteSources(route) ??
+    declaredStaleTime ??
     (isStatic ? compat.defaultStaticStaleTimeSeconds : compat.defaultDynamicStaleTimeSeconds)
   const bodySizeBytes = Buffer.byteLength(body)
   const tree = compat.buildRootTreePrefetch({
@@ -1537,6 +1588,9 @@ async function emitSegmentArtifacts(
     postponed,
     runtimePrefetch:
       (route.segmentConfig as { prefetch?: unknown } | undefined)?.prefetch === 'allow-runtime',
+    partialPrefetching: compat.routePartialPrefetching(route),
+    routePattern: route.route,
+    ...hints,
     // The route's <title> is dynamic and ships as its own `/_head` response;
     // announcing it in the TREE lets the client fetch the head before the body
     // (Next's response order) instead of learning it from the body response.
@@ -1553,6 +1607,7 @@ async function emitSegmentArtifacts(
     postponed,
     bodySizeBytes,
     prefetchHints: { [route.route]: tree.tree.prefetchHints },
+    staleTimeDeclared: declaredStaleTime !== undefined,
     ...(vary && buildVaryTrusted(route, vary, fallbackParamsRender) ? { vary } : {}),
   })
   await mkdir(compat.segmentDir(config.outPath, route.id), { recursive: true })
@@ -1900,6 +1955,15 @@ async function buildCacheComponentsShell(
 ): Promise<boolean> {
   const url = new URL(`http://pnext.local${route.route}`)
   const hasDynamicParams = route.params.length > 0 || Boolean(route.catchAll)
+  // Resolved first so the shells' client route state knows the route's param policy.
+  const staticParams =
+    hasDynamicParams && route.hasStaticParams
+      ? await staticParamsFor(config, route).catch(rethrowIfProgrammingError)
+      : undefined
+  if (staticParams) {
+    route.prerenderedParams = staticParams.allSets
+    if (staticParams.paramMatching) route.paramMatching = staticParams.paramMatching
+  }
   // Build-phase so buildtime sentinels resolve correctly in the shell.
   beginShellSourceTracking()
   let renderResult: Awaited<ReturnType<typeof renderShellWithCacheMeta>>
@@ -1914,7 +1978,7 @@ async function buildCacheComponentsShell(
     // stray cacheSignal-bound timer can never keep the build's event loop alive.
     abortActivePrerenderScopes()
   }
-  const { prebuilt, meta } = renderResult
+  const { prebuilt, meta, vary } = renderResult
   const shellSources = endShellSourceTracking()
   // A base fallback shell provides NO partial-shell value when it is either null (dynamic data
   // escaped every boundary) or params-only-empty (its only holes come from `params`, which are
@@ -1983,16 +2047,17 @@ async function buildCacheComponentsShell(
         // Probe render failed — the shell itself is unaffected.
       }
     }
-    const prefetchBody = (await renderPrefetchBody(config, route, () =>
+    const prefetchBody = await renderPrefetchBody(config, route, { prebuilt, vary }, () =>
       hasDynamicParams
         ? renderFallbackShell({ config, route, url, prefetchShell: true })
         : renderPartialShell({ config, route, url, prefetchShell: true }),
-    )) ?? { prebuilt, vary: renderResult.vary }
+    )
     await emitSegmentArtifacts(
       config,
       route,
       prefetchBody.prebuilt.shell,
       prefetchBody.prebuilt.holes.length > 0,
+      prefetchBody.hints,
       meta,
       fallbackStatus,
       prefetchBody.vary,
@@ -2002,9 +2067,7 @@ async function buildCacheComponentsShell(
     )
 
     // Descending-specificity sub-shells from generateStaticParams prefixes.
-    if (hasDynamicParams && route.hasStaticParams) {
-      await buildSubShells(config, route)
-    }
+    if (staticParams) await buildSubShells(config, route, staticParams)
     return true
   }
 
@@ -2034,7 +2097,7 @@ async function buildCacheComponentsShell(
       recordRouteCacheTags(route, meta.tags)
       if (meta.linkHeader) route.linkHeader = meta.linkHeader
     }
-    await buildSubShells(config, route)
+    if (staticParams) await buildSubShells(config, route, staticParams)
     return true
   }
 
@@ -2102,16 +2165,8 @@ async function hasFullStaticParamSet(
 async function buildSubShells(
   config: Awaited<ReturnType<typeof loadConfig>>,
   route: RouteManifestEntry,
+  staticParams: Awaited<ReturnType<typeof staticParamsFor>>,
 ): Promise<void> {
-  let staticParams: Awaited<ReturnType<typeof staticParamsFor>>
-  try {
-    staticParams = await staticParamsFor(config, route)
-  } catch (error) {
-    rethrowIfProgrammingError(error)
-    return
-  }
-  route.prerenderedParams = staticParams.allSets
-  if (staticParams.paramMatching) route.paramMatching = staticParams.paramMatching
   const paramKeys = [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
   // Distinct leading prefixes AND full param sets. A partial prefix fills keys
   // [0..k) (k < len) and leaves the rest hanging → a sub-shell (postponed). A
@@ -2571,7 +2626,7 @@ async function buildStaticRouteHandler(
   const routeModule = metadataRouteHandlerModule(imported, route) ?? imported
   const module = (
     nextCompatEnabled(config)
-      ? buildCompat().normalizeStaticParamsModule(routeModule as Record<string, unknown>)
+      ? buildCompat().normalizeStaticParamsModule(routeModule as Record<string, unknown>, route)
       : routeModule
   ) as RouteHandlerModule
   const paramSets = await staticRouteParams(route, module)
@@ -2991,16 +3046,17 @@ export function staticHtmlPath(outPath: string, routePath: string, flatLayout = 
   return safePublicPath(outPath, normalized, 'index.html')
 }
 
-// Percent-encode generateStaticParams values the way Next encodes them into
-// prerender URLs: params reach the page render as URL segments (`%20`, `%26`),
-// one encoded element per catch-all entry.
+// generateStaticParams values as a request for their URL would see them: the URL segment through the
+// registered param value (core: raw; compat: Next's encoded `%20`, `%26`), per catch-all entry.
 function encodeStaticRouteParams(
   params: Record<string, RouteParamValue>,
 ): Record<string, RouteParamValue> {
+  const { paramValue } = getRoutingExtensions()
+  const value = (segment: string) => paramValue(encodeURIComponent(segment))
   return Object.fromEntries(
-    Object.entries(params).map(([key, value]) => [
+    Object.entries(params).map(([key, raw]) => [
       key,
-      Array.isArray(value) ? value.map(encodeURIComponent) : encodeURIComponent(value),
+      Array.isArray(raw) ? raw.map(value) : value(raw),
     ]),
   )
 }
@@ -3227,7 +3283,7 @@ async function probeDeferredDynamicUsage(
   staticMetadataFiles: StaticMetadataFile[],
   staticModuleMetadata: Record<string, StaticModuleMetadata>,
 ): Promise<void> {
-  const routePath = toNextRoutePattern(route.route || '/')
+  const routePath = toNextRoutePattern(route)
   const failures: unknown[] = []
   const restore = captureDeferredFailures(error => failures.push(error))
   beginDynamicBailoutProbe(routePath)
@@ -3278,8 +3334,8 @@ function warnSkippedStatic(routePath: string, reason: string) {
 
 // pnext routes carry Express-style `:param` / `:...catchAll` segments; Next's
 // build diagnostics name routes in `[param]` / `[...catchAll]` form.
-function toNextRoutePattern(route: string): string {
-  return route.replace(/:\.\.\.([^/]+)/g, '[...$1]').replace(/:([^/]+)/g, '[$1]')
+function toNextRoutePattern(route: RouteManifestEntry, label = route.route || '/'): string {
+  return nextRoutePattern(label, route.catchAllOptional)
 }
 
 // A throwing after() during a prerender is tagged by the compat after() runtime

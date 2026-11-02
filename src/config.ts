@@ -69,6 +69,7 @@ export interface ConfigSourceOverrides {
   outDir?: string
   assetPrefix?: string
   productionBrowserSourceMaps?: boolean
+  htmlLimitedBots?: RegExp
 }
 export type ConfigSource = (
   root: string,
@@ -165,6 +166,7 @@ export async function loadConfig(
     productionBrowserSourceMaps:
       merged.productionBrowserSourceMaps ?? config.productionBrowserSourceMaps,
     skipTrailingSlashRedirect: merged.skipTrailingSlashRedirect ?? config.skipTrailingSlashRedirect,
+    htmlLimitedBots: merged.htmlLimitedBots,
     appDir: path.relative(root, appPath),
     publicDir: 'public',
     outDir: merged.outDir,

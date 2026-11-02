@@ -465,7 +465,6 @@ export async function createRequestHandler(
     const canonicalRedirect = trailingSlashRedirect(config, requestedUrl)
     if (canonicalRedirect) return canonicalRedirect
     const canonicalUrl = new URL(request.url)
-    const canonicalHeaders = request.headers
     const beforeProxy = getRequestExtensions().beforeProxy
     if (beforeProxy) await beforeProxy(request)
     let proxyResponse: Response | undefined
@@ -508,10 +507,11 @@ export async function createRequestHandler(
     // picks up whatever search ended up on the fully-resolved request.
     const canonicalRequestUrl = new URL(canonicalUrl)
     canonicalRequestUrl.search = url.search
+    // The resolved request's headers: a middleware rewrite's request-header overrides apply to the render.
     const canonicalRequest =
       canonicalRequestUrl.href === request.url
         ? request
-        : new Request(canonicalRequestUrl, { headers: canonicalHeaders })
+        : new Request(canonicalRequestUrl, { headers: request.headers })
 
     const method = request.method.toUpperCase()
     // Soft navigations carry the client's parallel-route state; when the
@@ -787,10 +787,21 @@ export async function createRequestHandler(
         ? new Request(canonicalRequest.url, { headers: canonicalRequest.headers })
         : canonicalRequest
     const pageRevalidateReason = stalePage ? staleReason : hardExpired ? 'on-demand' : undefined
+    // An unbuilt param of a route whose build prerenders stayed static: dynamic usage fails it.
+    const onDemandPrerender =
+      nextCompat &&
+      matched.route.onDemandStatic === true &&
+      !built &&
+      !draftBypass &&
+      !softDynamic &&
+      (method === 'GET' || method === 'HEAD')
+    // A draft-mode render is per request: never an ISR document a CDN may keep.
+    const revalidateReason = draftBypass ? undefined : pageRevalidateReason
+    const mode = draftBypass ? 'dynamic' : routeModeOf(matched.route)
     setWorkUnitRoute(
       'html',
-      pageRevalidateReason ? 'isr' : routeModeOf(matched.route),
-      responseHintsFor(matched.route, pageRevalidateReason),
+      revalidateReason ? 'isr' : onDemandPrerender && mode === 'dynamic' ? 'static' : mode,
+      responseHintsFor(matched.route, revalidateReason),
     )
     const renderMatchedPage = () =>
       withRouteRuntime(matched.route.segmentConfig?.runtime, () =>
@@ -821,6 +832,7 @@ export async function createRequestHandler(
       fetchCache: matched.route.segmentConfig?.fetchCache,
       refreshFetches: Boolean(stalePage),
       route: url.pathname,
+      onDemandPrerender,
     })
     const renderRevalidateSeconds =
       renderedPage.revalidateSeconds ??
@@ -838,14 +850,18 @@ export async function createRequestHandler(
     // so after a server action revalidated the path the browser replayed the pre-revalidation payload.
     // A `segmentConfig.revalidate > 0` route is already classified 'isr' by routeModeOf above.
     const renderWasDynamic =
-      matched.route.mode === 'dynamic' || matched.route.usesRequest || renderedPage.noStore === true
+      renderedPage.noStore === true ||
+      (!onDemandPrerender && (matched.route.mode === 'dynamic' || matched.route.usesRequest))
     if (renderRevalidateSeconds !== undefined && renderRevalidateSeconds > 0 && !renderWasDynamic) {
       setWorkUnitRoute('html', 'isr', {
         ...(getWorkUnit()?.responseHints ?? {}),
         revalidateSeconds: renderRevalidateSeconds,
       })
     }
-    const pageResponse = renderedPage.value
+    let pageResponse = renderedPage.value
+    // Its SSR pass failed (failOnDemandPrerender): Next answers 500 while the browser recovers.
+    if (onDemandPrerender && renderedPage.noStore)
+      pageResponse = new Response(pageResponse.body, { status: 500, headers: pageResponse.headers })
 
     // A PPR resume replays the prebuilt shell without re-running the
     // components whose react-dom preload()/font hints produced the prerender's
@@ -876,8 +892,13 @@ export async function createRequestHandler(
       // shell must keep re-entering the renderer: caching its first (still
       // un-upgraded) render on disk would serve every later request as a HIT
       // and the upgraded shell would never reach the client.
-      !isPprShellUpgradeEligible(config, matched.route, url) &&
+      !isPprShellUpgradeEligible(
+        config,
+        matched.route,
+        matched.targetPath === url.pathname ? url : new URL(matched.targetPath, url),
+      ) &&
       (forceStaticRoute ||
+        onDemandPrerender ||
         (!matched.route.usesRequest &&
           // `dynamic = 'force-dynamic'` opts the route out of every render cache in Next: persisting
           // the first render would serve every later request as a static HIT and never re-render.

@@ -20,6 +20,7 @@ import {
   cssClassNames,
   cssModuleClassName,
   cssModuleMapping,
+  cssModuleSourceFromMap,
   isCssModuleFile,
   recordEmittedAsset,
 } from './assets'
@@ -707,7 +708,7 @@ export function cssModuleClientPlugin(): Plugin {
     setup(plugin) {
       plugin.onLoad({ filter: /\.(?:css|scss|sass)$/ }, async ({ path: file }) => ({
         contents: isCssModuleFile(file)
-          ? `export default ${JSON.stringify(await cssModuleMapping(file))};`
+          ? cssModuleSourceFromMap(await cssModuleMapping(file))
           : 'export default undefined;',
         loader: 'js',
       }))

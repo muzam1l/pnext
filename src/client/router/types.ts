@@ -211,6 +211,8 @@ export interface SegmentCacheRecord {
   static: boolean
   /** True when the payload came from a runtime (request-sampled) prefetch. */
   runtime: boolean
+  /** The prefetch was a FULL one (`prefetch={true}`). */
+  full?: boolean
   /**
    * The server DECLARED this payload its POSTPONED (PPR) shell for this exact URL - the
    * truncated prefetch response `x-nextjs-postponed` marks. Such a payload is the
@@ -254,6 +256,8 @@ export interface SegmentCachePolicy {
    * as its static-sibling guard.
    */
   routeFor?: (pathname: string) => string | null
+  /** The learned route pattern predicted to serve a pathname the server never answered, or null. */
+  predictRoute?: (pathname: string) => string | null
   /** True when the colon-form `route` pattern covers `pathname`. */
   matchesRoute?: (route: string, pathname: string) => boolean
   /**
@@ -262,6 +266,8 @@ export interface SegmentCachePolicy {
    * never commits - but it is byte-identical by the server's own assertion, so the request is skipped.
    */
   prefetchCovered?: (input: SegmentCacheLookup) => { html: string } | null
+  /** True when the policy issues the body prefetch itself; `treeHeaders` teach it the route's hints. */
+  deferBodyPrefetch?: (href: string, full: boolean, treeHeaders?: Headers) => boolean
   /**
    * w9-segment-split: the PAGE frame is cached but the LAYOUT frame is not,
    * so only `/_layout` has to come off the network.

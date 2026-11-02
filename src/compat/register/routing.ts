@@ -12,12 +12,14 @@ import {
   registerAlwaysClientEntryReason,
   registerClientEntryDetectors,
   registerRouteDependencyClassifiers,
+  registerParamValue,
   registerRouteAdmission,
   registerRouteConventions,
   registerUsageDetectors,
 } from '../../extensions'
 import { nextCompatEnabled } from '../../compat/aliases'
 import { admitRoute } from '../static-params'
+import { canonicalSegment } from '../../utils/decode'
 import { escapeRegex } from '../../utils/code'
 
 export function registerRoutingExtensions(config: ResolvedConfig): void {
@@ -40,6 +42,8 @@ export function registerRoutingExtensions(config: ResolvedConfig): void {
   // (instrumentation-client-hook asserts both). Core keeps its leaner default.
   registerAlwaysClientEntryReason('compat-parity')
   registerRouteAdmission(admitRoute)
+  // App Router hands components percent-encoded param values (`cash%242`, `100%25`).
+  registerParamValue(canonicalSegment)
 }
 
 // A route's layout chain is re-classified for every route below it, and the answer depends only on

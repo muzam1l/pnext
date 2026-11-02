@@ -150,11 +150,16 @@ try {
   const formatted = formatCliError(error)
   // A blank formatted message exits 1 with no explanation; fall back to the
   // raw error so the failure is never silent.
-  if (formatted.message.trim()) console.error(formatted.message)
-  else
-    console.error(
-      error instanceof Error ? (error.stack ?? `${error.name}: ${error.message}`) : String(error),
-    )
+  let message = formatted.message.trim()
+    ? formatted.message
+    : error instanceof Error
+      ? (error.stack ?? `${error.name}: ${error.message}`)
+      : String(error)
+  if (command === 'build') {
+    const { getBuildExtensions } = await import('../extensions')
+    message = getBuildExtensions().compat.formatBuildError(error, message)
+  }
+  console.error(message)
   if (formatted.trace) console.log(`\n${formatted.trace}`)
   process.exit(1)
 }

@@ -17,7 +17,7 @@ import {
 import { recordUseCacheLife, recordUseCacheTags } from '../cache/use-cache'
 import { currentRequest, getWorkUnit } from '../../request/context'
 import { getNextConfig } from './config-loader'
-import { isPrerendering, PostponeError } from '../../render/ppr'
+import { isPrerendering, PostponeError, RUNTIME_SESSION } from '../../render/ppr'
 export { io, navigation, prefetch } from '../ppr/io'
 
 export function refresh() {
@@ -133,7 +133,7 @@ export function unstable_cache<Args extends unknown[], Result>(
 
 /** Opt the surrounding render out of prebuilt static output (Next semantics). */
 export function unstable_noStore() {
-  recordCacheNoStore()
+  recordCacheNoStore('unstable_noStore()')
 }
 
 // 'use cache' directive companions: tag/bound the active use-cache entry
@@ -215,7 +215,7 @@ export function cacheLife(
     ...(stale !== undefined ? { staleSeconds: stale } : {}),
   })
   if (revalidate !== undefined) recordCacheRevalidate(revalidate)
-  if (isPrerendering() && stale === 0) throw new PostponeError('cacheLife')
+  if (isPrerendering() && stale === 0) throw new PostponeError('cacheLife', RUNTIME_SESSION)
 }
 export const unstable_cacheTag = cacheTag
 export const unstable_cacheLife = cacheLife

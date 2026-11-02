@@ -24,6 +24,7 @@ import {
 import { isPostpone } from '../../render/ppr'
 import { markErrorLogged } from '../../utils/error-log'
 import { getUserOnRequestError, instrumentationReady } from './instrumentation'
+import { failOnDemandPrerender, runOutsideRenderCacheMeta } from '../cache/revalidate'
 
 const ERROR_REPORTED_KEY = Symbol.for('pnext.errorReported')
 
@@ -231,6 +232,7 @@ export async function reportRequestErrorToUser(
   context: RequestErrorContext,
 ): Promise<void> {
   if (isControlFlowError(error)) return
+  if (context.renderSource === 'server-rendering') failOnDemandPrerender()
 
   const unit = getWorkUnit()
   if (unit) {
@@ -260,12 +262,14 @@ export async function reportRequestErrorToUser(
     : buildContext(error, context, path)
 
   try {
-    // The hook is not part of the render: a polling fetch must not hit the render's GET dedupe.
+    // The hook is not part of the render: its fetches skip the render's GET dedupe and cache meta.
     await runOutsideCacheScope(() =>
-      hook(
-        error,
-        { path, method: requestInfo.method, headers: headersToObject(requestInfo.headers) },
-        hookContext,
+      runOutsideRenderCacheMeta(() =>
+        hook(
+          error,
+          { path, method: requestInfo.method, headers: headersToObject(requestInfo.headers) },
+          hookContext,
+        ),
       ),
     )
   } catch (hookError) {

@@ -2,6 +2,7 @@ import { isNotFoundError, isRedirectError, type PNextRedirectError } from '../..
 import { runWithRequest, setPhase } from '../../request/context'
 import { toNextRequest } from '../../api/server'
 import { revalidationEventCount } from '../cache/revalidate'
+import { rootOtelContext } from '../otel/tracer'
 import { serializeBoundaryError } from '../lifecycle/error-serialize'
 import { runWithAfterRequestApiScope } from '../lifecycle/after-scope'
 import { lookupAction } from './registry'
@@ -216,7 +217,12 @@ export async function runAction(request: Request, options: RunActionOptions): Pr
     setPhase('action')
     const data = await runWithRequest(
       nextRequest,
-      () => runWithAfterRequestApiScope(true, () => Promise.resolve(action(...args))),
+      () =>
+        runWithAfterRequestApiScope(true, () => {
+          const run = () => Promise.resolve(action(...args))
+          const root = rootOtelContext()
+          return root ? root.api.context.with(root.context, run) : run()
+        }),
       {},
       { responseHeaders },
     ).finally(() => setPhase('render'))

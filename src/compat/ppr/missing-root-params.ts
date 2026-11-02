@@ -21,7 +21,7 @@ import { scanRootParamsForFile } from './root-params-scan'
  * catch-all (`:slug*` -> `[...slug]`); a trailing `?` marks it optional
  * (`[[...slug]]`).
  */
-function toBracketPattern(pattern: string): string {
+export function toBracketPattern(pattern: string): string {
   return pattern
     .split('/')
     .map(segment => {

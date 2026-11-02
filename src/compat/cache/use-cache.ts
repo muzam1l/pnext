@@ -27,7 +27,9 @@ import {
   markRuntimeApiOnAwait,
   PostponeError,
   realNow,
+  RUNTIME_SESSION,
   trackPrerenderCacheFill,
+  recordShellCacheIO,
 } from '../../render/ppr'
 import {
   currentRenderCacheMeta,
@@ -49,6 +51,7 @@ import {
   tagsStaleSince,
 } from './revalidate'
 import {
+  hasCustomModernCacheHandler,
   hasModernCacheHandler,
   modernCacheEntry,
   modernCacheGet,
@@ -56,6 +59,7 @@ import {
   modernCacheKey,
   modernCacheRefreshTags,
   modernCacheSet,
+  pendingModernCacheInstall,
 } from './modern-handler'
 import { funnelCacheRuntimeError } from './runtime-error'
 import {
@@ -68,6 +72,8 @@ import {
   USE_CACHE_HANGING_MESSAGE,
 } from './build-prerender-errors'
 import { getNextConfig } from '../next/config-loader'
+import { createUseCachePrivateOutsideRequestContextError } from './build-flags'
+import { generateStaticParamsScope } from '../static-params'
 
 // ---------------------------------------------------------------------------
 // Build-prerender `use cache` fill timeout (E236 hanging-input detection).
@@ -191,7 +197,10 @@ const scopeStorage = useCacheGlobal(
   USE_CACHE_SCOPE_STORAGE,
   () => new AsyncLocalStorage<UseCacheScope>(),
 )
-const requestTokens = useCacheGlobal(USE_CACHE_REQUEST_TOKENS, () => new WeakMap<object, object>())
+const requestTokens = useCacheGlobal(
+  USE_CACHE_REQUEST_TOKENS,
+  () => new WeakMap<object, Set<string>>(),
+)
 const handlerLookups = useCacheGlobal(
   USE_CACHE_HANDLER_LOOKUPS,
   () => new WeakMap<object, Map<string, ReturnType<typeof modernCacheGet>>>(),
@@ -476,21 +485,29 @@ const RUNTIME_PREFETCH_DYNAMIC_STALE = 30
 const PREFETCH_SHELL_DYNAMIC_EXPIRE = 300
 const PREFETCH_SHELL_DYNAMIC_STALE = 300
 
+/** App Shells are reused across navigations, so they admit only shell-length caches. */
+function runtimePrefetchMinStale(): number {
+  return isPrefetchShellPrerender() ? PREFETCH_SHELL_DYNAMIC_STALE : RUNTIME_PREFETCH_DYNAMIC_STALE
+}
+
 /** How the active prerender gates a short-lived `use cache` scope, if at all. */
-function prefetchCacheGate(): 'stale' | 'expire' | null {
+function prefetchCacheGate(): 'stale' | 'expire' | 'shell' | null {
   if (insideDataCacheProducer() || insideUseCacheProducer()) return null
   if (isRuntimePrefetchPrerender()) return 'stale'
+  if (isPrefetchShellPrerender() && getNextConfig().partialPrefetching === true) return 'shell'
   if (isPrefetchShellPrerender() || isTaskBoundaryPrerender()) return 'expire'
   return null
 }
 
-function cacheLifeTooShort(gate: 'stale' | 'expire', life: CacheLifeStash | undefined): boolean {
-  return (
-    (life?.staleSeconds ?? DEFAULT_STALE_SECONDS) <
-      (gate === 'stale' ? RUNTIME_PREFETCH_DYNAMIC_STALE : PREFETCH_SHELL_DYNAMIC_STALE) ||
-    (gate === 'expire' &&
-      (life?.expireSeconds ?? DEFAULT_EXPIRE_SECONDS) < PREFETCH_SHELL_DYNAMIC_EXPIRE)
-  )
+/** The RUNTIME_* bits of the hole a gated-out scope leaves, or undefined when the scope is kept. */
+function cacheLifeHole(
+  gate: 'stale' | 'expire' | 'shell',
+  life: CacheLifeStash | undefined,
+): number | undefined {
+  const expire = life?.expireSeconds ?? DEFAULT_EXPIRE_SECONDS
+  if (gate !== 'stale' && expire < PREFETCH_SHELL_DYNAMIC_EXPIRE) return RUNTIME_SESSION
+  const minStale = gate === 'expire' ? RUNTIME_PREFETCH_DYNAMIC_STALE : runtimePrefetchMinStale()
+  return (life?.staleSeconds ?? DEFAULT_STALE_SECONDS) < minStale ? 0 : undefined
 }
 
 /**
@@ -501,15 +518,15 @@ function cacheLifeTooShort(gate: 'stale' | 'expire', life: CacheLifeStash | unde
  */
 function gatePrefetchCacheLife<T>(
   result: Promise<T>,
-  gate: 'stale' | 'expire',
+  gate: 'stale' | 'expire' | 'shell',
   life: () => { staleSeconds?: number; expireSeconds?: number } | undefined,
 ): Promise<T> {
   // Awaiting a cache read inside a runtime prefetch arms the sync-IO abort, the
   // same way awaiting cookies()/params does (identity for the shell gate).
   return markRuntimeApiOnAwait(
     Promise.resolve(result).then(value => {
-      if (cacheLifeTooShort(gate, life())) return hangingPromise<T>('use cache')
-      return value
+      const hole = cacheLifeHole(gate, life())
+      return hole === undefined ? value : hangingPromise<T>('use cache', hole)
     }),
   )
 }
@@ -640,7 +657,7 @@ function propagate(entry: UseCacheEntry, parent?: UseCacheScope) {
     return
   }
   const gate = prefetchCacheGate()
-  if (gate && cacheLifeTooShort(gate, entry)) return
+  if (gate && cacheLifeHole(gate, entry) !== undefined) return
   const { tags, revalidateSeconds, expireSeconds, staleSeconds } = entry
   recordCacheTags(tags)
   if (revalidateSeconds !== undefined) recordCacheRevalidate(revalidateSeconds)
@@ -669,84 +686,27 @@ function propagateToParent(entry: UseCacheEntry, parent: UseCacheScope): void {
 export function pnextUseCache<Args extends unknown[], Result>(
   id: string,
   fn: (...args: Args) => Result,
+  kind?: string,
+  pageSegment = false,
 ): (...args: Args) => Result {
   const run = (...args: Args): Result => {
-    const serializedArgs = installSearchParamsTripwire(serializeCacheBoundaryArgs(args), id) as Args
+    let serializedArgs = serializeCacheBoundaryArgs(args) as Args
+    if (pageSegment) serializedArgs = installSearchParamsTripwire(serializedArgs, id) as Args
     // Draft mode skips cache reads/writes but KEEPS the cache-scope rules:
     // dynamic APIs (cookies()/headers()) inside 'use cache' still throw.
     if (draftModeBypassActive()) return draftBypassRun(id, fn, serializedArgs)
-    // Element-like arguments become indexed holes: they never affect the key
-    // (an element keys as an opaque token either way), the produced tree embeds
-    // the hole markers, and each invocation re-instantiates it with ITS fills.
-    const holes = extractElementHoles(serializedArgs)
-    const keyArgs = declaredArgs(fn, serializedArgs)
-    const key = cacheKeyFor(id, withRootParamKeyArgs(id, keyArgs))
-    if (isPromiseLike(key)) {
-      return key.then(resolvedKey => {
-        if (resolvedKey === null) return fn(...serializedArgs)
-        return readOrProduceEntry(
-          resolvedKey,
-          id,
-          argsJsonFromKey(id, resolvedKey),
-          fn,
-          holes.args as Args,
-          holes.fills,
-        )
-      }) as Result
-    }
-    if (key === null) return fn(...serializedArgs)
-
-    return readOrProduceEntry(
-      key,
-      id,
-      argsJsonFromKey(id, key),
-      fn,
-      holes.args as Args,
-      holes.fills,
-    )
+    return cachedCall(id, fn, serializedArgs, declaredArgs(fn, serializedArgs), kind)
   }
   const wrapper = (...args: Args): Result => sinkDiscardedRejection(run(...args))
   ;(wrapper as unknown as Record<symbol, unknown>)[USE_CACHE_WRAPPER] = true
   return wrapper
 }
 
-// ---------------------------------------------------------------------------
-// searchParams-inside-`use cache` detection (E842).
-//
-// A cached page receives `{ params, searchParams }` props. Awaiting
-// `searchParams` INSIDE the cache scope is unsupported (it is dynamic request
-// data). Next passes a searchParams promise that rejects with E842 when read
-// inside a cache scope; we mirror it during a build prerender by swapping the
-// props' `searchParams` for a tripwire thenable. The tripwire only fires when
-// awaited while a `use cache` producer is on the stack (insideUseCacheProducer),
-// so cache-key computation (which resolves it OUTSIDE any producer scope) sees
-// the real value, and a page that never awaits searchParams (search-params-
-// unused) is never tripped. The violation is recorded even when the page catches
-// the throw (search-params-caught) so the build still fails.
-// ---------------------------------------------------------------------------
-
+// E842: a public cached page segment omits searchParams from its key and rejects any read of it.
 function installSearchParamsTripwire(args: unknown[], id: string): unknown[] {
-  if (!prerenderErrorCollectionActive()) return args
-  const route = routeFromCacheId(id)
-  let changed = false
-  const out = args.map(arg => {
-    if (
-      arg !== null &&
-      typeof arg === 'object' &&
-      !Array.isArray(arg) &&
-      !isPromiseLike(arg) &&
-      !isElementLike(arg) &&
-      isPromiseLike((arg as Record<string, unknown>).searchParams)
-    ) {
-      changed = true
-      return {
-        ...arg,
-        searchParams: searchParamsTripwire(route, (arg as Record<string, unknown>).searchParams),
-      }
-    }
-    return arg
-  })
-  return changed ? out : args
+  const [props, ...rest] = args as [{ searchParams?: unknown } | undefined]
+  if (!isPromiseLike(props?.searchParams)) return args
+  return [{ ...props, searchParams: searchParamsTripwire(routeFromCacheId(id)) }, ...rest]
 }
 
 function withFillTimeout(value: Promise<unknown>, route: string | undefined): Promise<unknown> {
@@ -767,18 +727,19 @@ function withFillTimeout(value: Promise<unknown>, route: string | undefined): Pr
   })
 }
 
-function searchParamsTripwire(route: string, real: unknown): PromiseLike<unknown> {
+const SEARCH_PARAMS_TRIPWIRE = Symbol('pnext.searchParamsTripwire')
+
+function searchParamsTripwire(route: string) {
   return {
+    [SEARCH_PARAMS_TRIPWIRE]: true,
     then<TResult1 = unknown, TResult2 = never>(
       onFulfilled?: ((value: unknown) => TResult1 | PromiseLike<TResult1>) | null,
       onRejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
     ): PromiseLike<TResult1 | TResult2> {
-      if (insideUseCacheProducer()) {
-        const message = useCacheSearchParamsMessage(route)
+      const message = useCacheSearchParamsMessage(route)
+      if (prerenderErrorCollectionActive())
         recordPrerenderError({ kind: 'search-params', route, consoleBlock: `Error: ${message}` })
-        return Promise.reject(new Error(message)).then(onFulfilled, onRejected)
-      }
-      return Promise.resolve(real).then(onFulfilled, onRejected)
+      return Promise.reject(new Error(message)).then(onFulfilled, onRejected)
     },
   }
 }
@@ -794,6 +755,7 @@ export function pnextUseCacheBound<Args extends unknown[], Result>(
   id: string,
   fn: (...args: Args) => Result,
   capture: () => unknown[],
+  kind?: string,
 ): (...args: Args) => Result {
   const wrapper = (...args: Args): Result => {
     const serializedArgs = serializeCacheBoundaryArgs(args) as Args
@@ -816,34 +778,38 @@ export function pnextUseCacheBound<Args extends unknown[], Result>(
       })
       throw new Error(USE_CACHE_CLOSE_OVER_FUNCTION_MESSAGE)
     }
-    const holes = extractElementHoles(serializedArgs)
-    const keyArgs = [captured, ...declaredArgs(fn, serializedArgs)]
-    const key = cacheKeyFor(id, withRootParamKeyArgs(id, keyArgs))
-    if (isPromiseLike(key)) {
-      return key.then(resolvedKey => {
-        if (resolvedKey === null) return fn(...serializedArgs)
-        return readOrProduceEntry(
-          resolvedKey,
-          id,
-          argsJsonFromKey(id, resolvedKey),
-          fn,
-          holes.args as Args,
-          holes.fills,
-        )
-      }) as Result
-    }
-    if (key === null) return fn(...serializedArgs)
-    return readOrProduceEntry(
-      key,
-      id,
-      argsJsonFromKey(id, key),
-      fn,
-      holes.args as Args,
-      holes.fills,
-    )
+    return cachedCall(id, fn, serializedArgs, [captured, ...declaredArgs(fn, serializedArgs)], kind)
   }
   ;(wrapper as unknown as Record<symbol, unknown>)[USE_CACHE_WRAPPER] = true
   return wrapper
+}
+
+/** Serve `args` from the entry `keyArgs` keys, or run uncached when they cannot key. */
+function cachedCall<Args extends unknown[], Result>(
+  id: string,
+  fn: (...args: Args) => Result,
+  args: Args,
+  keyArgs: unknown[],
+  kind: string | undefined,
+): Result {
+  const installing = pendingModernCacheInstall()
+  if (installing) return installing.then(() => cachedCall(id, fn, args, keyArgs, kind)) as Result
+  // Element-like arguments key as opaque tokens and become holes each invocation fills.
+  const holes = extractElementHoles(args)
+  const enter = (key: string | null): Result =>
+    key === null
+      ? fn(...args)
+      : readOrProduceEntry(
+          key,
+          id,
+          argsJsonFromKey(id, key),
+          fn,
+          holes.args as Args,
+          holes.fills,
+          kind,
+        )
+  const key = cacheKeyFor(id, withRootParamKeyArgs(id, keyArgs))
+  return isPromiseLike(key) ? (key.then(enter) as Result) : enter(key)
 }
 
 /**
@@ -860,14 +826,18 @@ export function pnextUseCachePrivate<Args extends unknown[], Result>(
   fn: (...args: Args) => Result,
 ): (...args: Args) => Result {
   const wrapper = (...args: Args): Result => {
-    recordCacheNoStore()
+    const generator = generateStaticParamsScope()
+    if (generator)
+      throw createUseCachePrivateOutsideRequestContextError(generator.route, generator.functionName)
+    recordCacheNoStore("'use cache: private'")
     // Private caches are EXCLUDED from prerenders: they may read per-request data, so a build/shell
     // prerender postpones the scope (a dynamic hole under the nearest Suspense boundary; a classic
     // static prerender skips the route to dynamic) and the function is evaluated per request instead.
     // EXCEPTION: a runtime prefetch samples the real request, so a private cache with a long enough
     // stale window IS included; a shorter-lived one stays a postponed hole.
     if (isPrerendering()) {
-      if (!isRuntimePrefetchPrerender()) throw new PostponeError('use cache: private')
+      if (!isRuntimePrefetchPrerender())
+        throw new PostponeError('use cache: private', RUNTIME_SESSION)
       return runtimePrefetchPrivate(id, fn, serializeCacheBoundaryArgs(args) as Args) as Result
     }
     const serializedArgs = serializeCacheBoundaryArgs(args) as Args
@@ -930,7 +900,8 @@ function runtimePrefetchPrivate<Args extends unknown[], Result>(
   return markRuntimeApiOnAwait(
     produced.then(value => {
       const stale = scope.staleSeconds ?? DEFAULT_STALE_SECONDS
-      if (stale < RUNTIME_PREFETCH_DYNAMIC_STALE) return hangingPromise('use cache: private')
+      if (stale < runtimePrefetchMinStale())
+        return hangingPromise('use cache: private', RUNTIME_SESSION)
       // The sampled value IS in this response, so the response is only as fresh
       // as that private window — the runtime-prefetch payload must expire with
       // it, not with the (longer) public `use cache` window baked into the
@@ -1071,12 +1042,16 @@ function readOrProduceEntry<Args extends unknown[], Result>(
   fn: (...args: Args) => Result,
   args: Args,
   fills: unknown[],
+  kind?: string,
 ): Result {
   if (currentPrerenderScope()?.signal.aborted) {
     return Promise.reject(new PostponeError('use cache')) as Result
   }
   const parent = scopeStorage.getStore()
   const modernKey = hasModernCacheHandler() ? modernCacheKey(id, argsJson) : undefined
+  // A custom default handler's miss re-runs only keys this request has not yet held.
+  const heldKeys =
+    kind === undefined && hasCustomModernCacheHandler() ? currentUseCacheRequestToken() : undefined
   const resumeRecord = useCacheRdcRecords().get(key)
   if (
     resumeRecord &&
@@ -1100,6 +1075,7 @@ function readOrProduceEntry<Args extends unknown[], Result>(
       tagSeq: resumeRecord.tagSeq,
       ...(resumeRecord.route !== undefined ? { route: resumeRecord.route } : {}),
     })
+    heldKeys?.add(key)
   }
   const existing = entries.get(key)
   const pendingWrite = existing?.pendingWrite
@@ -1136,6 +1112,7 @@ function readOrProduceEntry<Args extends unknown[], Result>(
     }
   }
   const produce = (): Result => {
+    heldKeys?.add(key)
     const value = produceEntry(key, id, argsJson, fn, args, parent, undefined, modernKey)
     const out = withHoleFills(value, fills)
     // The producing entry's cacheLife is set once `value` settles (see
@@ -1147,6 +1124,7 @@ function readOrProduceEntry<Args extends unknown[], Result>(
     return captureUseCacheRdcResult(key, modernGet ? modernGet.then(() => gated) : gated) as Result
   }
   const serve = (entry: UseCacheEntry, refreshStale = true): Result => {
+    heldKeys?.add(key)
     if (refreshStale && (expired || swrStale) && !pendingWrite && !entry.refreshing) {
       // TTL expiry outside an ISR regen: serve stale while refreshing in
       // the background (Next's SWR data-cache semantics).
@@ -1189,10 +1167,11 @@ function readOrProduceEntry<Args extends unknown[], Result>(
     // served stale while the handler still hands the key back (a custom handler that serves stale is
     // what drives SWR). Next's default handler drops an entry at `revalidate` under `next start`, so
     // there the read must re-produce instead of replaying our in-process copy.
-    if (modernGet && expired) {
+    if (modernGet && (expired || (heldKeys && !pendingWrite && !heldKeys.has(key)))) {
       return modernGet.then(found => {
-        if (!found) return produce()
         const latest = entries.get(key) ?? existing
+        // A same-key sibling call on this lookup already re-produced: join it.
+        if (!found && latest === existing) return produce()
         return serve(latest, latest === existing)
       }) as Result
     }
@@ -1387,8 +1366,10 @@ function cacheKeyFor(id: string, args: unknown[]): string | Promise<string | nul
         resolved => stringifyCacheKey(id, resolved),
         // A hanging input (a postponed request API) keeps the whole call pending.
         (error: unknown) => {
-          if (isPostpone(error)) throw error
-          return null
+          if (!isPostpone(error)) return null
+          // The scope still holds the shell's cached IO, as when it ran uncached.
+          recordShellCacheIO()
+          throw error
         },
       )
     }
@@ -1418,6 +1399,7 @@ function stringifyCacheKey(id: string, value: unknown): string | null {
 
 function resolvePromisesForKey(value: unknown, stack: WeakSet<object>): unknown {
   if (isPromiseLike(value)) {
+    if (SEARCH_PARAMS_TRIPWIRE in value) return undefined
     return Promise.resolve(value).then(resolved =>
       resolvePromisesForKey(resolved, new WeakSet<object>()),
     )
@@ -1854,12 +1836,13 @@ function memoServerComponent(
   return wrapper
 }
 
-function currentUseCacheRequestToken(): object | undefined {
+/** The request's identity token, doubling as the use-cache keys it produced, served or resumed. */
+function currentUseCacheRequestToken(): Set<string> | undefined {
   const request = currentRequest() as object | undefined
   if (!request) return undefined
   let token = requestTokens.get(request)
   if (!token) {
-    token = {}
+    token = new Set()
     requestTokens.set(request, token)
   }
   return token

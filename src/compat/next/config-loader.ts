@@ -25,6 +25,7 @@ import {
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import type { ConfigSourceOverrides as NextConfigCoreOverrides } from '../../config'
 import { build } from '../../utils/esbuild'
 import { setConfig } from './config'
 import { setCacheComponents } from '../../render/ppr'
@@ -116,16 +117,6 @@ export function setNextConfig(config: NextConfigObject): void {
     config.skipTrailingSlashRedirect === true
   ;(globalThis as { __PNEXT_TRAILING_SLASH__?: boolean }).__PNEXT_TRAILING_SLASH__ =
     config.trailingSlash === true
-}
-
-/** Overrides mapped onto pnext's resolved core config. */
-export interface NextConfigCoreOverrides {
-  basePath?: string
-  trailingSlash?: boolean
-  skipTrailingSlashRedirect?: boolean
-  outDir?: string
-  assetPrefix?: string
-  productionBrowserSourceMaps?: boolean
 }
 
 export interface LoadNextConfigResult {
@@ -509,6 +500,9 @@ function mapOverrides(config: NextConfigObject): NextConfigCoreOverrides {
     overrides.skipTrailingSlashRedirect = config.skipTrailingSlashRedirect
   if (typeof config.productionBrowserSourceMaps === 'boolean')
     overrides.productionBrowserSourceMaps = config.productionBrowserSourceMaps
+  // Next keeps only the source and matches case-insensitively, statelessly.
+  if (config.htmlLimitedBots instanceof RegExp)
+    overrides.htmlLimitedBots = new RegExp(config.htmlLimitedBots.source, 'i')
   // Next's distDir maps onto pnext's outDir. pnext's default output dir is .pnext; only override when
   // the app explicitly sets distDir. Under `output: 'export'` a custom distDir is the EXPORT
   // destination instead - the build keeps its default dir and the static export tree lands in distDir.

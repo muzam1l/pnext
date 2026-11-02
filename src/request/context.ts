@@ -432,7 +432,7 @@ export function requireRequest(api: string) {
  * PROMISE so that creating the promise does not postpone - only awaiting it inside a Suspense subtree does
  * (dynamic-at-await-site).
  */
-export function requestApiPromise<T>(api: string, produce: () => T): Promise<T> {
+export function requestApiPromise<T>(api: string, produce: () => T, runtime: number): Promise<T> {
   // Under a cacheComponents prerender the value hangs: awaiting it postpones the
   // boundary, while merely observing its rejection (the request-apis stash-and-
   // observe pattern) yields the "rejects when the prerender is complete" message
@@ -448,7 +448,7 @@ export function requestApiPromise<T>(api: string, produce: () => T): Promise<T> 
       // the navigation, not the prefetch (see runWithRuntimePrefetchSyncIoAbort).
       return markRuntimeApiOnAwait(Promise.resolve(produce()))
     }
-    return hangingPromise<T>(api)
+    return hangingPromise<T>(api, runtime)
   }
   // Legacy PPR (experimental_ppr, cacheComponents off): keep the call-site
   // throw so the existing shell path postpones exactly as before.

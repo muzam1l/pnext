@@ -122,7 +122,7 @@ import {
 import { createClientWorkerTransform } from '../bundler/worker'
 import { rewriteStyledJsxSource } from '../css/styled-jsx'
 import { getImagesConfig } from '../next/image/config'
-import { appUsesBlurPlaceholder, appUsesLegacyLink } from '../next/usage'
+import { appUsesBlurPlaceholder, appUsesLegacyLink, appUsesRuntimePrefetch } from '../next/usage'
 import { rewriteLegacyLinkValidation } from '../next/link-transform'
 import { pagesClientModulePlugin } from '../pages/client-plugin'
 
@@ -407,6 +407,10 @@ export function registerBundlerExtensions(config: ResolvedConfig): void {
       __PNEXT_IMAGE_BLUR__: String(appUsesBlurPlaceholder(config.root)),
       // Same one-sided source scan for `<Link legacyBehavior>` (usage.ts).
       __PNEXT_LINK_LEGACY__: String(appUsesLegacyLink(config.root)),
+      // Runtime and Partial Prefetching client code ships only to an app with a runtime-prefetched route.
+      __PNEXT_RUNTIME_PREFETCHING__: String(
+        getNextConfig().partialPrefetching === true || appUsesRuntimePrefetch(config.root),
+      ),
       // next.config `images` only ever reached the server global, so the client
       // fell back to the defaults — config-dependent props (path, qualities,
       // sizes) mismatched on hydration. Inlining the resolved config also drops

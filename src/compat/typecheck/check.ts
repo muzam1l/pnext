@@ -13,7 +13,7 @@ export class PnextTypecheckError extends Error {
   /** The individual diagnostics, kept so the worker can ship them across intact. */
   readonly messages: string[]
   constructor(messages: string[]) {
-    super(messages.join('\n'))
+    super(`Failed to type check.\n\n${messages.join('\n')}`)
     this.name = 'PnextTypecheckError'
     this.messages = messages
   }
@@ -569,11 +569,14 @@ function formatDiagnostics(
       /^Type 'typeof import\("([^"]+)"\)' does not satisfy the constraint 'AppPageConfig/.exec(
         raw,
       )?.[1]
-    if (pageModule && /(?:property|Property) 'default'/.test(raw)) {
+    // A missing default stays raw, as Next prints it.
+    if (pageModule && /(?:property|Property) 'default'(?! is missing)/.test(raw)) {
       const file =
         ['.tsx', '.ts', '.jsx', '.js'].map(ext => pageModule + ext).find(existsSync) ?? pageModule
+      const props =
+        /Type '\((?:\w+|\{[^}]*\}|\[[^\]]*\])\??: (.+)\) => [^']+' is not assignable/.exec(raw)?.[1]
       messages.add(
-        `Type error: Page "${path.relative(root, file).split(path.sep).join('/')}" has an invalid "default" export:\n${raw}`,
+        `Type error: Page "${path.relative(root, file).split(path.sep).join('/')}" has an invalid "default" export:\n${props ? `  Type "${props}" is not valid.` : raw}`,
       )
       continue
     }

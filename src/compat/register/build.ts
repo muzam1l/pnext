@@ -23,9 +23,11 @@ import type { ResolvedConfig } from '../../config'
 import { nextCompatEnabled, reactCompatEnabled, reactCompilerOptions } from '../aliases'
 import { warnNextMetadataBuildIssues } from '../metadata'
 import { getNextConfig } from '../next/config-loader'
+import { routeRuntimePrefetch } from '../next/route-state'
 import { preferredRegionForRoute } from '../next/preferred-region'
 import { deploymentId } from '../bundler/config'
-import { aliasGenerateStaticParams } from '../static-params'
+import { aliasGenerateStaticParams, runParamMatchingGenerator } from '../static-params'
+import { nextRoutePattern } from '../../routing/match'
 import { takeCacheLifeStash } from '../cache/use-cache'
 import {
   varyNamesFor,
@@ -96,6 +98,7 @@ export function registerBuildCompatExtensions(): void {
     defaultDynamicStaleTimeSeconds: DEFAULT_DYNAMIC_STALE_TIME_SECONDS,
     defaultStaticStaleTimeSeconds: DEFAULT_STATIC_STALE_TIME_SECONDS,
     buildRootTreePrefetch,
+    routePartialPrefetching: routeRuntimePrefetch,
     rootTreePrefetchText,
     buildSegmentMeta,
     segmentDir,
@@ -233,7 +236,7 @@ export async function resolveParamMatching(
   modules: ParamMatchingModule[],
   generated: Record<string, RouteParamValue>[],
 ): Promise<ParamMatching | undefined> {
-  const page = nextRoutePattern(route)
+  const page = nextRoutePattern(route.route, route.catchAllOptional)
   const paramNames = [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
   const tree = await segmentTree(config, route, modules)
   const fragments = new Map<SegmentNode, ParamMatching>()
@@ -254,8 +257,11 @@ export async function resolveParamMatching(
     validateOrdering(page, policy, paramNames)
     validateGenerated(page, policy, paramNames, generated)
   }
+  // `ensureStatic = "navigation"` never serves a generic shell: an unconfigured param blocks.
+  const navigation = modules.some(item => item.module.ensureStatic === 'navigation')
+  if (navigation) for (const name of paramNames) policy[name] ??= 'blocking'
   validateCoherence(page, policy)
-  return fragments.size > 0 ? policy : undefined
+  return fragments.size > 0 || navigation ? policy : undefined
 }
 
 // Build step: routes without generateStaticParams never reach `staticParamsFor`, so their declared policies resolve here (with no generated sets to validate against).
@@ -344,7 +350,7 @@ async function exportedFragment(
       `Route "${page}" cannot export both \`unstable_paramMatching\` and \`unstable_generateParamMatching\`.`,
     )
   }
-  const visible = visibleParamNames(config.appPath, file, paramNames)
+  const visible = visibleParamNames(config.appPath, file)
   const filePath = `app/${path.relative(config.appPath, file).split(path.sep).join('/')}`
   if (hasStatic) {
     return validateExport(
@@ -353,6 +359,7 @@ async function exportedFragment(
       'unstable_paramMatching',
       module.unstable_paramMatching,
       visible,
+      paramNames,
     )
   }
   const generate = module.unstable_generateParamMatching
@@ -365,8 +372,9 @@ async function exportedFragment(
     page,
     filePath,
     'unstable_generateParamMatching',
-    await (generate as () => unknown)(),
+    await runParamMatchingGenerator(page, generate as () => unknown),
     visible,
+    paramNames,
   )
 }
 
@@ -424,6 +432,7 @@ function validateExport(
   exportName: string,
   value: unknown,
   visible: string[],
+  paramNames: string[],
 ): ParamMatching {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     const valueType = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value
@@ -436,6 +445,11 @@ function validateExport(
     if (!visible.includes(paramName)) {
       throw new PnextBuildValidationError(
         `Invalid parameter "${paramName}" in \`${exportName}\` for "${page}". The export in "${filePath}" may only configure parameters defined at or above its segment.`,
+      )
+    }
+    if (!paramNames.includes(paramName)) {
+      throw new PnextBuildValidationError(
+        `Invalid parameter "${paramName}" in \`${exportName}\` for "${page}". Parameter matching may only configure dynamic parameters in this route.`,
       )
     }
     if (!PARAM_MATCHING_MODES.includes(mode as ParamMatchingMode)) {
@@ -533,21 +547,12 @@ function validateCoherence(page: string, policy: ParamMatching) {
   }
 }
 
-/** Route params introduced by the module's own directory chain. */
-function visibleParamNames(appPath: string, file: string, paramNames: string[]) {
+/** Params introduced by the module's own directory chain (a slot's own params included). */
+function visibleParamNames(appPath: string, file: string) {
   const dirs = path.relative(appPath, path.dirname(file)).split(path.sep)
-  const names = dirs.map(segmentParamName).filter((name): name is string => name !== undefined)
-  return paramNames.filter(name => names.includes(name))
+  return dirs.map(segmentParamName).filter((name): name is string => name !== undefined)
 }
 
 function segmentParamName(segment: string) {
   return /^\[\[?(?:\.\.\.)?([^\]]+)\]\]?$/.exec(segment)?.[1]
-}
-
-/** `/:lang/docs/:parts*` in Next's `/[lang]/docs/[...parts]` form. */
-function nextRoutePattern(route: RouteManifestEntry) {
-  return route.route.replace(/:([\w$]+)(\*?)/g, (_match, name: string, star: string) => {
-    if (!star) return `[${name}]`
-    return route.catchAllOptional ? `[[...${name}]]` : `[...${name}]`
-  })
 }

@@ -10,7 +10,7 @@
 // any edge-runtime entity - middleware/proxy, or a route declaring an edge runtime. pnext runs one Bun
 // process, so it emulates the pass by importing a FRESH module instance (a separate bundle file, so
 // separate module state) and calling its register() with NEXT_RUNTIME='edge' set for the duration.
-// Apps without edge entities never get the pass.
+// Apps without edge entities never get the pass; sandboxed edge middleware registers in its own realm.
 
 import {
   existsSync,
@@ -31,6 +31,7 @@ import { resolveExternalLoadTarget } from '../../resolve/imports'
 import { compatAliases, reactServerLayerAliases } from '../aliases'
 import { nextPageExtensions } from '../next/config-loader'
 import { getOtelApi } from '../otel/api'
+import { isSandboxedMiddleware } from '../edge-runtime'
 import { productionRelease } from '../../runtime/production'
 
 /**
@@ -119,7 +120,7 @@ export function instrumentationReady(): Promise<void> {
   return readyGate ?? Promise.resolve()
 }
 
-function findInstrumentation(config: ResolvedConfig): string | undefined {
+export function findInstrumentation(config: ResolvedConfig): string | undefined {
   for (const root of instrumentationLookupRoots(config)) {
     for (const ext of nextPageExtensions()) {
       const name = `instrumentation.${ext}`
@@ -461,7 +462,8 @@ function appHasEdgeEntities(config: ResolvedConfig): boolean {
   for (const root of roots) {
     for (const name of ['middleware', 'proxy']) {
       for (const ext of nextPageExtensions()) {
-        if (existsSync(path.join(root, `${name}.${ext}`))) return true
+        const file = path.join(root, `${name}.${ext}`)
+        if (existsSync(file) && !isSandboxedMiddleware(config, file)) return true
       }
     }
     for (const dir of ['app', 'pages']) {

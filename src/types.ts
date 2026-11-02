@@ -517,6 +517,8 @@ export interface RouteManifestEntry {
   prerenderedParams?: Record<string, RouteParamValue>[]
   /** Per-param matching policy the app declared; the compat admission hook interprets it. */
   paramMatching?: Record<string, string>
+  /** Every build prerender of `prerenderedParams` stayed static: unbuilt params prerender on demand. */
+  onDemandStatic?: boolean
   /**
    * Per-prerendered-URL vary sets tracked by the BUILD render, keyed by the concrete pathname. A request-time
    * render answered from that prerender executes no user code, so it tracks nothing and would publish
@@ -749,16 +751,12 @@ export interface RouteSegmentConfig {
     | 'only-no-store'
   /** Param names governed by a `dynamicParams = false` declaration. */
   dynamicParamsFalse?: string[]
-  /**
-   * The page has its own static params export while a `dynamicParams = false`
-   * declaration governs the route: every param tuple must match a prerendered
-   * path (Next's fallback: false), not just the governed params.
-   */
-  strictDynamicParams?: boolean
   /** `export const runtime` value, when declared ('edge' | 'nodejs'). */
   runtime?: string
   /** Next app-shell prefetch policy declared by the route. */
   prefetch?: 'allow-runtime' | 'partial' | 'unstable_eager'
+  /** `export const ensureStatic`: the prefetch stages forced static even when they read runtime data. */
+  ensureStatic?: 'shell' | 'prefetch' | 'navigation'
   /**
    * `export const unstable_instant` on the page or a layout in its chain (a boolean or a sample-config object
    * means true; an explicit `false` on a leaf overrides an ancestor's opt-in). A full (`prefetch={true}`)
