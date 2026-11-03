@@ -1,10 +1,22 @@
-import { existsSync } from 'node:fs'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { existsSync, readFileSync } from 'node:fs'
+import { copyFile, mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileHref } from '../../config'
 import type { ResolvedConfig } from '../../config'
 import type { BuildManifest, RouteManifestEntry } from '../../types'
+import { cacheComponents } from '../../render/ppr'
+import { routeParamKeys } from '../../render/renderer'
+import { nextRoutePattern } from '../../routing/match'
 import { getNextConfig } from '../next/config-loader'
+import { PREVIEW_MODE_ID } from '../pages/api'
+import {
+  fillNextRoutePattern,
+  nextPatternRegex,
+  nxtPKey,
+  paramMatchingCandidates,
+  routeRootParams,
+  type ParamMatchingCandidate,
+} from '../register/build'
 
 /**
  * `adapterPath` support (Next's `onBuildComplete` hook).
@@ -26,12 +38,22 @@ interface SharedRouteFields {
   type: string
 }
 
+interface AdapterPrerender {
+  id: string
+  pathname: string
+  type: string
+  parentOutputId: string
+  parentFallbackMode?: string | null | false
+  fallback?: { filePath: string; initialStatus: number; initialHeaders: Record<string, string> }
+  config?: { allowQuery: string[] }
+}
+
 interface AdapterOutputs {
   pages: SharedRouteFields[]
   appPages: SharedRouteFields[]
   pagesApi: SharedRouteFields[]
   appRoutes: SharedRouteFields[]
-  prerenders: { id: string; pathname: string; type: string; parentOutputId: string }[]
+  prerenders: AdapterPrerender[]
   staticFiles: { id: string; filePath: string; pathname: string; type: string }[]
 }
 
@@ -40,6 +62,7 @@ interface AdapterRoute {
   source?: string
   sourceRegex: string
   destination?: string
+  has?: { type: string; key: string; value: string }[]
 }
 
 /** Adapter module shape — only the hook pnext can honour is typed. */
@@ -100,11 +123,17 @@ function sharedFields(
   return {
     id: route.id,
     filePath: serverEntryPath(config, route),
-    pathname: route.route,
+    pathname: nextRoutePattern(route.route, route.catchAllOptional),
     sourcePage: sourcePage(config, route),
     // pnext has one runtime: the server process. `edge` is never emitted.
     runtime: 'nodejs',
-    assets: {},
+    assets:
+      route.kind === 'page'
+        ? {
+            [path.relative(config.root, appPathRoutesManifest(config))]:
+              appPathRoutesManifest(config),
+          }
+        : {},
     assetsHashes: {},
     config: {
       ...(route.maxDuration !== undefined ? { maxDuration: route.maxDuration } : {}),
@@ -149,6 +178,51 @@ function collectOutputs(config: ResolvedConfig, manifest: BuildManifest): Adapte
     }
   }
 
+  const prerendered = new Set(outputs.prerenders.map(output => output.pathname))
+  for (const route of cacheComponents() ? manifest.routes : []) {
+    const candidates = paramMatchingCandidates(route, routeRootParams(config.appPath, route))
+    if (candidates.length === 0) continue
+    const root = candidates.at(-1)!.fallback
+    // A closed root closes the page only when no other candidate opens it.
+    const parentFallbackMode =
+      root === false && candidates.some(candidate => candidate.fallback !== false)
+        ? undefined
+        : root
+    const prerender = (pathname: string, filePath: string, allowQuery: string[]) => {
+      if (prerendered.has(pathname) || !existsSync(filePath)) return
+      prerendered.add(pathname)
+      outputs.prerenders.push({
+        id: pathname,
+        pathname,
+        type: 'PRERENDER',
+        parentOutputId: route.id,
+        parentFallbackMode,
+        fallback: { filePath, initialStatus: 200, initialHeaders: {} },
+        config: { allowQuery },
+      })
+    }
+    for (const { pathname, unfilled } of candidates) {
+      const appFile = nextAppFile(config, pathname)
+      if (!existsSync(`${appFile}.html`)) continue
+      const allowQuery = unfilled.map(nxtPKey)
+      prerender(pathname, `${appFile}.html`, allowQuery)
+      prerender(`${pathname}.rsc`, `${appFile}.segments/_full.segment.rsc`, allowQuery)
+      const meta = JSON.parse(readFileSync(`${appFile}.meta`, 'utf8')) as {
+        segmentPaths?: string[]
+      }
+      for (const segment of meta.segmentPaths ?? []) {
+        const file = `.segments${segment === '/' ? '/_index' : segment}.segment.rsc`
+        prerender(`${pathname}${file}`, `${appFile}${file}`, allowQuery)
+      }
+    }
+    const names = routeParamKeys(route)
+    for (const set of route.prerenderedParams ?? []) {
+      if (!names.every(name => set[name] !== undefined)) continue
+      const pathname = fillNextRoutePattern(route, set)
+      prerender(pathname, `${nextAppFile(config, pathname)}.html`, [])
+    }
+  }
+
   for (const route of manifest.routes) {
     if (prerenderedRoutes.has(route.id) && route.mode === 'static' && !route.ppr) continue
     const fields = sharedFields(config, route)
@@ -170,6 +244,14 @@ function collectOutputs(config: ResolvedConfig, manifest: BuildManifest): Adapte
   return outputs
 }
 
+function nextAppFile(config: ResolvedConfig, pathname: string): string {
+  return path.join(config.root, '.next', 'server', 'app', pathname)
+}
+
+function appPathRoutesManifest(config: ResolvedConfig): string {
+  return path.join(config.outPath, 'app-path-routes-manifest.json')
+}
+
 /**
  * Name the capture groups of a route's match pattern after its params, giving
  * the `namedRegex` form Next's routes-manifest uses (`$name` in destinations).
@@ -188,24 +270,45 @@ function namedSourceRegex(route: RouteManifestEntry): string {
  * one matching their RSC suffixes - `/x.rsc` and the per-segment prefetch URLs - mirroring how Next
  * emits them.
  */
-function collectDynamicRoutes(manifest: BuildManifest): AdapterRoute[] {
+function collectDynamicRoutes(config: ResolvedConfig, manifest: BuildManifest): AdapterRoute[] {
   const routes: AdapterRoute[] = []
   for (const route of manifest.routes) {
     if (route.params.length === 0) continue
+    const candidates = cacheComponents()
+      ? paramMatchingCandidates(route, routeRootParams(config.appPath, route))
+      : []
+    if (candidates.length > 0) {
+      routes.push(...candidates.map(candidateRoute))
+      continue
+    }
+    const source = nextRoutePattern(route.route, route.catchAllOptional)
     const sourceRegex = namedSourceRegex(route)
     if (route.kind === 'page') {
       routes.push({
-        source: `${route.route}.rsc`,
+        source: `${source}.rsc`,
         sourceRegex: sourceRegex.replace(
           /\(\?:\/\)\?\$$/,
           String.raw`(?<rscSuffix>\.rsc|\.segments/.+\.segment\.rsc)(?:/)?$`,
         ),
-        destination: `${route.route}$rscSuffix`,
+        destination: `${source}$rscSuffix`,
       })
     }
-    routes.push({ source: route.route, sourceRegex, destination: route.route })
+    routes.push({ source, sourceRegex, destination: source })
   }
   return routes
+}
+
+/** One matcher for a candidate's document, `.rsc` and segment requests; closed ones need the bypass cookie. */
+function candidateRoute(candidate: ParamMatchingCandidate): AdapterRoute {
+  const query = candidate.unfilled.map(name => `nxtP${name}=$${nxtPKey(name)}`).join('&')
+  return {
+    source: candidate.pathname,
+    sourceRegex: `^${nextPatternRegex(candidate.pathname, true)}(?<rscSuffix>\\.rsc|\\.segments/.+\\.segment\\.rsc|)(?:/)?$`,
+    destination: `${candidate.pathname}$rscSuffix${query ? `?${query}` : ''}`,
+    ...(candidate.fallback === false
+      ? { has: [{ type: 'cookie', key: '__prerender_bypass', value: PREVIEW_MODE_ID }] }
+      : {}),
+  }
 }
 
 /**
@@ -233,6 +336,11 @@ export async function runBuildCompleteAdapter(
   if (typeof adapter?.onBuildComplete !== 'function') return
 
   await writeServerEntries(config, manifest)
+  // The typed-routes build step wrote Next's manifest; the adapter reads it from distDir.
+  await copyFile(
+    path.join(config.root, '.next', 'app-path-routes-manifest.json'),
+    appPathRoutesManifest(config),
+  )
 
   await adapter.onBuildComplete({
     routing: {
@@ -240,7 +348,7 @@ export async function runBuildCompleteAdapter(
       middlewareMatchers: [],
       beforeFiles: [],
       afterFiles: [],
-      dynamicRoutes: collectDynamicRoutes(manifest),
+      dynamicRoutes: collectDynamicRoutes(config, manifest),
       onMatch: [],
       fallback: [],
       shouldNormalizeNextData: false,

@@ -5,6 +5,8 @@ import { h, type ComponentType } from 'preact'
 import { useEffect, useMemo, useState } from 'preact/hooks'
 import { patchHistory } from '../../api/client-navigation'
 import { locationListeners } from '../../client/router/events'
+import { routerState } from '../../client/router/hub'
+import { startTransition } from '../react/use'
 
 interface PageProps {
   searchParams?: unknown
@@ -15,6 +17,7 @@ export function LivePage({ Page, props }: { Page: ComponentType<PageProps>; prop
   const [search, setSearch] = useState(initial)
   useEffect(() => {
     patchHistory()
+    routerState.locationBroadcast = startTransition
     const listener = () => setSearch(location.search)
     locationListeners().add(listener)
     listener()

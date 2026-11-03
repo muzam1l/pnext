@@ -8,6 +8,8 @@ export interface PrefetchedPage {
   p?: unknown
   /** `x-nextjs-stale-time` from the response (seconds), when the server sent it. */
   staleTimeSeconds?: number
+  /** `x-nextjs-postponed: 1`: a static stage plus a live resume, never a complete prerender. */
+  postponed?: boolean
   /** Complete body segment was emitted from a prerendered route artifact. */
   segmentPrerendered?: boolean
   /**
@@ -102,6 +104,8 @@ export interface SoftNavigateOptions extends NavigationScrollOptions {
   cachedPage?: PrefetchedPage
   /** router.refresh()/revalidation surface: bypass caches, fetch fresh (internal). */
   refreshLike?: boolean
+  /** router.refresh(): drop every URL's segment data and documents, keep the route trees. */
+  refresh?: boolean
   /**
    * A same-URL LINK click: refresh the PAGE segments only. It takes the refresh-like path (no loading
    * flash, caches evicted, no new history entry) but KEEPS the live layout segments, so the request
@@ -130,6 +134,8 @@ export interface DocumentNavState {
   childrenSearch?: string
   /** Slot dir -> source URL (`path` or `path?query`) its content rendered from. */
   slots?: Record<string, string>
+  /** Children rendered a `default.*` file: no selected segment. */
+  childrenDefault?: boolean
   /**
    * The document is an interception HOST render (server-stamped): the URL is the intercepted target
    * but the children tree kept rendering the host page. Such a render is host-bound - never
@@ -178,9 +184,10 @@ declare global {
     __PNEXT_LOCATION_LISTENERS__?: Set<() => void>
     next?: {
       router?: {
-        push?: (href: string) => Promise<void>
-        replace?: (href: string) => Promise<void>
-        prefetch?: (href: string) => Promise<PrefetchedPage | null>
+        push?: (href: string) => void
+        replace?: (href: string) => void
+        refresh?: () => void
+        prefetch?: (href: string) => void
       }
     }
   }
@@ -189,6 +196,8 @@ declare global {
 export interface SegmentCacheRecord {
   /** Requested pathname (percent-encoding preserved). */
   pathname: string
+  /** The href a prefetch requested, when it redirected to `pathname`. */
+  from?: string
   /** Requested query string (leading `?` included, `_rsc` still present). */
   search: string
   /** Segment request key the response answered (`/_index`, `/_head`, …). */
@@ -219,6 +228,12 @@ export interface SegmentCacheRecord {
    * destination's own prerendered static stage, holes and all.
    */
   postponedShell?: boolean
+  /** An upgradeable ISR fallback (`x-pnext-fallback`): 1 = a runtime prefetch may replace it, 2 = static only. */
+  fallback?: 1 | 2
+  /** `x-pnext-runtime-needed` bits: the static hints this response proves stale (1 shell, 2 prefetch). */
+  runtimeNeeded?: number
+  /** The server said a runtime request would return more than this static body. */
+  needsRuntime?: boolean
 }
 
 export interface SegmentCacheLookup {
@@ -231,6 +246,8 @@ export interface SegmentCacheHit {
   html: string
   /** True when this hit may commit a navigation with no network request. */
   networkFree: boolean
+  /** The entry came from a runtime (request-sampled) prefetch. */
+  runtime?: boolean
   /**
    * True when a PREFETCH of this URL has nothing left to fetch. Weaker than
    * `networkFree`: a shell shared across params satisfies the prefetch (its
@@ -258,6 +275,10 @@ export interface SegmentCachePolicy {
   routeFor?: (pathname: string) => string | null
   /** The learned route pattern predicted to serve a pathname the server never answered, or null. */
   predictRoute?: (pathname: string) => string | null
+  /** A predicted route the server answered with other params: never predict `pathname` again. */
+  markDynamicRewrite?: (pathname: string) => void
+  /** The target a prefetch learned this URL redirects to, while fresh. */
+  redirectTarget?: (url: URL) => URL | null
   /** True when the colon-form `route` pattern covers `pathname`. */
   matchesRoute?: (route: string, pathname: string) => boolean
   /**
@@ -317,8 +338,11 @@ export interface SegmentCachePolicy {
   }) => void
   /** A same-URL navigation refreshes page segments only. */
   evictPageSegments: () => void
+  evictUrl?: (url: string) => void
   /** A revalidation invalidates every segment entry. */
   clear: () => void
+  /** Drop segment data for every URL but keep the learned route trees (router.refresh). */
+  clearData?: () => void
 }
 
 /** The slice of the Navigation API the router reads (absent from this TypeScript lib). */

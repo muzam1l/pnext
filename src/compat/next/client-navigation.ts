@@ -12,8 +12,11 @@ import {
   RouteParamsContext,
 } from '../../render/island-context'
 import { blockJavascriptUrl } from '../../client/router'
+import { routerState } from '../../client/router/hub'
+import { startTransition } from '../react/use'
+import { currentNavState } from '../../client/router/history'
 import { isUnrecognizedActionError } from '../actions/unrecognized-error'
-import { assertRouterQueueImplemented } from '../actions/shared'
+import { assertRouterQueueImplemented } from '../client/nav'
 import {
   forbidden,
   notFound,
@@ -38,6 +41,9 @@ export {
   useSearchParams,
 }
 export type { RedirectStatus }
+
+// Location hooks re-render inside a transition, so a suspending update keeps the committed UI.
+routerState.locationBroadcast = startTransition
 
 export const RedirectType = {
   push: 'push',
@@ -180,13 +186,6 @@ export function useParams<
   return (scoped ?? params) as T
 }
 
-interface DocumentNavState {
-  children?: string
-  slots?: Record<string, string>
-  /** Children rendered `default.*` (Next's `__DEFAULT__`) — no selected segment. */
-  childrenDefault?: boolean
-}
-
 export function useSelectedLayoutSegment(parallelRoutesKey?: string): string | null {
   const segments = clientSelectedSegments(parallelRoutesKey)
   return segments[parallelRoutesKey ? segments.length - 1 : 0] ?? null
@@ -223,7 +222,7 @@ function clientSelectedSegments(parallelRoutesKey?: string): string[] {
     return []
   }
 
-  const navState = documentNavState()
+  const navState = currentNavState()
   // A defaulted children slot (Next's `__DEFAULT__`) selects nothing: the URL's
   // segments were matched by a PARALLEL slot, not by children.
   const childrenSegments = () =>
@@ -260,21 +259,11 @@ function pathSegments(pathname: string): string[] {
 
 function slotPath(parallelRoutesKey: string): string | undefined {
   const slotName = `@${parallelRoutesKey}`
-  for (const [dir, pathname] of Object.entries(documentNavState().slots ?? {})) {
+  for (const [dir, pathname] of Object.entries(currentNavState().slots ?? {})) {
     const parts = dir.split(/[\\/]/)
     if (parts[parts.length - 1] === slotName) return pathname
   }
   return undefined
-}
-
-function documentNavState(): DocumentNavState {
-  const text = document.getElementById('__PNEXT_NAV_STATE__')?.textContent
-  if (!text) return {}
-  try {
-    return JSON.parse(text) as DocumentNavState
-  } catch {
-    return {}
-  }
 }
 
 function decodeSegment(segment: string): string {

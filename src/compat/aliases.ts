@@ -30,6 +30,7 @@ export const SHIMMED_NEXT_DIST_PATHS = [
   'next/dist/server/web/spec-extension/unstable-cache',
   'next/dist/server/web/spec-extension/unstable-no-store',
   'next/dist/server/web/spec-extension/revalidate',
+  'next/dist/server/use-cache/cache-life',
   'next/dist/server/app-render/work-unit-async-storage.external',
 ]
 
@@ -84,9 +85,16 @@ export function compatAliases(
 export function reactServerLayerAliases(config: CompatConfig): Record<string, string> {
   if (!reactCompatEnabled(config)) return {}
   const reactRoot = path.resolve(import.meta.dirname, 'react')
+  const nextRoot = path.resolve(import.meta.dirname, 'next')
   return {
     react: path.join(reactRoot, 'react-server.ts'),
     'react-dom': path.join(reactRoot, 'dom-react-server.ts'),
+    ...(nextCompatEnabled(config)
+      ? withJsExtensionAliases({
+          'next/error': path.join(nextRoot, 'error.react-server.ts'),
+          'next/navigation': path.join(nextRoot, 'navigation.react-server.ts'),
+        })
+      : {}),
   }
 }
 
@@ -132,11 +140,15 @@ export function nextCompatAliasEntries(target: CompatAliasTarget): Record<string
   const nextRoot = path.resolve(import.meta.dirname, 'next')
   return withJsExtensionAliases({
     next: path.join(nextRoot, 'index.ts'),
+    'next/app': path.join(nextRoot, 'app.ts'),
     // Client variant avoids node:async_hooks (render cache-meta collector) in
     // browser bundles; the APIs are server-only in Next anyway.
     'next/cache': path.join(nextRoot, target === 'client' ? 'client-cache.ts' : 'cache.ts'),
+    'next/client': path.join(nextRoot, 'client.ts'),
+    'next/compat/router': path.join(nextRoot, 'compat-router.ts'),
     'next/config': path.join(nextRoot, 'config.ts'),
     'next/constants': path.join(nextRoot, 'constants.ts'),
+    'next/document': path.join(nextRoot, 'document.ts'),
     'next/dynamic': path.join(nextRoot, 'dynamic.tsx'),
     'next/error': path.join(nextRoot, 'error.tsx'),
     'next/font': path.join(nextRoot, 'font', 'index.ts'),
@@ -207,6 +219,7 @@ export function nextCompatAliasEntries(target: CompatAliasTarget): Record<string
       'spec-extension',
       'revalidate.ts',
     ),
+    'next/dist/server/use-cache/cache-life': path.join(nextRoot, 'cache.ts'),
     // Direct import of the work-unit store (see the shim's header). Server-only;
     // a browser bundle never reaches request context. CJS for the same reason as
     // next/constants above: apps `require()` this deep internal, and a `.ts`

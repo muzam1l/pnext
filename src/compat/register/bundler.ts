@@ -54,6 +54,7 @@ import {
 } from '../../resolve/imports'
 import { setServerBundleConditions } from '../../runtime/load'
 import { getNextConfig } from '../next/config-loader'
+import { hasInstrumentationClient } from '../lifecycle/instrumentation-client'
 import { escapeRegex, specifierSniffTokens } from '../../utils/code'
 import {
   cacheComponentsEnabled,
@@ -66,7 +67,6 @@ import {
   relayCompilerConfig,
   removeConsoleTargets,
   resolveExtensions,
-  builtInServerExternalPackages,
   serverExternalPackages,
   swcEnvUsageMode,
   tsconfigPath,
@@ -126,6 +126,23 @@ import { appUsesBlurPlaceholder, appUsesLegacyLink, appUsesRuntimePrefetch } fro
 import { rewriteLegacyLinkValidation } from '../next/link-transform'
 import { pagesClientModulePlugin } from '../pages/client-plugin'
 
+const routerIndex = path.join('client', 'router', 'index.ts')
+// pnext's own client runtime never imports an optimizePackageImports barrel.
+const frameworkSource = path.resolve(import.meta.dirname, '../..') + path.sep
+
+// The router facade's runtime import resolves to compat's nav policies, which re-export the runtime:
+// they always load together, so they ship as one chunk.
+const routerRuntimeWithNavPoliciesPlugin: Plugin = {
+  name: 'pnext-compat-router-runtime',
+  setup(build) {
+    build.onResolve({ filter: /^\.\/runtime-entry$/ }, args =>
+      args.importer.endsWith(routerIndex)
+        ? { path: path.resolve(args.importer, '../../../compat/client/nav-runtime.ts') }
+        : undefined,
+    )
+  },
+}
+
 export function registerBundlerExtensions(config: ResolvedConfig): void {
   // The alias registries (setImportAliasExtensions + setModuleAliases) are boot
   // facts — the route scanner and the server runtime latch them before the
@@ -169,11 +186,10 @@ export function registerBundlerExtensions(config: ResolvedConfig): void {
   setExternalPackagePolicy({
     external: name => externals.has(name),
     transpile: name =>
-      !externals.has(name) && (transpile.has(name) || isLinkedWorkspacePackage(config, name)),
+      transpile.has(name) || (!externals.has(name) && isLinkedWorkspacePackage(config, name)),
     // Linked workspace packages are deliberately absent: esbuild resolves their
     // symlinks to real paths, so they never reach a filter as node_modules.
-    transpiled: () => [...transpile].filter(name => !externals.has(name)),
-    releaseExternal: name => builtInServerExternalPackages().has(name) && !transpile.has(name),
+    transpiled: () => [...transpile],
     esmExternals,
   })
   setExternalLoadResolver(({ root, fromFile, specifier, target }) => {
@@ -421,10 +437,16 @@ export function registerBundlerExtensions(config: ResolvedConfig): void {
       ...(nextCompatEnabled(config)
         ? {
             __PNEXT_NEXT_ROUTER__: 'true',
-            __PNEXT_DEFER_LINKLESS_ROUTER__: 'true',
+            __PNEXT_INSTRUMENTATION_CLIENT__: String(hasInstrumentationClient(config)),
             __PNEXT_ROUTER_POLICY_SETTERS__: 'true',
+            __PNEXT_STATIC_EXPORT__: String(getNextConfig().output === 'export'),
+            // Same switch render.ts stamps as the document's segment-scheduler flag.
+            __PNEXT_CACHE_COMPONENTS__: String(
+              (getNextConfig() as { cacheComponents?: unknown }).cacheComponents === true,
+            ),
           }
         : {}),
+      __PNEXT_HAS_BASE_PATH__: String(Boolean(config.basePath)),
       __PNEXT_CONCURRENT_ROUTER_QUEUE__: String(
         (getNextConfig().experimental as { concurrentRouterQueue?: unknown } | undefined)
           ?.concurrentRouterQueue === true,
@@ -444,6 +466,7 @@ export function registerBundlerExtensions(config: ResolvedConfig): void {
       { name: polyfillsChunkFileName(), contents: POLYFILLS_NOMODULE_SOURCE },
     ],
     clientEsbuildPlugins: (cfg: ResolvedConfig): Plugin[] => [
+      routerRuntimeWithNavPoliciesPlugin,
       ...webpackLoaderPlugins(cfg, 'client'),
       pagesClientModulePlugin(cfg),
       wasmModulePlugin(cfg),
@@ -605,6 +628,7 @@ function firstPartyClientOptimizeImportsLoadPlugin(
     setup(build) {
       build.onLoad({ filter: /\.tsx?$/, namespace: 'file' }, args =>
         args.path.includes(`${path.sep}node_modules${path.sep}`) ||
+        args.path.startsWith(frameworkSource) ||
         roots.some(root => args.path.startsWith(root))
           ? undefined
           : rewriteFile(args.path),

@@ -5,7 +5,7 @@ import type { ResolvedConfig } from '../config'
 import type { CompatRelease } from '../runtime/production'
 import { findProxyFile } from '../routing/proxy'
 import { pagesRevalidateFacts } from './cache-control'
-import { emitEdgeSandbox } from './edge-runtime'
+import { isSandboxedMiddleware } from './edge-runtime'
 import { emitReleaseInstrumentation } from './lifecycle/instrumentation'
 import { emitNextConfigBundle } from './next/config-loader'
 import { pagesApiFacts, pagesRouteFacts } from './pages/api'
@@ -15,10 +15,13 @@ export async function compatReleaseFacts(
   config: ResolvedConfig,
   outDir: string,
 ): Promise<CompatRelease> {
+  const proxy = findProxyFile(config)
   const [nextConfig, instrumentation, edgeSandbox] = await Promise.all([
     emitNextConfigBundle(config.root, outDir),
     emitReleaseInstrumentation(config, outDir),
-    emitEdgeSandbox(config, findProxyFile(config), outDir),
+    proxy && isSandboxedMiddleware(config, proxy)
+      ? import('./edge-runtime/sandbox').then(m => m.emitEdgeSandbox(config, proxy, outDir))
+      : undefined,
   ])
   const toPosix = (file: string) => file.split(path.sep).join('/')
   return {

@@ -462,7 +462,10 @@ ${runtimeExport}${maxDurationExport}export default async function PagesCompatSta
   // The otel compat exposes a span wrapper (Render.getStaticProps) at runtime.
   const withSpan = globalThis.__PNEXT_PAGES_DATA_SPAN__ ?? ((kind, fn) => fn());
   const resolvedParams = decodePagesParams(await params);
-  const invoke = async () => pageModule.getStaticProps?.({ params: resolvedParams });
+  const gsp = async () => pageModule.getStaticProps?.({ params: resolvedParams });
+  // A data producer: app-router prerender rules (sync IO, uncached fetch) do not apply.
+  const producer = globalThis[Symbol.for('pnext.compat.dataCacheProducerStorage')];
+  const invoke = () => (producer ? producer.run(true, gsp) : gsp());
   const result = await withSpan('getStaticProps', invoke);
   if (result?.notFound) notFound();
   if (result?.redirect) redirect(result.redirect.destination);

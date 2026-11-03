@@ -202,7 +202,7 @@ export interface MetadataExtensions {
   readModuleMetadata: (
     module: Record<string, unknown>,
     props: PageProps,
-    parent: Metadata,
+    parent: Metadata | Promise<Metadata>,
     modulePath?: string,
   ) => Promise<Metadata | undefined>
   readModuleViewport: (
@@ -227,7 +227,7 @@ export interface SlotHeadBranch {
   pageDepth: number
   /** The children branch defines head tags below this branch's owner layout. */
   childrenDefinesHead: boolean
-  /** Started on first call, then memoized; rejections are observed at creation. */
+  /** Started with the layouts' generators; rejections are observed at creation. */
   metadata: () => Promise<MetadataEntry[]>
   viewport: () => Promise<Viewport[]>
 }
@@ -332,7 +332,7 @@ export interface StaticParamsExtensions {
     file: string,
     result: unknown,
     checkComplete: boolean,
-  ) => void
+  ) => void | Promise<void>
   /** The route's per-param matching policy from its layout/page modules, if any declare one. */
   resolveParamMatching: (
     config: ResolvedConfig,
@@ -424,6 +424,12 @@ export interface RenderSpanExtensions {
 
   /** Wrap app component-tree construction in the createComponentTree span. */
   withComponentTreeSpan: <T>(fn: () => Promise<T>) => Promise<T>
+  /** Wrap a `generateMetadata` call in its span. */
+  withGenerateMetadataSpan: <T>(name: string, attributes: Record<string, unknown>, fn: () => T) => T
+  /** Run a server action inside the request's root span context. */
+  withRootSpanContext: <T>(fn: () => T) => T
+  /** Wrap a pages-router API handler in its span. */
+  withPagesApiSpan: <T>(pathname: string, fn: () => T) => T
 
   /**
    * Emit a cheap leaf `resolve segment modules` span
@@ -446,6 +452,9 @@ const renderSpanExtensions: RenderSpanExtensions = {
   withRenderBodySpan: (_route, fn) => fn(),
   withFindPageComponentsSpan: (_route, fn) => fn(),
   withComponentTreeSpan: fn => fn(),
+  withGenerateMetadataSpan: (_name, _attributes, fn) => fn(),
+  withRootSpanContext: fn => fn(),
+  withPagesApiSpan: (_pathname, fn) => fn(),
   emitResolveSegmentSpan: () => undefined,
   withRouteHandlerSpan: (_route, fn) => fn(),
 }

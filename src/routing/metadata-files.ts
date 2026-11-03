@@ -14,6 +14,7 @@ import type {
 import { escapeHtml, stringifyHtmlValue } from '../utils/html'
 import { readDirListing, toPosixPath } from '../utils/fs'
 import { servedAppFiles, servedRelease } from '../runtime/production'
+import { isUnfilledShellParam } from '../render/ppr'
 
 export type StaticMetadataKind =
   | 'favicon'
@@ -42,6 +43,8 @@ export interface StaticMetadataForPath {
   dynamicOpenGraphImages?: MetadataImage[]
   twitterImage?: MetadataImage
   dynamicTwitterImages?: MetadataImage[]
+  /** A shell prerender left a param-dependent asset out: its head belongs to the per-URL stage. */
+  hangingParams?: boolean
 }
 
 const imageExtensions = ['ico', 'jpg', 'jpeg', 'png', 'svg', 'gif', 'webp'] as const
@@ -163,9 +166,11 @@ export async function withDynamicMetadataRoutes(
   const discovered = discoverDynamicMetadataFiles(appPath)
   if (discovered.length === 0) return metadata
   const routeDir = toPosixPath(path.relative(appPath, path.dirname(routeFile)))
-  const files = discovered
+  const matched = discovered
     .map(file => matchDynamicMetadataFile(file, pathname, routeDir))
     .filter((file): file is MatchedDynamicMetadataFile => file !== undefined)
+  // A shell prerender hangs these params: the asset belongs to the per-URL stage, never a `:name` href.
+  const files = matched.filter(file => !Object.keys(file.params).some(isUnfilledShellParam))
 
   const manifest = bestDynamicFiles(files, 'manifest')[0]
   const entriesOf = (file: MatchedDynamicMetadataFile, module: DynamicMetadataModule) =>
@@ -200,6 +205,7 @@ export async function withDynamicMetadataRoutes(
 
   return {
     ...metadata,
+    ...(files.length < matched.length ? { hangingParams: true } : {}),
     ...(manifest ? { manifestLink: { rel: 'manifest', url: manifest.routePath } } : {}),
     ...(icons.length > 0 ? { dynamicIcons: icons } : {}),
     ...(appleIcons.length > 0 ? { dynamicAppleIcons: appleIcons } : {}),

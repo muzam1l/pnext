@@ -6,6 +6,7 @@
 // first paint and pulls this in; a page that only has a <Link> never reads an id
 // before the navigation runtime lands, so this rides the idle chunk with it.
 import { routerState } from './hub'
+import type { DocumentNavState } from './types'
 
 export const HISTORY_BFCACHE_ID_KEY = '__pnextBfcacheId'
 
@@ -67,4 +68,26 @@ export function seedHistoryEntry() {
   } catch {
     // Without a stable id, bfcache-keyed subtrees fall back to remounting.
   }
+}
+
+/**
+ * The parallel-route state the server embedded into the current document. Echoed
+ * on soft-navigation fetches so unmatched slots keep their content and
+ * interception routes know the origin.
+ */
+export function currentNavState(): DocumentNavState {
+  let state: DocumentNavState = {}
+  const script =
+    typeof document.getElementById === 'function'
+      ? document.getElementById('__PNEXT_NAV_STATE__')
+      : null
+  if (script?.textContent) {
+    try {
+      state = JSON.parse(script.textContent) as DocumentNavState
+    } catch {
+      state = {}
+    }
+  }
+  if (!state.children) state = { ...state, children: location.pathname }
+  return state
 }

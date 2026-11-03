@@ -63,6 +63,8 @@ interface RouteState {
   bfcacheId?: string
   /** `prefetch = 'allow-runtime'`: this route's shell is request-sampled. */
   runtimePrefetch?: boolean
+  /** The body read searchParams. */
+  search?: boolean
 }
 
 /**
@@ -111,7 +113,7 @@ const router: PNextRouter = {
     })
   },
   refresh() {
-    void softNavigate(window.location.href, { replace: true, scroll: false })
+    void softNavigate(window.location.href, { replace: true, scroll: false, refresh: true })
   },
   back() {
     window.history.back()

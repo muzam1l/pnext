@@ -4,7 +4,9 @@
 import { createContext } from 'preact'
 import { softNavigate } from '../../client/router'
 import { locationListeners, onNavigationStart } from '../../client/router/events'
+import { routerState } from '../../client/router/hub'
 import { patchHistory } from '../../api/client-navigation'
+import { startTransition } from '../react/use'
 
 export interface LinkStatus {
   pending: boolean
@@ -55,8 +57,11 @@ function wire() {
   // Raw window.history.pushState/replaceState (shallow routing) must clear the
   // pending link; the patch broadcasts them through locationListeners.
   patchHistory()
+  routerState.locationBroadcast = startTransition
   onNavigationStart(onNavStart)
   locationListeners().add(onLocationChange)
+  // A server action supersedes the pending link at dispatch, though it queues behind its navigation.
+  routerState.clearLinkStatus = onLocationChange
   window.addEventListener('popstate', onLocationChange)
 }
 

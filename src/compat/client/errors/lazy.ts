@@ -5,39 +5,9 @@
 // What DOES stay eager is a pair of capture-only listeners: an error thrown during hydration or in
 // a first-paint effect fires before the idle load lands, and Next still shows global-error for it.
 // They buffer the value, pull ./install right away, and hand it over.
-import { options } from 'preact'
 import type { InstallOptions } from './install'
-import { registerDeferredInstall } from '../../../client/router'
-
-declare const __PNEXT_DEFER_LINKLESS_ROUTER__: boolean | undefined
-
-// Same key ./install reads (Symbol.for crosses the chunk boundary): only values the preact
-// boundary walk rethrew — a ROOT RENDER failure, Next's global-error case — may replace the
-// document. Every other uncaught window value (event handlers, third-party noise, ResizeObserver
-// loop events) is buffered for triage but the page survives, as it does under Next.
-const RENDER_ESCAPE = Symbol.for('pnext.renderEscape')
-
-/** Tag boundary-walk escapes before the deferred runtime exists (a hydration throw fires first). */
-function tagRenderEscapes(): void {
-  const hooks = options as unknown as Record<string, unknown>
-  const key = (['_catchError', '__e'] as const).find(name => typeof hooks[name] === 'function')
-  if (!key) return
-  const walkBoundaries = hooks[key] as (...args: unknown[]) => unknown
-  hooks[key] = function taggedCatchError(this: unknown, ...args: unknown[]) {
-    try {
-      return walkBoundaries.apply(this, args)
-    } catch (error) {
-      if (error !== null && typeof error === 'object') {
-        try {
-          ;(error as Record<symbol, unknown>)[RENDER_ESCAPE] = true
-        } catch {
-          // frozen throw value: the runtime's own escalation still mounts post-install
-        }
-      }
-      throw error
-    }
-  }
-}
+import { whenIdle } from '../../../client/router'
+import { installSuspenseCatch } from '../../react/use'
 
 type ErrorRuntime = typeof import('./install')
 
@@ -53,7 +23,8 @@ export function errorRuntime(): Promise<ErrorRuntime> {
 
 export function installClientErrors(installOptions: InstallOptions = {}): void {
   if (!process.browser && typeof window === 'undefined') return
-  tagRenderEscapes()
+  // Tags boundary-walk escapes before the deferred runtime exists (a hydration throw fires first).
+  installSuspenseCatch()
 
   let runtime: Promise<ErrorRuntime> | undefined
   const load = () =>
@@ -97,11 +68,7 @@ export function installClientErrors(installOptions: InstallOptions = {}): void {
   }
   pullForStreamError()
   document.addEventListener('DOMContentLoaded', pullForStreamError)
-  // Idle, not with the router: a page without links never loads that, yet errors must still reach
+  // Idle, not with the router: a router-free page never loads that, yet errors must still reach
   // error.js and global-error synchronously once the page is interactive.
-  if (typeof __PNEXT_DEFER_LINKLESS_ROUTER__ !== 'undefined' && __PNEXT_DEFER_LINKLESS_ROUTER__) {
-    if (typeof requestIdleCallback === 'function')
-      requestIdleCallback(() => void load().catch(() => undefined), { timeout: 1000 })
-    else setTimeout(() => void load().catch(() => undefined), 1)
-  } else registerDeferredInstall(() => load().then(() => undefined))
+  whenIdle(() => void load().catch(() => undefined))
 }

@@ -17,14 +17,7 @@ import {
 } from '../../extensions'
 import type { RouteManifestEntry } from '../../types'
 import { writeBuildFlags } from '../cache/build-flags'
-import {
-  validateBuild,
-  validateGeneratedStaticParams,
-  validatePrerenderRoutes,
-} from '../validation/validate'
-import { setStaticParamsExtensions } from '../../render/hooks'
-import { readSourceSync } from '../../resolve/source-text'
-import { recordPrerenderError } from '../cache/build-prerender-errors'
+import { validateBuild, validatePrerenderRoutes } from '../validation/validate'
 import {
   diagnoseCacheComponentsPrerender,
   diagnosticLeadsWithErrorLine,
@@ -40,30 +33,6 @@ export function registerValidationExtensions(config: ResolvedConfig): void {
   if (registered) return
   if (!nextCompatEnabled(config)) return
   registered = true
-  setStaticParamsExtensions({
-    validateResult: (config, route, file, result, checkComplete) => {
-      if (!nextCompatEnabled(config)) return
-      try {
-        validateGeneratedStaticParams(
-          config,
-          { ...route, file },
-          readSourceSync(file) ?? '',
-          result,
-          checkComplete,
-        )
-      } catch (error) {
-        // The CLI prints a validation error once.
-        if ((error as Error).name === 'PnextBuildValidationError') throw error
-        recordPrerenderError({
-          kind: 'validation',
-          route: route.route || '/',
-          consoleBlock: (error as Error).message,
-        })
-        throw error
-      }
-    },
-  })
-
   const step: BuildStep = async ctx => {
     // Runtime compat gate: the extension registry is process-global, so once any compat.next build
     // registers this step it stays registered for every later buildProject() in the same process -

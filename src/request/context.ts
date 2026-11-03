@@ -445,7 +445,7 @@ export function requestApiPromise<T>(api: string, produce: () => T, runtime: num
     if (isRuntimePrefetchPrerender() && api !== 'connection()') {
       // Awaiting the resolved value arms the sync-IO abort: anything the render
       // computes with Date.now() & co. AFTER a runtime API resolved belongs to
-      // the navigation, not the prefetch (see runWithRuntimePrefetchSyncIoAbort).
+      // the navigation, not the prefetch (see runWithSyncIoAbort).
       return markRuntimeApiOnAwait(Promise.resolve(produce()))
     }
     return hangingPromise<T>(api, runtime)

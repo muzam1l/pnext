@@ -14,6 +14,7 @@ import type { RouteManifestEntry, RouteParamValue } from '../../types'
 import { getRequestRuntime } from '../../routing/request-environment'
 import { closedParams, paramSetMatches } from '../static-params'
 import { getNextConfig } from './config-loader'
+import { currentResponseVaryParams, SEARCH_PARAMS_SENTINEL } from '../segment/vary-params'
 
 interface RouteState {
   route: string
@@ -37,6 +38,8 @@ interface RouteState {
    * document's static stage across the route's params.
    */
   pageVary?: string[]
+  /** The body read searchParams: a same-pathname sibling differing only in search has its own static data. */
+  search?: boolean
 }
 
 /**
@@ -174,13 +177,21 @@ export function nextClientRouteState(
   const prefetchKind =
     declared === 'unstable_eager' ||
     (declared === undefined &&
-      (globalEager || (route.hasStaticParams && !route.usesRequest && !partiallyEnumerated)))
+      (globalEager ||
+        // A Partial Prefetching route skips the per-link Speculative phase unless declared eager.
+        (route.hasStaticParams &&
+          !route.usesRequest &&
+          !partiallyEnumerated &&
+          !routeRuntimePrefetch(route))))
       ? 'eager'
       : declared === 'allow-runtime' || declared === 'partial'
         ? 'shell'
         : undefined
+  const segments = currentResponseVaryParams()?.segments
+  const search = segments && [...segments].some(a => a.varyParams.has(SEARCH_PARAMS_SENTINEL))
   return {
     ...state,
+    ...(search ? { search: true } : {}),
     ...(staticChildren.length > 0 ? { staticChildren } : {}),
     ...(Object.keys(staticChildrenBySegment).length > 0 ? { staticChildrenBySegment } : {}),
     ...(prefetchKind ? { prefetchKind } : {}),

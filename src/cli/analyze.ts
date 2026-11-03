@@ -7,11 +7,11 @@ import type { Metafile } from 'esbuild'
 import { DEFAULT_OUT_DIR, loadConfig, type ResolvedConfig } from '../config'
 import { emittedAssetName, publishEmittedAssets, routeCssAssetNames } from '../css/build'
 import { matchRoute } from '../routing/routes'
-import { bold, cyan, dim, yellow } from '../utils/ansi'
+import { bold, cyan, dim, formatBytes, formatDelta, yellow } from '../utils/ansi'
 import { listFiles, resolveManifest } from '../utils/fs'
 import type { BuildManifest, RouteManifestEntry } from '../types'
 import { buildManifestFile } from '../runtime/production'
-import { outCachePath, standaloneOutSegment } from '../out-paths'
+import { analyzeSizesFile, outCachePath, standaloneOutSegment } from '../out-paths'
 
 export interface AnalyzeResult {
   root: string
@@ -155,7 +155,6 @@ interface AnalyzeOptions {
 // report, outside the build output the build cache fingerprints.
 const ANALYZE_DIR = 'analyze'
 const GRAPH_FILE = 'graph.json'
-const SIZES_FILE = 'sizes.json'
 const SMALL_CHUNK_BYTES = 1024
 const COMMONJS_FLAG_BYTES = 2048
 const BARREL_FLAG_MODULES = 20
@@ -1570,8 +1569,8 @@ function parseByteSize(value: string) {
 
 // Build side: what `pnext build` records for analyze and prints per route.
 
-export function readAnalyzeSizes(outPath: string) {
-  return readJson<AnalyzeSizes>(path.join(outCachePath(outPath), ANALYZE_DIR, SIZES_FILE))
+function readAnalyzeSizes(outPath: string) {
+  return readJson<AnalyzeSizes>(analyzeSizesFile(outPath))
 }
 
 /** Module and chunk graph of the production client build, keyed by shipped file names. */
@@ -1725,15 +1724,13 @@ export async function recordRouteSizes(
     ...(previous ? { previous: previous.routes } : {}),
   }
   await mkdir(path.join(outCachePath(config.outPath), ANALYZE_DIR), { recursive: true })
-  await writeFile(
-    path.join(outCachePath(config.outPath), ANALYZE_DIR, SIZES_FILE),
-    JSON.stringify(record),
-  )
-  return sizeRows(record)
+  const rows = sizeRows(record)
+  // The build summary reads these back on a cache hit without loading this module.
+  await writeFile(analyzeSizesFile(config.outPath), JSON.stringify({ ...record, rows }))
+  return rows
 }
 
-/** Build summary rows, from a fresh record or one an earlier build left (build cache hit). */
-export function sizeRows(sizes: AnalyzeSizes | undefined): RouteSizeRow[] {
+function sizeRows(sizes: AnalyzeSizes | undefined): RouteSizeRow[] {
   if (!sizes) return []
   return Object.entries(sizes.routes).map(([route, size]) => {
     const budget = budgetFor(sizes.budgets, route)
@@ -1745,40 +1742,6 @@ export function sizeRows(sizes: AnalyzeSizes | undefined): RouteSizeRow[] {
       ...(before ? { previousBytes: before.compressedBytes } : {}),
     }
   })
-}
-
-/** The build summary's per-route initial-load lines, with budget and previous-build deltas. */
-export function printRouteSizes(rows: RouteSizeRow[]) {
-  if (rows.length === 0) return
-  console.log(`${bold('Initial load')} ${dim('(gzip: HTML + CSS + JS)')}`)
-  const width = Math.max(...rows.map(row => row.route.length))
-  const sizeWidth = Math.max(...rows.map(row => formatBytes(row.compressedBytes).length))
-  for (const row of rows) {
-    const parts = [formatBytes(row.compressedBytes).padStart(sizeWidth)]
-    const delta = row.previousBytes === undefined ? 0 : row.compressedBytes - row.previousBytes
-    if (delta !== 0) parts.push(dim(formatDelta(delta)))
-    if (row.budget !== undefined && row.compressedBytes > row.budget) {
-      parts.push(yellow(`over ${formatBytes(row.budget)} budget`))
-    }
-    console.log(`  ${row.route.padEnd(width)}  ${parts.join('  ')}`)
-  }
-  const over = rows.filter(row => row.budget !== undefined && row.compressedBytes > row.budget)
-  if (over.length > 0) {
-    const routes = over.map(row => row.route).join(', ')
-    const verb = over.length === 1 ? 'route is' : 'routes are'
-    console.warn(yellow(`⚠ ${over.length} ${verb} over the initial-load budget: ${routes}`))
-  }
-  console.log('')
-}
-
-/** The analyze command worth running next: the heaviest route. */
-export function analyzeCommand(rows: RouteSizeRow[]) {
-  const heaviest = [...rows].sort((a, b) => b.compressedBytes - a.compressedBytes)[0]
-  return heaviest ? `pnext analyze ${heaviest.route}` : 'pnext analyze'
-}
-
-function formatDelta(bytes: number) {
-  return `${bytes > 0 ? '+' : '-'}${formatBytes(Math.abs(bytes))}`
 }
 
 // Output
@@ -2139,16 +2102,4 @@ function analyzeTypeRank(type: AnalyzeResult['files'][number]['type']) {
     case 'asset':
       return 3
   }
-}
-
-function formatBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`
-  const units = ['KB', 'MB', 'GB', 'TB'] as const
-  let value = bytes / 1024
-  let unitIndex = 0
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024
-    unitIndex += 1
-  }
-  return `${value >= 10 ? value.toFixed(1) : value.toFixed(2)} ${units[unitIndex]}`
 }

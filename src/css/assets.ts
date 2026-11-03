@@ -187,16 +187,14 @@ export async function cssModuleMapping(file: string) {
   )
 }
 
-// Named imports read the class map.
+// Named imports read the class map; literal consts so unused names tree-shake away.
 export function cssModuleSourceFromMap(map: Record<string, string>) {
-  const json = JSON.stringify(map)
   const names = Object.keys(map).filter(
     name => name !== 'default' && /^[A-Za-z_$][\w$]*$/.test(name),
   )
-  if (!names.length) return `export default ${json};`
-  const locals = names.map((name, index) => `${name}: __pnext_css_${index}`)
-  const exported = names.map((name, index) => `__pnext_css_${index} as ${name}`)
-  return `const __pnext_css = ${json};\nexport default __pnext_css;\nconst { ${locals.join(', ')} } = __pnext_css;\nexport { ${exported.join(', ')} };\n`
+  const locals = names.map((name, index) => `const c${index}=${JSON.stringify(map[name])};`)
+  const exported = names.map((name, index) => `c${index} as ${name}`)
+  return `export default ${JSON.stringify(map)};${locals.join('')}export{${exported.join(',')}};`
 }
 
 export function cssClassNames(source: string) {

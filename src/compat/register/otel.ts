@@ -32,7 +32,7 @@ import {
 import { nextCompatEnabled } from '../aliases'
 import { getRequestRuntime } from '../../routing/request-environment'
 import { selectRouteForRequest } from '../../routing/match'
-import { queueAfterTask } from '../../request/context'
+import { getWorkUnit, queueAfterTask } from '../../request/context'
 import {
   getDocumentScriptExtensions,
   setRenderSpanExtensions,
@@ -130,12 +130,24 @@ export function registerOtelRootInterceptor(config: ResolvedConfig): void {
   registerRequestWarmHooks(() => void getOtelApi(config.root))
 }
 
-/** Resolve the matched route for `pathname` and stamp it on the root span. */
+/** The route stamped on this request's root span, kept so later stages never re-match it. */
+const STAMPED = Symbol('pnext.otel.stampedRoute')
+interface StampedRoute {
+  pathname: string
+  route: RouteManifestEntry
+}
+function stampedRoute(): StampedRoute | undefined {
+  return getWorkUnit()?.compat?.[STAMPED] as StampedRoute | undefined
+}
+
+/** Resolve the matched route for `pathname` and stamp it on the root span (a no-op when unchanged). */
 function stampMatchedRoute(pathname: string): void {
   const runtime = getRequestRuntime()
-  if (!runtime) return
+  const unit = getWorkUnit()
+  if (!runtime || !unit || stampedRoute()?.pathname === pathname) return
   const matched = selectRouteForRequest(runtime.routes, pathname, undefined)
   if (!matched) return
+  ;(unit.compat ??= {})[STAMPED] = { pathname, route: matched.route } satisfies StampedRoute
   const routeRuntime = matched.route.segmentConfig?.runtime
   setRootSpanRoute(routeEntryToDisplay(matched.route), {
     edge: routeRuntime === 'edge' || routeRuntime === 'experimental-edge',
@@ -227,6 +239,13 @@ export function registerOtelExtensions(config: ResolvedConfig): void {
       )
     },
     withComponentTreeSpan: fn => withComponentTreeSpan(fn),
+    withGenerateMetadataSpan: (name, attributes, fn) =>
+      withChildSpan(name, SPAN_TYPE.generateMetadata, attributes, fn),
+    withRootSpanContext: fn => {
+      const root = rootOtelContext()
+      return root ? root.api.context.with(root.context, fn) : fn()
+    },
+    withPagesApiSpan: withPagesApiHandlerSpan,
     emitResolveSegmentSpan: (segment, file) => {
       if (!rootOtelContext()) return
       // pnext's own root layouts (synthesized, or the hybrid app's PagesLayout) are no Next segment.
@@ -298,15 +317,11 @@ export function registerOtelExtensions(config: ResolvedConfig): void {
         !ctx.request.headers.has('next-action') &&
         ctx.request.headers.get('rsc') !== '1'
       ) {
-        const matched = selectRouteForRequest(
-          getRequestRuntime()?.routes ?? [],
-          ctx.request.url.pathname,
-          undefined,
-        )
+        const route = stampedRoute()?.route
         // Next's pages router reports no client component loading; a 5xx error document loads 3 more.
-        if (!matched || !isPagesCompatRoute(matched.route.route))
+        if (!route || !isPagesCompatRoute(route.route))
           queueClientComponentLoadingSpan(
-            clientComponentLoadCount(matched?.route) + (ctx.status >= 500 ? 3 : 0),
+            clientComponentLoadCount(route) + (ctx.status >= 500 ? 3 : 0),
           )
       }
       if (ctx.routeKind === 'html' && ctx.status >= 500) emitErrorDocumentMetadataSpans()

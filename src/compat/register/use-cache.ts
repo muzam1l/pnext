@@ -65,20 +65,13 @@ const useCacheHeaderFinalizer: ResponseFinalizer = ctx => {
     ctx.headers.set('cache-control', `s-maxage=${revalidateSeconds}, stale-while-revalidate=${swr}`)
   }
 
-  // x-nextjs-stale-time drives the client router's cache staleness window.
-  // Set unconditionally: the segment finalizer runs earlier and stamps a
-  // mode-derived default, but the live render's own cacheLife is authoritative
-  // (the header is internal — never user-supplied — so overwriting is safe).
-  // A navigation that resumed a postponed render is request data and keeps the dynamic window.
-  if (
-    staleSeconds !== undefined &&
-    (!ctx.request.headers.has('x-pnext-soft-nav') ||
-      ctx.request.headers.has('next-router-prefetch') ||
-      (ctx.headers.get('x-nextjs-postponed') !== '1' &&
-        ctx.headers.get('x-pnext-segment-postponed') !== '1'))
-  ) {
-    ctx.headers.set('x-nextjs-stale-time', String(staleSeconds))
-  }
+  // A postponed response keeps the shell window already stamped; otherwise the live cacheLife wins.
+  if (staleSeconds === undefined) return
+  const postponed =
+    ctx.headers.get('x-nextjs-postponed') === '1' ||
+    ctx.headers.get('x-pnext-segment-postponed') === '1'
+  if (postponed && ctx.headers.has('x-nextjs-stale-time')) return
+  ctx.headers.set('x-nextjs-stale-time', String(staleSeconds))
 }
 
 let registered = false

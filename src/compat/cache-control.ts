@@ -193,7 +193,7 @@ function pagesRouteRegex(relative: string): RegExp | undefined {
   return new RegExp(`^${pattern || '/'}\\/?$`)
 }
 
-function parseCookieHeader(header: string | null): Record<string, string> {
+export function parseCookieHeader(header: string | null): Record<string, string> {
   const cookies: Record<string, string> = {}
   if (!header) return cookies
   for (const part of header.split(';')) {

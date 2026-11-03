@@ -317,6 +317,8 @@ export interface RenderExtensions {
    * here: it is captured FROM this very render and persisted only after the HTML exists.
    */
   currentCacheStaleSeconds: () => number | undefined
+  /** The static reuse window (seconds) a shell-served response advertises when its route declares none. */
+  defaultStaticStaleTimeSeconds: () => number
 
   /**
    * Override the generic error shell title. Compat uses this for Next's
@@ -410,6 +412,9 @@ export interface RenderExtensions {
     context: VaryParamsTrackingContext,
   ) => T
 
+  /** Record a searchParams access when a prerender's hanging `searchParams` promise is awaited. Default: identity. */
+  trackHangingSearchParams: <T>(promise: Promise<T>) => Promise<T>
+
   /**
    * Give a `params`/`searchParams` promise Next 15's transitional SYNC surface (the resolved keys
    * readable without `await`), behind compat.next.legacyRequestAPIs. The SAME promise comes back —
@@ -494,7 +499,8 @@ export interface PrerenderSidecarExtension {
   begin: (context: PrerenderSidecarContext) => void | Promise<void>
   collect: (context: PrerenderSidecarContext) => Promise<unknown>
   persist: (context: PrerenderSidecarContext, value: unknown) => Promise<void>
-  seed: (context: PrerenderSidecarContext) => void | Promise<void>
+  /** False when the shell baked cached values the sidecar cannot replay. */
+  seed: (context: PrerenderSidecarContext) => boolean | void | Promise<boolean | void>
   /**
    * Whether the persisted sidecar/shell went stale. `true` = hard staleness
    * (block and regenerate before responding); `'soft'` = stale-while-
@@ -512,6 +518,7 @@ function createRenderExtensions(): RenderExtensions {
     serializeServerActionProp: () => undefined,
     collectRenderMeta: async (produce, _options) => ({ value: await produce(), tags: [] }),
     currentCacheStaleSeconds: () => undefined,
+    defaultStaticStaleTimeSeconds: () => 300,
     genericErrorTitle: () => undefined,
     islandCommentWireFormat: () => false,
     serializeError: () => undefined,
@@ -523,6 +530,7 @@ function createRenderExtensions(): RenderExtensions {
     globalNotFoundEnabled: () => false,
     implicitSlotChildren: () => false,
     trackVaryParams: value => value,
+    trackHangingSearchParams: promise => promise,
     legacySyncProps: promise => promise,
     prerenderSidecar: {
       begin: () => undefined,
@@ -975,10 +983,9 @@ export interface SegmentPrefetchTree {
 }
 
 export interface SegmentTreeNodeLike {
-  name: string
-  param: null | { type: 'd' | 'c' | 'oc'; key: string | null; siblings: string[] | null }
-  slots: Record<string, SegmentTreeNodeLike> | null
-  prefetchHints: number
+  s: string | { n: string; t: 'd' | 'c' | 'oc'; k: null; s: string[] | null }
+  h?: number
+  c?: Record<string, SegmentTreeNodeLike>
   sizeBytes?: number
   segmentPath?: string
 }
@@ -990,7 +997,8 @@ export interface SegmentMetaLike {
   segmentPaths: string[]
   segmentSizes?: Record<string, number>
   inlinedSegmentPaths?: string[]
-  prefetchHints?: Record<string, number>
+  prefetchHints?: { hints: number; slots: null }
+  runtime?: number
 }
 
 /**
@@ -1042,7 +1050,6 @@ export interface BuildCompatExtensions {
     pathname: string
     isStatic: boolean
     staleTimeSeconds?: number
-    buildId?: string
     routeId?: string
     bodySizeBytes?: number
     inlineBudgetBytes?: number
@@ -1050,9 +1057,11 @@ export interface BuildCompatExtensions {
     postponed?: boolean
     partialPrefetching?: boolean
     routePattern?: string
-    shellStatic?: boolean
-    prefetchStatic?: boolean
+    catchAllOptional?: boolean
+    runtimeNeeded?: number
   }) => SegmentPrefetchTree
+  /** Params at or above a root layout: a route's App Shell keeps them concrete. */
+  rootParams: (config: ResolvedConfig) => ReadonlySet<string>
   /** The route uses Partial Prefetching (a shared App Shell, then per-link prefetches). */
   routePartialPrefetching: (route: RouteManifestEntry) => boolean
   rootTreePrefetchText: (payload: SegmentPrefetchTree, format?: 'json' | 'flight') => string
@@ -1062,8 +1071,11 @@ export interface BuildCompatExtensions {
     postponed: boolean
     bodySizeBytes?: number
     inlineBudgetBytes?: number
-    prefetchHints?: Record<string, number>
+    prefetchHints?: number
+    runtime?: number
+    shellRuntime?: number
     staleTimeDeclared?: boolean
+    runtimeNeeded?: number
   }) => SegmentMetaLike
   /**
    * `--experimental-build-mode generate` prerender diagnostics: Next's exact
@@ -1100,7 +1112,13 @@ export interface BuildCompatExtensions {
   segmentDir: (outPath: string, routeId: string) => string
   treeSegmentFile: (outPath: string, routeId: string) => string
   bodySegmentFile: (outPath: string, routeId: string) => string
+  shellSegmentFile: (outPath: string, routeId: string, key: string) => string
   segmentMetaFile: (outPath: string, routeId: string) => string
+  /** Fail the build when a shell an explicit param policy requires renders empty. Pure-core default: no-op. */
+  validateParamShells: (
+    route: RouteManifestEntry,
+    isEmpty: (filled: Record<string, RouteParamValue>) => Promise<boolean>,
+  ) => Promise<void>
 }
 
 /** Which entry point is running the init hooks (`pnext build` vs a server). */
@@ -1146,35 +1164,16 @@ function createBuildExtensions(): BuildExtensions {
     defaultDynamicStaleTimeSeconds: 30,
     defaultStaticStaleTimeSeconds: 300,
     routePartialPrefetching: () => false,
-    buildRootTreePrefetch: options => {
-      const staleTime =
+    buildRootTreePrefetch: options => ({
+      tree: { s: '' },
+      staleTime:
         options.staleTimeSeconds ??
         (options.isStatic
           ? compat.defaultStaticStaleTimeSeconds
-          : compat.defaultDynamicStaleTimeSeconds)
-      const bodySize = options.bodySizeBytes ?? 0
-      const budget = options.inlineBudgetBytes ?? 32 * 1024
-      const canInlineBody = options.isStatic && !options.postponed && bodySize <= budget
-      return {
-        tree: {
-          name: '',
-          param: null,
-          slots: {
-            children: {
-              name: '__PAGE__',
-              param: null,
-              slots: null,
-              prefetchHints: canInlineBody ? 0b10000000 : 0b100000000,
-              ...(options.bodySizeBytes !== undefined ? { sizeBytes: options.bodySizeBytes } : {}),
-              ...(canInlineBody ? {} : { segmentPath: '/' }),
-            },
-          },
-          prefetchHints: 0b10000 | (canInlineBody ? 0b1000000 : 0),
-        },
-        staleTime,
-        isStatic: options.isStatic,
-      }
-    },
+          : compat.defaultDynamicStaleTimeSeconds),
+      isStatic: options.isStatic,
+    }),
+    rootParams: () => new Set(),
     rootTreePrefetchText: (payload, format = 'json') => {
       const json = JSON.stringify(payload)
       return format === 'flight' ? `0:${json}` : json
@@ -1193,7 +1192,9 @@ function createBuildExtensions(): BuildExtensions {
           ? { segmentSizes: { '/': options.bodySizeBytes } }
           : {}),
         ...(inlined ? { inlinedSegmentPaths: ['/'] } : {}),
-        ...(options.prefetchHints ? { prefetchHints: options.prefetchHints } : {}),
+        ...(options.prefetchHints !== undefined
+          ? { prefetchHints: { hints: options.prefetchHints, slots: null } }
+          : {}),
       }
     },
     diagnoseCacheComponentsPrerender: () => undefined,
@@ -1206,8 +1207,11 @@ function createBuildExtensions(): BuildExtensions {
       `${compat.segmentDir(outPath, routeId)}/_tree.segment.rsc`,
     bodySegmentFile: (outPath, routeId) =>
       `${compat.segmentDir(outPath, routeId)}/index.segment.rsc`,
+    shellSegmentFile: (outPath, routeId, key) =>
+      `${compat.segmentDir(outPath, routeId)}/${key}.shell.rsc`,
     segmentMetaFile: (outPath, routeId) =>
       `${compat.segmentDir(outPath, routeId)}/route.segment.meta`,
+    validateParamShells: () => Promise.resolve(),
   }
   return { steps: [], completeHooks: [], initHooks: [], parallelPhases: [], compat }
 }

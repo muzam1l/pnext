@@ -13,7 +13,7 @@
 //     sibling URL somewhere else entirely, or vary on search params.
 
 import type { RouteParamValue } from '../../types'
-import { restampSharedParams, sameParams } from './segment-cache'
+import { decodeSegment, documentRouteState, restampSharedParams, sameParams } from './segment-cache'
 
 interface RouteState {
   // Bracket-free colon form: `:id` for a dynamic segment, `:slug*` for a
@@ -34,22 +34,8 @@ interface PredictedShell {
   html: string
   route: RouteState
   prefetch?: 'shell' | 'eager'
-  /**
-   * True when the predicted shell belongs to an `allow-runtime` route. Its content is derived from the
-   * sampled request's params, so a cached shell of ONE param value says nothing about another - the
-   * router must still prefetch every unseen URL of the route (a `partial` shell, being static, is shared).
-   *
-   * ...UNLESS `experimental.appShells` is on: there the runtime prefetch of a non-eager route renders
-   * with its `params` HANGING, so the cached shell IS the route's shared App Shell and says the same
-   * thing for every param. Revealing another link of the route then has nothing to fetch.
-   */
+  /** A runtime-prefetched route: its shell content belongs to the URL it was sampled for. */
   runtimePrefetch?: boolean
-}
-
-/** `experimental.appShells`, stamped into the document by register-render. */
-function appShellsEnabled(): boolean {
-  if (!process.browser && typeof window === 'undefined') return false
-  return (window as { __PNEXT_APP_SHELLS__?: boolean }).__PNEXT_APP_SHELLS__ === true
 }
 
 export function predictNextLoadingShell(
@@ -58,9 +44,15 @@ export function predictNextLoadingShell(
 ): PredictedShell | undefined {
   // Most recently stored shells first (Map preserves insertion order).
   for (const [pathname, html] of [...shells.entries()].reverse()) {
-    const state = routeStateFromShell(html)
+    const state = documentRouteState(html) as RouteState | null
     // A closed param decides whether the route exists at all: the server must resolve the URL.
-    if (!state || state.closedParams) continue
+    if (
+      typeof state?.route !== 'string' ||
+      typeof state.params !== 'object' ||
+      !state.params ||
+      state.closedParams
+    )
+      continue
     // A shell's own URL must fit its route pattern before it can teach the
     // route trie. This catches rewrites, including a dynamic response served
     // for a known static sibling.
@@ -80,24 +72,11 @@ export function predictNextLoadingShell(
           ...(state.catchAllOptional ? { catchAllOptional: true } : {}),
         },
         ...(state.prefetchKind ? { prefetch: state.prefetchKind } : {}),
-        ...(state.runtimePrefetch && !appShellsEnabled() ? { runtimePrefetch: true } : {}),
+        ...(state.runtimePrefetch ? { runtimePrefetch: true } : {}),
       }
     }
   }
   return undefined
-}
-
-function routeStateFromShell(html: string): RouteState | undefined {
-  const raw = /window\.__PNEXT_ROUTE__=(\{.*?\});<\/script>/.exec(html)?.[1]
-  if (!raw) return undefined
-  try {
-    const state = JSON.parse(raw) as RouteState
-    return typeof state.route === 'string' && state.params && typeof state.params === 'object'
-      ? state
-      : undefined
-  } catch {
-    return undefined
-  }
 }
 
 function matchRoute(
@@ -144,12 +123,4 @@ function matchRoute(
     else if (segment !== value) return undefined
   }
   return cursor === target.length ? params : undefined
-}
-
-function decodeSegment(segment: string) {
-  try {
-    return decodeURIComponent(segment)
-  } catch {
-    return segment
-  }
 }

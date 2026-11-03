@@ -73,6 +73,12 @@ export function getNextConfig(): NextConfigObject {
   return configStore().value
 }
 
+/** `experimental` from next.config, typed by the caller's expected keys. */
+export function nextExperimental<T extends Record<string, unknown>>(): Partial<T> {
+  const experimental = getNextConfig().experimental as Partial<T> | undefined
+  return experimental && typeof experimental === 'object' ? experimental : {}
+}
+
 export function nextPageExtensions(): readonly string[] {
   return (getNextConfig().pageExtensions as string[] | undefined) ?? ['tsx', 'ts', 'jsx', 'js']
 }

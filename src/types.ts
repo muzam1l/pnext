@@ -454,6 +454,13 @@ export interface RouteInterception {
   slotDir?: string
 }
 
+/** A baked artifact's tracked vary names (`'?'` = searchParams): the body and its layout/page frames. */
+export interface SegmentVaryWire {
+  vary: string[]
+  layoutVary?: string[]
+  pageVary?: string[]
+}
+
 export interface RouteManifestEntry {
   id: string
   kind: 'page' | 'handler'
@@ -519,14 +526,12 @@ export interface RouteManifestEntry {
   paramMatching?: Record<string, string>
   /** Every build prerender of `prerenderedParams` stayed static: unbuilt params prerender on demand. */
   onDemandStatic?: boolean
-  /**
-   * Per-prerendered-URL vary sets tracked by the BUILD render, keyed by the concrete pathname. A request-time
-   * render answered from that prerender executes no user code, so it tracks nothing and would publish
-   * "unknown" (exact-URL keying) - these are the sets it publishes instead.
-   */
-  prerenderVary?: Record<string, { vary: string[]; layoutVary: string[]; pageVary: string[] }>
   /** Suspense boundary ids left as dynamic holes in the prebuilt PPR shell. */
   pprHoles?: number[]
+  /** The build's prerender had no holes; a regeneration keeps the verdict (serve-time only). */
+  builtStatic?: boolean
+  /** RUNTIME_* bits the latest regenerated shell's holes wait on (serve-time only). */
+  pprRuntimeData?: number
   /** Metadata postponed out of the static PPR shell and resumed into the body. */
   pprMetadata?: boolean
   /**
@@ -564,6 +569,14 @@ export interface RouteManifestEntry {
     key: string
     concreteParams: Record<string, RouteParamValue>
     holes: number[]
+    /** RUNTIME_* bits this sub-shell's holes wait on. */
+    runtime?: number
+    /** The vary sets the sub-shell render tracked (wire form). */
+    vary?: SegmentVaryWire
+    /** RUNTIME_* bits of the prefetch shell baked for this root-param prefix. */
+    shellRuntime?: number
+    /** The vary sets that prefetch shell tracked (wire form). */
+    shellVary?: SegmentVaryWire
   }[]
   /**
    * `template.*` files from app root to the route's own segment, parallel to

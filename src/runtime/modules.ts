@@ -22,6 +22,7 @@ import {
   serverBundleConditions,
   serverBundleRequireConditions,
   serverCssModuleSource,
+  serverRequireAlias,
   type ServerBundleTarget,
 } from './loader'
 import {
@@ -62,6 +63,7 @@ import {
 } from '../resolve/imports'
 import {
   absolutePathLiterals,
+  importMetaRefs,
   importSpecifiers,
   lineComments,
   moduleSpecifierEdges,
@@ -1725,7 +1727,11 @@ function missingCompiledArtifact(entry: string): string | undefined {
       return file
     }
     const targets: string[] = []
-    for (const { specifier, kind } of moduleSpecifierEdges(source, file)) {
+    // A release relocates a bundled `require` into a `new URL(…, import.meta.url)` literal.
+    const urls = importMetaRefs(file, source)
+      .urls.filter(url => source.startsWith('require(new URL(', url.start - 16))
+      .map(url => ({ ...url, kind: 'require' }))
+    for (const { specifier, kind } of [...moduleSpecifierEdges(source, file), ...urls]) {
       // A dynamic import is an on-demand publication boundary: its target may
       // belong to a later client-chunk phase even when both artifacts share a
       // profile directory. Static imports must be complete before evaluation.
@@ -2640,7 +2646,12 @@ async function resolveDevModuleSpecifier(
     pagesCompatSourceAlias(config, specifier, importer, options) ?? options.aliases[specifier]
   if (compatAlias) {
     if (kind === 'require-call' && path.isAbsolute(compatAlias)) {
-      return { path: serverRequireAlias(specifier, compatAlias, options) }
+      return {
+        path:
+          options.conditionTarget === 'client'
+            ? compatAlias
+            : serverRequireAlias(specifier, compatAlias, 'require-call'),
+      }
     }
     // A compat alias pointing at a 'use client' file needs the SAME stub-and-match treatment as any
     // other local client component: the render tree walk recognizes a client boundary by a
@@ -2847,17 +2858,6 @@ function offLayerPackageTarget(
   if (!resolved) return specifier
   // `require()` takes a path; only an ESM import takes a file href.
   return isRequire ? resolved : pathToFileHref(resolved)
-}
-
-function serverRequireAlias(specifier: string, alias: string, options: DevModuleOptions) {
-  if (options.conditionTarget === 'client') return alias
-  if (specifier === 'next/navigation' && alias.endsWith(`${path.sep}navigation.ts`)) {
-    return path.join(path.dirname(alias), 'navigation.cjs')
-  }
-  if (specifier === 'next/router' && alias.endsWith(`${path.sep}router.ts`)) {
-    return path.join(path.dirname(alias), 'router.cjs')
-  }
-  return alias
 }
 
 function registerExternalLoadHandlers(

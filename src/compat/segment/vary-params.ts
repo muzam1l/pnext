@@ -344,6 +344,38 @@ export function createVaryingSearchParams<T extends Record<string, unknown>>(
   })
 }
 
+const HANGING_RAW = Symbol('pnext.hangingSearchParams')
+
+const hangingRaw = <T>(promise: Promise<T>) =>
+  (promise as unknown as Record<symbol, Promise<T> | undefined>)[HANGING_RAW]
+
+/** A hanging `searchParams` promise whose await records the search sentinel on `accumulator` (the page's by default). */
+export function markSearchAccessOnAwait<T>(
+  promise: Promise<T>,
+  accumulator = createVaryParamsAccumulator('page'),
+): Promise<T> {
+  if (!accumulator) return promise
+  const raw = hangingRaw(promise) ?? promise
+  return new Proxy(raw, {
+    get(target, prop, receiver) {
+      if (prop === HANGING_RAW) return target
+      if (prop !== 'then') return Reflect.get(target, prop, receiver) as unknown
+      return (...args: Parameters<Promise<T>['then']>): Promise<unknown> => {
+        if (typeof args[0] === 'function') accumulateVaryParam(accumulator, SEARCH_PARAMS_SENTINEL)
+        return (target.then as (...a: typeof args) => Promise<unknown>)(...args)
+      }
+    },
+  })
+}
+
+/** Re-attribute a hanging `searchParams` await to `accumulator`; null for a settled or untracked promise. */
+export function retrackHangingSearch<T>(
+  promise: Promise<T>,
+  accumulator: VaryParamsAccumulator,
+): Promise<T> | null {
+  return hangingRaw(promise) ? markSearchAccessOnAwait(promise, accumulator) : null
+}
+
 /** True for a `then` read on an object that has no such key (promise probing). */
 function isPromiseProbe(target: object, prop: string): boolean {
   return prop === 'then' && !Object.prototype.hasOwnProperty.call(target, prop)
@@ -526,6 +558,23 @@ export function responseVaryParamsFromWire(wire: {
     pageSearch: page.search,
     layoutSearch: layout.search,
     headSearch: false,
+  }
+}
+
+/** The vary sets restricted to `names` - a runtime App Shell is keyed on the root params it read. */
+export function restrictVary(
+  vary: ResponseVaryParams,
+  names: readonly string[],
+): ResponseVaryParams {
+  const keep = (list: string[]) => list.filter(name => names.includes(name))
+  return {
+    ...vary,
+    params: keep(vary.params),
+    page: keep(vary.page),
+    layout: keep(vary.layout),
+    search: false,
+    pageSearch: false,
+    layoutSearch: false,
   }
 }
 

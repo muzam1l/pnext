@@ -26,7 +26,7 @@ function ignoreMissing() {
 /** Import/export forms the rewrite understands; anything else vetoes the fold. */
 const namedClause = String.raw`\{([^}]*)\}`
 
-interface FoldOptions {
+export interface FoldOptions {
   outDir: string
   metafile: Metafile
   /** esbuild flags of the build being folded, so the merge is emitted the same way. */
@@ -40,8 +40,7 @@ interface FoldOptions {
 export async function foldInitialChunks(options: FoldOptions): Promise<Metafile> {
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   if (process.env.PNEXT_CHUNK_FOLD === '0') return options.metafile
-  // The cost this removes is compressed-transfer only (a gzip header and
-  // dictionary reset per chunk), so the pass rides the minify flag.
+  // The cost this removes is compressed-transfer only, so the pass rides the minify flag.
   if (!options.buildOptions.minify) return options.metafile
   return foldChunks(options)
 }
@@ -208,11 +207,10 @@ function coLoadGroups(metafile: Metafile) {
     .map(group => [...group].sort())
 }
 
-/**
- * Tiny first-paint framework chunks merge into a parent, up to this many bytes per parent: the most a
- * route that loads the parent alone can over-fetch.
- */
+/** First-paint framework chunks under this many bytes are tiny and may merge into a parent. */
 const TINY_CHUNK_BYTES = 2048
+/** Tiny bytes merged per parent: the most a route that loads the parent alone can over-fetch. */
+const TINY_PARENT_BUDGET = 3072
 
 const frameworkSrc = path.resolve(import.meta.dirname, '..') + path.sep
 
@@ -251,7 +249,7 @@ function tinyChunkGroups(metafile: Metafile, coLoad: string[][]) {
       .filter(other => loaders.every(set => set.has(other)))
       .sort((a, b) => unitBytes(b) - unitBytes(a))[0]
     if (!parent) continue
-    const left = budget.get(parent) ?? TINY_CHUNK_BYTES
+    const left = budget.get(parent) ?? TINY_PARENT_BUDGET
     if (output.bytes > left) continue
     // Most routes loading the parent must already load the chunk, or the merge mostly over-fetches.
     if (loading(file).length * 2 < loading(parent).length) continue
@@ -266,8 +264,9 @@ function tinyChunkGroups(metafile: Metafile, coLoad: string[][]) {
 
 function isFrameworkChunk(output: Metafile['outputs'][string]) {
   const inputs = Object.keys(output.inputs)
+  // An empty chunk (a shared module tree-shaken to nothing) is only a request.
   return (
-    inputs.length > 0 &&
+    (inputs.length > 0 || output.bytes === 0) &&
     inputs.every(input => {
       const file = path.resolve(input)
       return (
@@ -587,17 +586,33 @@ function memberRewriter(
       .split(path.sep)
       .join('/')
     const href = mergedHref.startsWith('.') ? mergedHref : `./${mergedHref}`
-    return (
-      source
-        .replace(
-          namedImport,
-          (_all, keyword: string, clause: string, spec: string) =>
-            `${keyword}{${rename(clause, nameOf(spec))}}from"${href}"`,
-        )
-        // Side-effect-only imports of a member collapse onto the merged chunk.
-        .replace(sideEffectImport, () => `import"${href}"`)
-    )
+    const rewritten = source
+      .replace(
+        namedImport,
+        (_all, keyword: string, clause: string, spec: string) =>
+          `${keyword}{${rename(clause, nameOf(spec))}}from"${href}"`,
+      )
+      // Side-effect-only imports of a member collapse onto the merged chunk.
+      .replace(sideEffectImport, () => `import"${href}"`)
+    return singleImport(rewritten, href)
   }
+}
+
+const IMPORT_SLOT = '\0pnext-import\0'
+
+/** One import statement per merged chunk: the members' imports join at the first one's position. */
+function singleImport(source: string, href: string): string {
+  const clauses: string[] = []
+  const statement = new RegExp(
+    String.raw`import\s*(?:\{([^}]*)\}\s*from\s*)?"${escapeRegex(href)}";?`,
+    'g',
+  )
+  const slotted = source.replace(statement, (_all, clause?: string) => {
+    if (clause?.trim()) clauses.push(clause)
+    return IMPORT_SLOT
+  })
+  const joined = clauses.length ? `import{${clauses.join(',')}}from"${href}";` : `import"${href}";`
+  return slotted.replace(IMPORT_SLOT, joined).replaceAll(IMPORT_SLOT, '')
 }
 
 /** Stands in for the merged chunk's final (content-hashed) name. */

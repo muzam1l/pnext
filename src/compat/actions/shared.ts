@@ -97,13 +97,3 @@ export function reviveBinaryMarker(record: Record<string, unknown>): unknown {
   if (typeof buffer === 'string') return base64ToArrayBuffer(buffer)
   return undefined
 }
-
-declare const __PNEXT_CONCURRENT_ROUTER_QUEUE__: boolean
-
-/** `experimental.concurrentRouterQueue` swaps in Next's unfinished router queue, whose entry points all throw. */
-export function assertRouterQueueImplemented(): void {
-  if (typeof __PNEXT_CONCURRENT_ROUTER_QUEUE__ === 'boolean' && __PNEXT_CONCURRENT_ROUTER_QUEUE__)
-    throw new Error(
-      'Not implemented: this behavior is not yet supported when `experimental.concurrentRouterQueue` is enabled.',
-    )
-}

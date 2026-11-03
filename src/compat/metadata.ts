@@ -3,14 +3,19 @@ import { staticMetadataForPathFromFiles, type StaticMetadataFile } from '../rout
 import { coerceString } from '../render/metadata'
 import { legacyRequestAPIs } from '../request/context'
 import { readSourceText } from '../resolve/source-text'
-import { SPAN_TYPE, withChildSpan } from './otel/tracer'
 import { settledPromise } from '../render/renderer'
-import type { SlotHeadBranch, SlotHeadInput, SlotHeadPolicy } from '../render/hooks'
+import {
+  getRenderSpanExtensions,
+  type SlotHeadBranch,
+  type SlotHeadInput,
+  type SlotHeadPolicy,
+} from '../render/hooks'
 import { getNextConfig } from './next/config-loader'
 import {
   createVaryingParams,
   createVaryingSearchParams,
   getMetadataVaryParamsAccumulator,
+  retrackHangingSearch,
   varyTrackingInfo,
   type VaryTrackingInfo,
 } from './segment/vary-params'
@@ -27,18 +32,19 @@ type NextGenerateViewport = (
 export async function readNextModuleMetadata(
   module: Record<string, unknown>,
   props: PageProps,
-  parent: Metadata,
+  parent: Metadata | Promise<Metadata>,
   modulePath?: string,
 ): Promise<Metadata | undefined> {
   if (typeof module.generateMetadata === 'function') {
     const generate = module.generateMetadata as NextGenerateMetadata
-    const run = () =>
-      generate(headSegmentProps(props, modulePath), Promise.resolve(resolvedParentMetadata(parent)))
+    const resolvedParent = Promise.resolve(parent).then(resolvedParentMetadata)
+    // A generator that never awaits its parent must not leave the parent's rejection unhandled.
+    resolvedParent.catch(() => undefined)
+    const run = () => generate(headSegmentProps(props, modulePath), resolvedParent)
     const name = metadataSpanName(modulePath)
     return await (name
-      ? withChildSpan(
+      ? getRenderSpanExtensions().withGenerateMetadataSpan(
           name,
-          SPAN_TYPE.generateMetadata,
           { 'next.page': name.slice('generateMetadata '.length) },
           run,
         )
@@ -87,7 +93,9 @@ function headVaryTrackedProps(props: PageProps): Pick<PageProps, 'params' | 'sea
     params: retrackSettled(props.params, (raw, info) =>
       createVaryingParams(head, raw, info.optionalCatchAllParam),
     ),
-    searchParams: retrackSettled(props.searchParams, raw => createVaryingSearchParams(head, raw)),
+    searchParams:
+      retrackHangingSearch(props.searchParams, head) ??
+      retrackSettled(props.searchParams, raw => createVaryingSearchParams(head, raw)),
   }
 }
 

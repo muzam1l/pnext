@@ -192,6 +192,15 @@ export function matchSegments(
     if (match) return match
   }
 
+  // Inside an intercepted unit a path that only a parallel slot routes renders the layout pageless.
+  if (
+    options.markersAsSegments &&
+    children.some(
+      name => isSlotSegment(name) && matchSegments(path.join(dir, name), segments, options),
+    )
+  ) {
+    return { dirs, params }
+  }
   return null
 }
 

@@ -1,21 +1,6 @@
-// instrumentation-client.ts (COMPAT).
-//
-// Next executes the app's instrumentation-client.(ts|js) in the browser BEFORE hydration, plus any
-// `instrumentationClientInject` next.config entries before it, in array order; each module may export
-// onRouterTransitionStart(href, navigateType) which the client router calls at the start of every soft
-// navigation.
-//
-// pnext emulation:
-//   - BUILD: a build step (running before prerendering, so statically generated pages carry the tag
-//     too) bundles a synthetic entry importing the inject modules then the user module - static ESM
-//     imports preserve array order - into `<out>/public/assets/instrumentation-client.js`.
-//   - The synthetic entry collects every module's onRouterTransitionStart into
-//     `window.__PNEXT_ON_ROUTER_TRANSITION_START__`; the client router invokes that global when a
-//     navigation starts.
-//   - DOCUMENT: a `<script type="module">` head tag loads the bundle. Module scripts execute in document
-//     order, so the head module runs before the route entry module at the end of <body>.
-//
-// Zero-cost: apps without an instrumentation-client file get no bundle, no build work, no head tag.
+// instrumentation-client (COMPAT): a build step bundles the inject modules then the app's
+// instrumentation-client into one asset. A <head> script starts its import as `self.__PNEXT_IC__`;
+// the route entry awaits it before mounting, as Next runs it before hydration.
 
 import { existsSync, mkdirSync } from 'node:fs'
 import path from 'node:path'
@@ -44,6 +29,10 @@ function findInstrumentationClient(config: ResolvedConfig): string | undefined {
     }
   }
   return undefined
+}
+
+export function hasInstrumentationClient(config: ResolvedConfig): boolean {
+  return findInstrumentationClient(config) !== undefined
 }
 
 /** `instrumentationClientInject` module paths from next.config, root-resolved. */
@@ -197,12 +186,9 @@ export function resetInstrumentationClientForTest(): void {
   bundlePresence = undefined
 }
 
-/**
- * The `<head>` tag loading the instrumentation-client bundle, or '' when the
- * app has none. basePath-prefixed like every other asset href.
- */
+/** The `<head>` script importing the instrumentation-client bundle, or '' when the app has none. */
 export function instrumentationClientHeadTag(config: ResolvedConfig): string {
   if (!hasInstrumentationClientBundle(config)) return ''
   const prefix = config.basePath ?? ''
-  return `<script type="module" src="${prefix}/${INSTRUMENTATION_CLIENT_ASSET}"></script>`
+  return `<script>self.__PNEXT_IC__=import(${JSON.stringify(`${prefix}/${INSTRUMENTATION_CLIENT_ASSET}`)})</script>`
 }

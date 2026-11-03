@@ -16,9 +16,9 @@ import { getRequestExtensions, withRouteRuntime, type RequestInterceptor } from 
 import { getRequestRuntime } from '../../routing/request-environment'
 import { selectRouteForRequest } from '../../routing/match'
 import { setWorkUnitRoute } from '../../request/context'
+import { getRenderSpanExtensions } from '../../render/hooks'
 import { canonicalUrlHref } from '../next/canonical-url'
 import { markPathRevalidated, normalizeRevalidatePath } from '../cache/revalidate'
-import { withPagesApiHandlerSpan } from '../otel/tracer'
 import { toNextRequest } from '../../api/server'
 import { decodePagesParams, PAGES_LAYOUT } from './router-state'
 
@@ -266,7 +266,7 @@ export const pagesApiInterceptor: RequestInterceptor = async (request, { config 
   // The handler observes its declared runtime (NEXT_RUNTIME + the edge globals), as app route
   // handlers do through the serve pipeline's withRouteRuntime.
   const finished = withRouteRuntime(runtime, () =>
-    withPagesApiHandlerSpan(url.pathname, () =>
+    getRenderSpanExtensions().withPagesApiSpan(url.pathname, () =>
       Promise.resolve(imported.default!(handlerRequest, responder.res)),
     ),
   ).catch(error => responder.fail(error))

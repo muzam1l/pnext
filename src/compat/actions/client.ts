@@ -12,9 +12,9 @@
  */
 import { options as preactOptions, type ComponentType, type VNode } from 'preact'
 import { __pnextPushFormStatus } from '../react/dom'
+import { assertRouterQueueImplemented } from '../client/nav'
 import {
   ACTION_ID_FIELD,
-  assertRouterQueueImplemented,
   FORM_STATE_FIELD,
   SUBMIT_ACTION_ID_FIELD,
   actionReturnClientReferences,

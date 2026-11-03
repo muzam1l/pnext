@@ -20,6 +20,7 @@ import {
   rearmVisiblePrefetches,
   softNavigate,
 } from '../../client/router'
+import { currentNavState } from '../../client/router/history'
 import { routerState } from '../../client/router/hub'
 import { UnrecognizedActionError } from './unrecognized-error'
 import {
@@ -34,27 +35,28 @@ import {
   type ActionFunction,
 } from './shared'
 
-const ACTION_ID_HEADER = 'next-action'
-const ACTION_REDIRECT_HEADER = 'x-action-redirect'
-const ACTION_REFRESH_HEADER = 'x-pnext-action-refresh'
-const NEXT_ACTION_REVALIDATED_HEADER = 'x-action-revalidated'
-const ACTION_NOT_FOUND_HEADER = 'x-pnext-action-not-found'
-const NEXT_ACTION_NOT_FOUND_HEADER = 'x-nextjs-action-not-found'
-const ACTION_ERROR_DIGEST_HEADER = 'x-pnext-action-error-digest'
-const ACTION_FLIGHT_CONTENT_TYPE = 'text/x-component'
-const ACTION_ARGS_FIELD = '$pnext_args'
-const ARG_FORMDATA_MARKER = '$$pnext_fd'
-const ARG_FILE_MARKER = '$$pnext_file'
-const ARG_FORMDATA_PREFIX = '$pnext_fd_'
-const ARG_FILE_PREFIX = '$pnext_file_'
-const ARG_ACTION_MARKER = '$$pnext_action_ref'
-const TEMP_REF_MARKER = '$$pnext_temp_ref'
-const ACTION_STREAM_CONTENT_TYPE = 'x-component/pnext-stream'
-const ACTION_ELEMENT_MARKER = '$$pnext_element'
-const ACTION_ELEMENT_HTML_MARKER = '$$pnext_element_html'
+import {
+  ACTION_ARGS_FIELD,
+  ACTION_ERROR_DIGEST_HEADER,
+  ACTION_ID_HEADER,
+  ACTION_NOT_FOUND_HEADER,
+  ACTION_REDIRECT_HEADER,
+  ACTION_REFRESH_HEADER,
+  ARG_ACTION_MARKER,
+  ARG_FILE_MARKER,
+  ARG_FILE_PREFIX,
+  ARG_FORMDATA_MARKER,
+  ARG_FORMDATA_PREFIX,
+  MASKED_ACTION_ERROR,
+  NEXT_ACTION_NOT_FOUND_HEADER,
+  NEXT_ACTION_REVALIDATED_HEADER,
+  ACTION_FLIGHT_CONTENT_TYPE,
+  ACTION_ELEMENT_HTML_MARKER,
+  ACTION_ELEMENT_MARKER,
+  ACTION_STREAM_CONTENT_TYPE,
+  TEMP_REF_MARKER,
+} from './protocol'
 
-const MASKED_ACTION_ERROR =
-  'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
 const UNEXPECTED_RESPONSE = 'An unexpected response was received from the server.'
 
 interface ActionFlightPayload {
@@ -370,6 +372,8 @@ async function navigationSettled() {
 }
 
 export function callAction(id: string, args: unknown[]): Promise<unknown> {
+  routerState.clearLinkStatus?.()
+  routerState.settleLink?.()
   queuedActions++
   const run = actionQueue.then(navigationSettled).then(() => sendAction(id, args))
   actionQueue = run
@@ -378,7 +382,7 @@ export function callAction(id: string, args: unknown[]): Promise<unknown> {
       // A discarded action's revalidation refreshes once nothing queued can still see the old page.
       if (--queuedActions > 0 || !refreshWhenDrained) return
       refreshWhenDrained = false
-      return navigationSettled().then(refresh)
+      return navigationSettled().then(() => refresh())
     })
   return run
 }
@@ -389,16 +393,17 @@ async function sendAction(id: string, args: unknown[]): Promise<unknown> {
   // A navigation since dispatch discards this action: its result never changes the document, and its
   // revalidation refreshes only once the router is idle.
   const discarded = () => routerState.navigationStarts !== navigationGenerationAtDispatch
-  const revalidate = async (revalidated: boolean) => {
+  const revalidate = async (revalidated: boolean, html?: string) => {
     if (!revalidated) return
     if (discarded()) refreshWhenDrained = true
-    else await refresh()
+    else await refresh(html)
   }
   const { body, contentType, tempRefs } = await encodeArgs(args)
   // accept mirrors Next's flight wire; app code observes it via headers().
   const headers: Record<string, string> = {
     [ACTION_ID_HEADER]: id,
     accept: 'text/x-component',
+    'x-pnext-nav-state': encodeURIComponent(JSON.stringify(currentNavState())),
   }
   if (contentType) headers['content-type'] = contentType
 
@@ -422,44 +427,6 @@ async function sendAction(id: string, args: unknown[]): Promise<unknown> {
         `Server Action "${id}" was not found on the server. \nRead more: https://nextjs.org/docs/messages/failed-to-find-server-action`,
       ),
     )
-  }
-
-  // Legacy single-pass redirect: a 303 with no Location (fetch would have followed
-  // one) carrying the destination page HTML. Push history and swap the
-  // document — no follow-up request.
-  if (response.status === 303) {
-    const rearm = hasActionRevalidated(response) ? deferActionPrefetches() : undefined
-    try {
-      const redirect = actionRedirect(response)
-      const target = redirect?.target
-      if (target && blockJavascriptUrl(target)) return undefined
-      if (target && discarded()) return void (await revalidate(hasActionRevalidated(response)))
-      const contentType = response.headers.get('content-type') ?? ''
-      const replace = redirect?.replace ?? false
-      // Single-pass flight redirect: the 303 carries the destination page HTML in
-      // the flight envelope. Push history and swap the document in one round trip.
-      if (target && contentType.includes(ACTION_FLIGHT_CONTENT_TYPE)) {
-        const payload = await readActionFlightPayload(response)
-        const flightHtml = payloadHtml(payload)
-        if (flightHtml) {
-          await replaceDocument(flightHtml, target, replace, hasActionRevalidated(response))
-          return undefined
-        }
-        await navigate(target, replace)
-        return undefined
-      }
-      if (target && contentType.includes('text/html')) {
-        const html = await response.text()
-        await replaceDocument(html, target, replace, hasActionRevalidated(response))
-        return undefined
-      }
-      if (target) {
-        await navigate(target, replace)
-        return undefined
-      }
-    } finally {
-      rearm?.()
-    }
   }
 
   if (!response.ok) {
@@ -500,15 +467,8 @@ async function sendAction(id: string, args: unknown[]): Promise<unknown> {
         await replaceDocument(flightHtml, target, replace, revalidated)
         return undefined
       }
-      if (revalidated && flightHtml && payload.a === undefined && !discarded()) {
-        await replaceDocument(flightHtml)
-      } else {
-        // Revalidation always re-renders the current route (Next applies the
-        // revalidated flight even when the action returned a value). No
-        // embedded HTML to swap in — refresh through the soft-nav pipeline so
-        // every active parallel slot (intercepted modals included) refetches.
-        await revalidate(revalidated)
-      }
+      // Revalidation re-renders the current route even when the action returned a value.
+      await revalidate(revalidated, flightHtml)
       return reviveActionReturn(payload.a, tempRefs)
     } finally {
       rearm?.()
@@ -575,9 +535,15 @@ async function navigate(href: string, replace = false) {
   }
 }
 
-async function refresh() {
+async function refresh(html?: string) {
   try {
-    await softNavigate(location.href, { replace: true, scroll: false })
+    await softNavigate(location.href, {
+      replace: true,
+      scroll: false,
+      ...(html
+        ? { cachedPage: { html: actionRedirectPage(html), finalUrl: location.href, ok: true } }
+        : {}),
+    })
   } catch (error) {
     // A failed refresh must not reject the dispatch: the action's return value
     // still has to reach the caller (the refresh is a best-effort re-render).

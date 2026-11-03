@@ -16,24 +16,9 @@
 //
 // These helpers are pure and node-safe. The client counterparts live inline in actions/client.ts.
 
-/** Marker key naming a temporary-reference id in the args / return wire. */
-export const TEMP_REF_MARKER = '$$pnext_temp_ref'
-export const ACTION_ELEMENT_MARKER = '$$pnext_element'
-/**
- * Marker carrying the SERVER-RENDERED HTML of a React element tree an action returned (host elements /
- * async server components - NOT a client-reference element, which uses ACTION_ELEMENT_MARKER). The
- * client revives it into a renderable node for useActionState.
- */
-export const ACTION_ELEMENT_HTML_MARKER = '$$pnext_element_html'
+import { ACTION_ELEMENT_HTML_MARKER, ACTION_ELEMENT_MARKER, TEMP_REF_MARKER } from './protocol'
 
 const clientReferenceSymbol = Symbol.for('pnext.clientReference')
-
-/**
- * Response content-type/marker for a streamed action return. The client detects
- * this and returns the response body as a ReadableStream from the call instead
- * of parsing JSON.
- */
-export const ACTION_STREAM_CONTENT_TYPE = 'x-component/pnext-stream'
 
 /**
  * Per-request association of a decoded arg object -> the temp-ref id the client

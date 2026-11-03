@@ -653,6 +653,9 @@ const insideProducerStorage = revalidateGlobal(
   'insideProducerStorage',
   () => new AsyncLocalStorage<boolean>(),
 )
+// Core's sync-IO shim reads it to exempt producer bodies (ppr.ts insideUseCacheScope).
+;(globalThis as Record<PropertyKey, unknown>)[Symbol.for('pnext.compat.dataCacheProducerStorage')] =
+  insideProducerStorage
 const producerKindStorage = revalidateGlobal(
   'producerKindStorage',
   () => new AsyncLocalStorage<'use-cache' | 'unstable-cache'>(),

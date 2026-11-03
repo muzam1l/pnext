@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { writeVercelOutput } from './adapters/vercel'
 import { startWarmChild, type WarmChild } from './adapters/vercel-warm'
 import { devOutSegment, loadConfig, pathToFileHref } from '../config'
+import { analyzeSizesFile } from '../out-paths'
 import { bootstrapCompat } from '../compat-bootstrap'
 import {
   buildParallelPhaseError,
@@ -39,16 +40,7 @@ import {
   registerCssRuntime,
   warmCssPipeline,
 } from '../css/build'
-import {
-  analyzeCommand,
-  analyzeGraph,
-  printRouteSizes,
-  readAnalyzeSizes,
-  recordRouteSizes,
-  sizeRows,
-  writeAnalyzeGraph,
-  type RouteSizeRow,
-} from './analyze'
+import type { AnalyzeSizes, RouteSizeRow } from './analyze'
 import { ensureEmptyDir, listFiles, readText, toPosixPath, writeText } from '../utils/fs'
 import {
   discoverStaticMetadataFiles,
@@ -66,21 +58,19 @@ import {
   defaultNotFoundDocument,
   pprShellPath,
   pprSubShellPath,
-  renderFallbackShell,
+  subShellKey,
   renderGlobalNotFoundResponse,
   renderPageWithStatus,
-  renderPartialShell,
-  renderSubShell,
+  routeParamKeys,
   staticParamsFor,
 } from '../render/renderer'
+import { renderFallbackShell, renderPartialShell, renderSubShell } from '../render/ppr-shell'
 import {
   abortActivePrerenderScopes,
   beginShellSourceTracking,
   cacheComponents,
   endShellSourceTracking,
-  RUNTIME_PARAMS,
-  RUNTIME_SESSION,
-  RUNTIME_URL,
+  runtimeNeededBits,
 } from '../render/ppr'
 import { handleRouteModule, staticRouteParams, type RouteHandlerModule } from '../routing/handler'
 import { runWithCacheScope } from '../request/cache'
@@ -113,12 +103,13 @@ import { lookupBuildCache, writeBuildCache } from './build/cache'
 import { startStandalone, writeStandalone } from './serve/standalone'
 import { immutableAssetPath } from './serve/immutable'
 import { createVerboseLogger, type VerboseLogger } from '../utils/verbose'
-import { bold, cyan, dim, green } from '../utils/ansi'
+import { bold, cyan, dim, formatBytes, formatDelta, green, yellow } from '../utils/ansi'
 import type {
   ActionManifestEntry,
   BuildManifest,
   RouteManifestEntry,
   RouteParamValue,
+  SegmentVaryWire,
   StaticFileMetadata,
   StaticModuleMetadata,
   StaticRouteMetadata,
@@ -240,24 +231,17 @@ async function runBuild(
       undefined,
       undefined,
       undefined,
-      sizeRows(readAnalyzeSizes(config.outPath)),
+      readSizesRecord(config.outPath)?.rows,
     )
     return cached.manifest
   }
   // Load Tailwind on the CSS worker while the steps below run, so the first
   // stylesheet doesn't pay its cold boot.
   warmCssPipeline(config)
-  // The warm pass runs in its own process; start it here so its boot overlaps the build and only the
-  // warming itself lands on its own step. Every build compiles what the production server would
-  // otherwise compile inside its first request; the vercel adapter additionally imports app modules
-  // for the bundles only an import writes (see adapters/vercel-warm).
-  const warmMode = options.adapter === 'vercel' ? 'full' : 'compile'
-  const warm = startWarmChild(config, warmMode)
-  lifecycle.warm = warm
   // The framework's half of the standalone trace needs no build output; it overlaps the bundling.
   const standalone = startStandalone(config)
   // Read before the output is cleared: analyze diffs each route against the previous build.
-  const previousSizes = readAnalyzeSizes(config.outPath)
+  const previousSizes = readSizesRecord(config.outPath)
   const publicFiles = await log.step('prepare output directory', async () => {
     // Build-owned outputs only: `<outRoot>/dev` belongs to a possibly-running
     // dev server and must survive.
@@ -265,6 +249,9 @@ async function runBuild(
     await ensureEmptyDir(config.outRootPath, [devOutSegment, 'pnext-pages-compat'])
     return copyPublicDir(config.publicPath, path.join(config.outPath, 'static'))
   })
+  // Spawned after the wipe: the warm child's boot writes the config bundle into the out dir.
+  const warm = startWarmChild(config, options.adapter === 'vercel' ? 'full' : 'compile')
+  lifecycle.warm = warm
   // The document-level stylesheets run their postcss/Tailwind pass on the CSS
   // worker, so they overlap with the route scan below instead of serializing
   // ahead of it. Awaited before prepareRouteCssChunks — route CSS still builds
@@ -485,20 +472,6 @@ async function runBuild(
   await remainingSteps
   const staticModuleMetadata = await moduleMetadata
   const clientGraph = await clientBundles
-  // Entry names are final only now that the client stage fingerprinted them.
-  const graph = clientGraph
-    ? analyzeGraph(
-        config,
-        clientGraph,
-        new Map(
-          clientRoutes.flatMap(route =>
-            route.clientEntry ? [[`${clientEntryName(route)}.js`, route.clientEntry]] : [],
-          ),
-        ),
-      )
-    : undefined
-  const graphWritten = graph ? writeAnalyzeGraph(config.outPath, graph) : Promise.resolve()
-  graphWritten.catch(() => undefined)
   const proxyModule = await proxyBuild
   await partytownLib
   // Standalone static chunks (compat: the no-module polyfills chunk) live
@@ -679,7 +652,7 @@ async function runBuild(
       // keeps the existing (warned-about) prerender behavior.
       (segmentConfig?.runtime === 'edge' && !forceStatic)
 
-    let staticParams: Awaited<ReturnType<typeof staticParamsFor>> | null = null
+    let staticParams: StaticParams | null = null
     if (!configForcesDynamic && route.hasStaticParams) {
       try {
         staticParams = await log.step(`static params ${route.route}`, () =>
@@ -719,12 +692,7 @@ async function runBuild(
           : route.mode === 'static' && route.params.length === 0 && !route.catchAll
             ? [{}]
             : []
-    // Partial sets included: dynamicParams=false checks match governed params
-    // against these at request time.
-    if (staticParams) {
-      route.prerenderedParams = staticParams.allSets
-      if (staticParams.paramMatching) route.paramMatching = staticParams.paramMatching
-    }
+    if (staticParams) recordParamState(route, staticParams)
     // NEXT_DEBUG_BUILD parity: Next logs why a route that would otherwise have
     // been prerendered fell back to dynamic (the e2e suite greps this line).
     // This branch covers the request-API bailout (headers()/cookies() in the
@@ -828,19 +796,22 @@ async function runBuild(
               throw new Error(`the page rendered status ${rendered.value.status}`)
             }
             if (rendered.dynamicUsage || prerenderVary?.search) onDemandStatic = false
-            // Explicit no-store signals (fetch no-store/no-cache, revalidate
-            // 0, unstable_noStore) keep the route dynamic — unless the
+            // Request APIs and no-store signals keep the path dynamic, unless the
             // segment config explicitly opts into static/ISR output.
             const optedStatic =
               forceStatic ||
               typeof segmentConfig?.revalidate === 'number' ||
               segmentConfig?.revalidate === false
-            if (rendered.noStore && !optedStatic) {
-              if (process.env.NEXT_DEBUG_BUILD) logStaticBailout(routePath || '/', 'no-store fetch')
+            if ((rendered.noStore || rendered.dynamicUsage) && !optedStatic) {
+              if (process.env.NEXT_DEBUG_BUILD) {
+                logStaticBailout(
+                  routePath || '/',
+                  rendered.noStore ? 'no-store fetch' : await requestApiBailoutReason(route),
+                )
+              }
               continue
             }
             await writeText(file, rendered.value.html)
-            recordPrerenderVary(route, routePath || '/', prerenderVary)
             // Prerendered paths print like Next's build output; tooling (and
             // the Next e2e suite) greps for them. Generate mode defers them
             // below the `Route (app)` header so the diagnostics capture window
@@ -921,6 +892,32 @@ async function runBuild(
       },
     )
     if (onDemandStatic) route.onDemandStatic = true
+    // A Partial Prefetching route prerendered page by page still needs its shared App Shell: the
+    // route-level prefetch shell (and one per root-param prefix) beside the per-URL prerenders.
+    if (!route.ppr && buildCompat().routePartialPrefetching(route)) {
+      const url = new URL(`http://pnext.local${route.route}`)
+      const hasParams = route.params.length > 0 || route.catchAll !== undefined
+      const shell = await renderPrefetchShell(config, route, () =>
+        hasParams
+          ? renderFallbackShell({ config, route, url, prefetchShell: true })
+          : renderPartialShell({ config, route, url, prefetchShell: true }),
+      )
+      if (shell) {
+        const { prebuilt, meta, vary } = shell
+        await emitSegmentArtifacts(
+          config,
+          route,
+          prebuilt.shell,
+          prebuilt.holes.length > 0,
+          { body: prebuilt.runtimeData ?? 0, shell: prebuilt.runtimeData ?? 0 },
+          meta,
+          undefined,
+          vary,
+          true,
+        )
+      }
+      if (staticParams) await buildSubShells(config, route, staticParams, false)
+    }
   }
 
   // Generate-mode prerender diagnostics fail the pass with Next's exact
@@ -1030,14 +1027,37 @@ async function runBuild(
   }
   await writeBuildManifest(config.outPath, manifest)
   log.log(`wrote manifest.json (${routes.length} route${routes.length === 1 ? '' : 's'})`)
-  // Before the adapter and the build cache snapshot the output, both of which read what lands here.
-  const routeSizes =
+  // Overlaps the warm pass; awaited before the build cache snapshot.
+  const routeSizes: Promise<RouteSizeRow[]> =
     config.output === 'export'
-      ? []
-      : await log.step('route sizes', async () => {
-          await graphWritten
-          return recordRouteSizes(config, manifest, graph, previousSizes, globalCssSources(config))
+      ? Promise.resolve([])
+      : log.step('route sizes', async () => {
+          const analyze = await import('./analyze')
+          // Entry names are final only now that the client stage fingerprinted them.
+          const graph =
+            clientGraph &&
+            analyze.analyzeGraph(
+              config,
+              clientGraph,
+              new Map(
+                clientRoutes.flatMap(route =>
+                  route.clientEntry ? [[`${clientEntryName(route)}.js`, route.clientEntry]] : [],
+                ),
+              ),
+            )
+          const [rows] = await Promise.all([
+            analyze.recordRouteSizes(
+              config,
+              manifest,
+              graph,
+              previousSizes,
+              globalCssSources(config),
+            ),
+            graph && analyze.writeAnalyzeGraph(config.outPath, graph),
+          ])
+          return rows
         })
+  routeSizes.catch(() => undefined)
   for (const hook of getBuildExtensions().completeHooks) {
     await hook({ config, manifest, log })
   }
@@ -1066,6 +1086,7 @@ async function runBuild(
   const buildDurationMs = performance.now() - startedAt
   const phases = await settleBuildParallelPhases()
   flushDevModuleCaches()
+  const sizes = await routeSizes
   await writeBuildCache(config, options, cached)
   if (config.output === 'export') await publishCoreStaticExport(config.outPath)
 
@@ -1078,7 +1099,7 @@ async function runBuild(
     interceptionPrerenders,
     partialPrerenders,
     phases,
-    routeSizes,
+    sizes,
   )
   return manifest
 }
@@ -1186,6 +1207,46 @@ function assertManifestServerArtifacts(outPath: string, manifest: BuildManifest)
       throw new Error(`Build manifest server artifact is missing: ${artifact}`)
     }
   }
+}
+
+function readSizesRecord(outPath: string) {
+  try {
+    return JSON.parse(readFileSync(analyzeSizesFile(outPath), 'utf8')) as AnalyzeSizes & {
+      rows?: RouteSizeRow[]
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** The build summary's per-route initial-load lines, with budget and previous-build deltas. */
+function printRouteSizes(rows: RouteSizeRow[]) {
+  if (rows.length === 0) return
+  console.log(`${bold('Initial load')} ${dim('(gzip: HTML + CSS + JS)')}`)
+  const width = Math.max(...rows.map(row => row.route.length))
+  const sizeWidth = Math.max(...rows.map(row => formatBytes(row.compressedBytes).length))
+  for (const row of rows) {
+    const parts = [formatBytes(row.compressedBytes).padStart(sizeWidth)]
+    const delta = row.previousBytes === undefined ? 0 : row.compressedBytes - row.previousBytes
+    if (delta !== 0) parts.push(dim(formatDelta(delta)))
+    if (row.budget !== undefined && row.compressedBytes > row.budget) {
+      parts.push(yellow(`over ${formatBytes(row.budget)} budget`))
+    }
+    console.log(`  ${row.route.padEnd(width)}  ${parts.join('  ')}`)
+  }
+  const over = rows.filter(row => row.budget !== undefined && row.compressedBytes > row.budget)
+  if (over.length > 0) {
+    const routes = over.map(row => row.route).join(', ')
+    const verb = over.length === 1 ? 'route is' : 'routes are'
+    console.warn(yellow(`⚠ ${over.length} ${verb} over the initial-load budget: ${routes}`))
+  }
+  console.log('')
+}
+
+/** The analyze command worth running next: the heaviest route. */
+function analyzeCommand(rows: RouteSizeRow[]) {
+  const heaviest = [...rows].sort((a, b) => b.compressedBytes - a.compressedBytes)[0]
+  return heaviest ? `pnext analyze ${heaviest.route}` : 'pnext analyze'
 }
 
 function printBuildSummary(
@@ -1427,66 +1488,35 @@ async function renderShellWithCacheMeta(
   }
 }
 
-/**
- * `use cache` entries whose expiry falls inside Next's DYNAMIC_EXPIRE window (5 minutes - the
- * `seconds` cacheLife profile, or an explicit short `expire`) are OMITTED from the prerender the
- * client prefetches: such data is not worth prefetching, so its boundary stays a hole the
- * navigation fills live.
- */
-const DYNAMIC_EXPIRE_SECONDS = 300
-
-/**
- * True when the route's own sources declare a cacheLife that expires inside the dynamic-expire
- * window. A cheap source scan used purely to decide whether the extra prefetch-shell prerender below
- * is worth running - every other route keeps a single shell render.
- */
-function routeDeclaresShortLivedCache(route: RouteManifestEntry): boolean {
-  for (const file of route.sourceFiles) {
-    if (!existsSync(file)) continue
-    const source = readTextSync(file)
-    for (const literal of source.matchAll(/cacheLife\s*\(\s*\{[^}]*\bexpire\s*:\s*([^,}]+)/gs)) {
-      const value = staticNumberExpression(literal[1]!)
-      if (value !== undefined && value < DYNAMIC_EXPIRE_SECONDS) return true
-    }
-    for (const named of source.matchAll(/cacheLife\s*\(\s*['"]([^'"]+)['"]\s*\)/g)) {
-      const expire = builtInCacheLifeExpire(named[1]!)
-      if (expire !== undefined && expire < DYNAMIC_EXPIRE_SECONDS) return true
-    }
+/** A Partial Prefetching route's shell-stage render, best-effort: null when it threw or postponed. */
+async function renderPrefetchShell(
+  config: Awaited<ReturnType<typeof loadConfig>>,
+  route: RouteManifestEntry,
+  render: () => Promise<PrebuiltShell | null>,
+): Promise<{
+  prebuilt: PrebuiltShell
+  meta: ShellCacheMeta
+  vary: BuildResponseVary | undefined
+} | null> {
+  if (!buildCompat().routePartialPrefetching(route)) return null
+  try {
+    const shell = await renderShellWithCacheMeta(config, route, render)
+    return shell.prebuilt ? { ...shell, prebuilt: shell.prebuilt } : null
+  } catch {
+    return null
+  } finally {
+    abortActivePrerenderScopes()
   }
-  return false
 }
 
-/** The route's prefetch body (a short-lived-cache-free render when needed) and its static-attempt hints. */
+/** The route's prefetch body: the shell-stage render for a Partial Prefetching route, else the document. */
 async function renderPrefetchBody(
   config: Awaited<ReturnType<typeof loadConfig>>,
   route: RouteManifestEntry,
   document: { prebuilt: PrebuiltShell; vary: BuildResponseVary | undefined },
   render: () => Promise<PrebuiltShell | null>,
 ) {
-  const shortLived = routeDeclaresShortLivedCache(route)
-  let shell: typeof document | undefined
-  if (shortLived || buildCompat().routePartialPrefetching(route)) {
-    try {
-      const { prebuilt, vary } = await renderShellWithCacheMeta(config, route, render)
-      if (prebuilt) shell = { prebuilt, vary }
-    } catch {
-      // Best-effort: the document shell doubles as the prefetch body, as before.
-    } finally {
-      abortActivePrerenderScopes()
-    }
-  }
-  // Fallback params read in a shell ISR later upgrades are not worth a runtime request.
-  const urlData = RUNTIME_SESSION | RUNTIME_URL | (route.hasStaticParams ? 0 : RUNTIME_PARAMS)
-  const ensureStatic = route.segmentConfig?.ensureStatic
-  const hints = {
-    shellStatic:
-      ensureStatic !== undefined ||
-      !(((shell ?? document).prebuilt.runtimeData ?? 0) & RUNTIME_SESSION),
-    prefetchStatic:
-      (ensureStatic !== undefined && ensureStatic !== 'shell') ||
-      !((document.prebuilt.runtimeData ?? 0) & urlData),
-  }
-  return { ...(shortLived && shell ? shell : document), hints }
+  return (await renderPrefetchShell(config, route, render)) ?? document
 }
 
 async function buildPprShell(
@@ -1521,12 +1551,11 @@ async function buildPprShell(
     route,
     prefetchBody.prebuilt.shell,
     prefetchBody.prebuilt.holes.length > 0,
-    prefetchBody.hints,
+    { body: prebuilt.runtimeData ?? 0, shell: prefetchBody.prebuilt.runtimeData ?? 0 },
     meta,
     undefined,
     prefetchBody.vary,
-    // renderPartialShell against the PATTERN url: a route-level, params-hanging
-    // render, so an empty tracked set is honest (see buildVaryTrusted).
+    // A route-level, params-hanging render: an empty tracked set is honest (see buildVaryTrusted).
     true,
   )
 }
@@ -1561,8 +1590,8 @@ async function emitSegmentArtifacts(
   route: RouteManifestEntry,
   body: string,
   postponed: boolean,
-  /** Whether a static App Shell / per-URL prefetch attempt suffices (no runtime data before the stage). */
-  hints: { shellStatic: boolean; prefetchStatic: boolean },
+  /** RUNTIME_* bits the served body's holes wait on, and the App Shell's (prefetch-shell stage). */
+  runtime: { body: number; shell: number },
   cacheMeta?: ShellCacheMeta,
   statusOverride?: number,
   vary?: BuildResponseVary,
@@ -1579,6 +1608,7 @@ async function emitSegmentArtifacts(
     declaredStaleTime ??
     (isStatic ? compat.defaultStaticStaleTimeSeconds : compat.defaultDynamicStaleTimeSeconds)
   const bodySizeBytes = Buffer.byteLength(body)
+  const runtimeNeeded = runtimeNeededBits(route, runtime.shell, runtime.body)
   const tree = compat.buildRootTreePrefetch({
     pathname: route.route,
     isStatic,
@@ -1590,7 +1620,8 @@ async function emitSegmentArtifacts(
       (route.segmentConfig as { prefetch?: unknown } | undefined)?.prefetch === 'allow-runtime',
     partialPrefetching: compat.routePartialPrefetching(route),
     routePattern: route.route,
-    ...hints,
+    catchAllOptional: route.catchAllOptional,
+    runtimeNeeded,
     // The route's <title> is dynamic and ships as its own `/_head` response;
     // announcing it in the TREE lets the client fetch the head before the body
     // (Next's response order) instead of learning it from the body response.
@@ -1606,8 +1637,11 @@ async function emitSegmentArtifacts(
     staleTime,
     postponed,
     bodySizeBytes,
-    prefetchHints: { [route.route]: tree.tree.prefetchHints },
+    prefetchHints: tree.tree.h ?? 0,
+    runtime: runtime.body,
+    shellRuntime: runtime.shell,
     staleTimeDeclared: declaredStaleTime !== undefined,
+    runtimeNeeded,
     ...(vary && buildVaryTrusted(route, vary, fallbackParamsRender) ? { vary } : {}),
   })
   await mkdir(compat.segmentDir(config.outPath, route.id), { recursive: true })
@@ -1625,37 +1659,11 @@ async function emitSegmentArtifacts(
 }
 
 /**
- * Whether a BUILD render's tracked vary set may be persisted as the route's published set. Mirrors
- * the request path's `varyTrusted`: an EMPTY set on a params-bearing route is more often an artifact
- * (nothing was tracked) than the truth, and under-varying serves one param's content for another, so
- * such a render stays "unknown" (exact-URL keying).
- *
- * The exception is a ROUTE-LEVEL shell render (`fallbackParamsRender`): its params HANG, so a
- * component that read one postponed and left a hole instead of recording an access. The empty set is
- * then the truth - the baked bytes are param-independent by construction.
+ * Whether a BUILD render's tracked vary set may be persisted as the route's published set. An EMPTY set on
+ * a params-bearing route is more often an artifact (nothing was tracked) than the truth, so it stays
+ * "unknown" (exact-URL keying) - except for a ROUTE-LEVEL shell render, whose params HANG: a read would
+ * have postponed and left a hole, so the baked bytes are param-independent by construction.
  */
-/**
- * Persist a concrete-param prerender's tracked vary sets on the route entry. The request-time render
- * of such a URL is answered from the prerender, so it executes no user code and tracks nothing;
- * without this the response publishes no vary set and every param value keys its own entry. Only a
- * set the render really recorded is kept - an empty one on a params-bearing route is the
- * untracked-render artifact `buildVaryTrusted` guards against.
- */
-function recordPrerenderVary(
-  route: RouteManifestEntry,
-  routePath: string,
-  vary: BuildResponseVary | undefined,
-): void {
-  if (!vary || !buildVaryTrusted(route, vary, false)) return
-  if (vary.params.length === 0 && !vary.search) return
-  route.prerenderVary ??= {}
-  route.prerenderVary[routePath] = {
-    vary: buildCompat().varyNamesFor(vary, 'body'),
-    layoutVary: buildCompat().varyNamesFor(vary, 'layout'),
-    pageVary: buildCompat().varyNamesFor(vary, 'page'),
-  }
-}
-
 function buildVaryTrusted(
   route: RouteManifestEntry,
   vary: BuildResponseVary,
@@ -1689,7 +1697,7 @@ async function emitNextSegmentArtifacts(
   meta: SegmentMeta,
   headers: Record<string, string> = {},
 ): Promise<void> {
-  const appPath = nextAppRoutePath(route.route)
+  const appPath = nextAppRoutePath(toNextRoutePattern(route))
   const appFile = path.join(root, '.next', 'server', 'app', appPath)
   const segmentsDir = `${appFile}.segments`
   const nextMeta = {
@@ -1748,6 +1756,8 @@ async function emitConcreteNextPageArtifacts(
     isStatic: !postponed,
     staleTimeSeconds: staleTime,
     routeId: route.id,
+    routePattern: route.route,
+    catchAllOptional: route.catchAllOptional,
     bodySizeBytes,
     postponed,
   })
@@ -1757,7 +1767,13 @@ async function emitConcreteNextPageArtifacts(
     postponed,
     bodySizeBytes,
   })
-  const appFile = path.join(config.root, '.next', 'server', 'app', nextAppRoutePath(routePath))
+  const appFile = path.join(
+    config.root,
+    '.next',
+    'server',
+    'app',
+    nextAppRoutePath(toNextRoutePattern(route, routePath)),
+  )
   const segmentsDir = `${appFile}.segments`
   await mkdir(segmentsDir, { recursive: true })
   await writeText(`${appFile}.html`, rendered.html)
@@ -1828,27 +1844,6 @@ function builtInCacheLifeStale(profile: string): number | undefined {
     case 'weeks':
     case 'max':
       return 300
-    default:
-      return undefined
-  }
-}
-
-/** `expire` (seconds) of a built-in cacheLife profile. */
-function builtInCacheLifeExpire(profile: string): number | undefined {
-  switch (profile) {
-    case 'seconds':
-      return 60
-    case 'minutes':
-      return 3600
-    case 'hours':
-      return 86400
-    case 'days':
-      return 604800
-    case 'weeks':
-      return 2592000
-    case 'default':
-    case 'max':
-      return 31536000
     default:
       return undefined
   }
@@ -1960,10 +1955,7 @@ async function buildCacheComponentsShell(
     hasDynamicParams && route.hasStaticParams
       ? await staticParamsFor(config, route).catch(rethrowIfProgrammingError)
       : undefined
-  if (staticParams) {
-    route.prerenderedParams = staticParams.allSets
-    if (staticParams.paramMatching) route.paramMatching = staticParams.paramMatching
-  }
+  if (staticParams) recordParamState(route, staticParams)
   // Build-phase so buildtime sentinels resolve correctly in the shell.
   beginShellSourceTracking()
   let renderResult: Awaited<ReturnType<typeof renderShellWithCacheMeta>>
@@ -2013,6 +2005,11 @@ async function buildCacheComponentsShell(
           shellHolesRenderFallbackContent(prebuilt.shell))
       ) &&
       !(hasDynamicParams && routeSourcesUseRequestApi(config.root, route)))
+  await buildCompat().validateParamShells(route, async filled =>
+    Object.keys(filled).length === 0
+      ? baseShellIsEmpty
+      : (await renderBuildSubShell(config, route, filled, { probeShell: true })).value === null,
+  )
 
   if (!baseShellIsEmpty) {
     route.ppr = true
@@ -2031,18 +2028,8 @@ async function buildCacheComponentsShell(
     let fallbackStatus: number | undefined
     if (!hasDynamicParams && routeSourcesUseHttpFallback(config.root, route)) {
       try {
-        const probe = await runWithWorkUnit('render', () =>
-          getRenderExtensions()
-            .collectRenderMeta(
-              () =>
-                runWithNextBuildPhase(() =>
-                  renderPageWithStatus({ config, route, params: {}, url }),
-                ),
-              { route: route.route || '/', prerender: true },
-            )
-            .then(result => result.value),
-        )
-        if (probe.status !== 200) fallbackStatus = probe.status
+        const status = await probeStatus(config, route, {}, url)
+        if (status !== 200) fallbackStatus = status
       } catch {
         // Probe render failed — the shell itself is unaffected.
       }
@@ -2057,12 +2044,11 @@ async function buildCacheComponentsShell(
       route,
       prefetchBody.prebuilt.shell,
       prefetchBody.prebuilt.holes.length > 0,
-      prefetchBody.hints,
+      { body: prebuilt.runtimeData ?? 0, shell: prefetchBody.prebuilt.runtimeData ?? 0 },
       meta,
       fallbackStatus,
       prefetchBody.vary,
-      // renderFallbackShell/renderPartialShell against the PATTERN url: a
-      // route-level, params-hanging render (see buildVaryTrusted).
+      // A route-level, params-hanging render (see buildVaryTrusted).
       true,
     )
 
@@ -2083,12 +2069,9 @@ async function buildCacheComponentsShell(
   // BAKES that data and leaves the client no dynamic request. The request-API scan keeps this narrow
   // - a route whose full param sets render with no request-time data is a COMPLETE static prerender.
   if (
-    hasDynamicParams &&
-    route.hasStaticParams &&
-    ((await hasPartialStaticPrefix(config, route)) ||
-      (cacheComponents() &&
-        routeSourcesUseRequestApi(config.root, route) &&
-        (await hasFullStaticParamSet(config, route))))
+    staticParams &&
+    (hasPartialStaticPrefix(route, staticParams) ||
+      (routeSourcesUseRequestApi(config.root, route) && hasFullStaticParamSet(route, staticParams)))
   ) {
     route.ppr = true
     route.pprMetadata = prebuilt?.metadataDynamic || undefined
@@ -2113,25 +2096,12 @@ async function buildCacheComponentsShell(
  * params around a remaining hole. A route whose static params are all FULL sets (or has none) yields
  * no partial sub-shell, so a params-only base fallback shell is served with a blocking render.
  */
-async function hasPartialStaticPrefix(
-  config: Awaited<ReturnType<typeof loadConfig>>,
-  route: RouteManifestEntry,
-): Promise<boolean> {
-  if (!route.hasStaticParams) return false
-  let staticParams: Awaited<ReturnType<typeof staticParamsFor>>
-  try {
-    staticParams = await staticParamsFor(config, route)
-  } catch (error) {
-    rethrowIfProgrammingError(error)
-    return false
-  }
-  const paramKeys = [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
-  for (const set of staticParams.allSets) {
-    let filled = 0
-    while (filled < paramKeys.length && set[paramKeys[filled]!] !== undefined) filled++
-    if (filled > 0 && filled < paramKeys.length) return true
-  }
-  return false
+function hasPartialStaticPrefix(route: RouteManifestEntry, staticParams: StaticParams): boolean {
+  const paramKeys = routeParamKeys(route)
+  return staticParams.allSets.some(set => {
+    const filled = filledPrefixLength(paramKeys, set)
+    return filled > 0 && filled < paramKeys.length
+  })
 }
 
 /**
@@ -2139,21 +2109,39 @@ async function hasPartialStaticPrefix(
  * buildSubShells already renders those as concrete, postponing sub-shells; this
  * predicate is what lets them be reached under cacheComponents.
  */
-async function hasFullStaticParamSet(
+function hasFullStaticParamSet(route: RouteManifestEntry, staticParams: StaticParams): boolean {
+  const paramKeys = routeParamKeys(route)
+  return staticParams.allSets.some(set => filledPrefixLength(paramKeys, set) === paramKeys.length)
+}
+
+function filledPrefixLength(paramKeys: string[], set: Record<string, RouteParamValue>): number {
+  let filled = 0
+  while (filled < paramKeys.length && set[paramKeys[filled]!] !== undefined) filled++
+  return filled
+}
+
+type StaticParams = Awaited<ReturnType<typeof staticParamsFor>>
+
+function recordParamState(route: RouteManifestEntry, staticParams: StaticParams): void {
+  // Partial sets included: dynamicParams=false checks match governed params against these at request time.
+  route.prerenderedParams = staticParams.allSets
+  if (staticParams.paramMatching) route.paramMatching = staticParams.paramMatching
+}
+
+/** A blocking render's HTTP status (an http-access fallback answers non-200). */
+async function probeStatus(
   config: Awaited<ReturnType<typeof loadConfig>>,
   route: RouteManifestEntry,
-): Promise<boolean> {
-  if (!route.hasStaticParams) return false
-  let staticParams: Awaited<ReturnType<typeof staticParamsFor>>
-  try {
-    staticParams = await staticParamsFor(config, route)
-  } catch (error) {
-    rethrowIfProgrammingError(error)
-    return false
-  }
-  const paramKeys = [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
-  if (paramKeys.length === 0) return false
-  return staticParams.allSets.some(set => paramKeys.every(key => set[key] !== undefined))
+  params: Record<string, RouteParamValue>,
+  url: URL,
+): Promise<number> {
+  const rendered = await runWithWorkUnit('render', () =>
+    getRenderExtensions().collectRenderMeta(
+      () => runWithNextBuildPhase(() => renderPageWithStatus({ config, route, params, url })),
+      { route: url.pathname, prerender: true },
+    ),
+  )
+  return rendered.value.status
 }
 
 /**
@@ -2165,94 +2153,142 @@ async function hasFullStaticParamSet(
 async function buildSubShells(
   config: Awaited<ReturnType<typeof loadConfig>>,
   route: RouteManifestEntry,
-  staticParams: Awaited<ReturnType<typeof staticParamsFor>>,
+  staticParams: StaticParams,
+  /** False when the static loop already emitted the per-URL `.html`/`.meta`. */
+  emitConcrete = true,
 ): Promise<void> {
-  const paramKeys = [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
+  const paramKeys = routeParamKeys(route)
   // Distinct leading prefixes AND full param sets. A partial prefix fills keys
   // [0..k) (k < len) and leaves the rest hanging → a sub-shell (postponed). A
   // FULL set fills every param → a fully-prerendered shell with no holes (not
   // postponed) that the request path serves for that exact URL.
+  const compat = buildCompat()
+  const rootParams = compat.rootParams(config)
+  const partial = compat.routePartialPrefetching(route)
   const prefixes = new Map<string, Record<string, RouteParamValue>>()
-  for (const set of staticParams.allSets) {
-    let filled = 0
-    while (filled < paramKeys.length && set[paramKeys[filled]!] !== undefined) filled++
-    if (filled === 0) continue
+  const addPrefix = (set: Record<string, RouteParamValue>, filled: number) => {
     const concrete: Record<string, RouteParamValue> = {}
     for (let i = 0; i < filled; i++) concrete[paramKeys[i]!] = set[paramKeys[i]!]!
     const key = subShellKey(concrete)
     if (!prefixes.has(key)) prefixes.set(key, concrete)
   }
+  for (const set of staticParams.allSets) {
+    const filled = filledPrefixLength(paramKeys, set)
+    if (filled === 0) continue
+    addPrefix(set, filled)
+    // A Partial Prefetching route's App Shell is keyed on its root params: bake that prefix too.
+    let rootFilled = 0
+    while (rootFilled < filled && rootParams.has(paramKeys[rootFilled]!)) rootFilled++
+    if (partial && rootFilled > 0 && rootFilled < filled) addPrefix(set, rootFilled)
+  }
   if (prefixes.size === 0) return
 
   const subShells: NonNullable<RouteManifestEntry['pprSubShells']> = []
+  const bakedVary = (tracked: BuildResponseVary | undefined): SegmentVaryWire | undefined =>
+    tracked && {
+      vary: compat.varyNamesFor(tracked, 'body'),
+      layoutVary: compat.varyNamesFor(tracked, 'layout'),
+      pageVary: compat.varyNamesFor(tracked, 'page'),
+    }
   for (const [key, concreteParams] of prefixes) {
     const routePath = fillRoutePath(route.route, concreteParams)
     const url = new URL(`http://pnext.local${routePath}`)
-    // Collect cache meta so a sub-shell's cache tags (its concrete-param
-    // prefix lets `use cache` scopes fill that the fallback shell postponed)
-    // join the route's tag set for PPR-shell tag staleness.
-    const { value: prebuilt, tags } = await runWithWorkUnit('render', () =>
-      getRenderExtensions().collectRenderMeta(
-        () =>
-          runWithNextBuildPhase(() =>
-            renderSubShell({ config, route, url, concreteParams, paramKeys }),
-          ),
-        { fetchCache: route.segmentConfig?.fetchCache, route: routePath || '/', prerender: true },
-      ),
-    )
+    // Tracked so the sub-shell publishes what it read; cache tags join the route's for tag staleness.
+    const { value: prebuilt, tags, vary } = await renderBuildSubShell(config, route, concreteParams)
     recordRouteCacheTags(route, tags)
     if (!prebuilt) continue
     const file = pprSubShellPath(config.outPath, route.id, key)
     await mkdir(path.dirname(file), { recursive: true })
     await writeText(file, prebuilt.shell)
-    subShells.push({ key, concreteParams, holes: prebuilt.holes })
+    // What the tracked render read, frame by frame: a param the body never touched is shareable.
+    const keys = Object.keys(concreteParams)
+    const entry: (typeof subShells)[number] = { key, concreteParams, holes: prebuilt.holes }
+    const tracked = bakedVary(vary)
+    if (tracked) entry.vary = tracked
+    if (prebuilt.runtimeData) entry.runtime = prebuilt.runtimeData
+    // A Partial Prefetching route's App Shell keeps its root params: bake one prefetch shell per root prefix.
+    if (partial && keys.length > 0 && keys.every(name => rootParams.has(name))) {
+      try {
+        const shell = await renderBuildSubShell(config, route, concreteParams, {
+          prefetchShell: true,
+        })
+        if (shell.value) {
+          await mkdir(compat.segmentDir(config.outPath, route.id), { recursive: true })
+          await writeText(compat.shellSegmentFile(config.outPath, route.id, key), shell.value.shell)
+          entry.shellRuntime = shell.value.runtimeData ?? 0
+          entry.shellVary = bakedVary(shell.vary) ?? { vary: [] }
+        }
+      } finally {
+        abortActivePrerenderScopes()
+      }
+    }
+    subShells.push(entry)
+    if (!emitConcrete) continue
+    if (keys.length < paramKeys.length) {
+      // Next emits no prefix artifacts for navigation-static pages.
+      if (route.segmentConfig?.ensureStatic !== 'navigation') {
+        await emitConcreteNextPageArtifacts(config, route, routePath, {
+          html: prebuilt.shell,
+          status: 200,
+          postponed: true,
+        })
+      }
+      continue
+    }
     // A FULL param set is a concrete prerendered path - emit Next's `.{html,meta}` plus tree-segment
     // artifacts for it. The sub-shell is the prerendered html (dynamic holes stay excluded, so a
     // dynamic <head> never leaks into the static copy); a blocking probe render supplies the real
     // HTTP status when the page resolves to an http-access fallback. Postponed iff the sub-shell kept
     // holes, mirrored as Next's `.meta` postponed marker string.
-    if (Object.keys(concreteParams).length === paramKeys.length) {
-      try {
-        const probe = await runWithWorkUnit('render', () =>
-          getRenderExtensions()
-            .collectRenderMeta(
-              () =>
-                runWithNextBuildPhase(() =>
-                  renderPageWithStatus({
-                    config,
-                    route,
-                    params: encodeStaticRouteParams(concreteParams),
-                    url,
-                  }),
-                ),
-              { route: routePath || '/', prerender: true },
-            )
-            .then(result => result.value),
-        )
-        // Dynamic metadata counts: the head resumes at request time, so the shell is partial even
-        // with zero body holes. The sub-shell render may not re-flag metadataDynamic once the
-        // fallback shell recorded it, so the route-level flag joins in. http-access fallback recovery
-        // renders a BOUNDARY file's metadata, which the shell flags never see, so the route's source
-        // graph is scanned for a dynamic generateMetadata/generateViewport too.
-        const postponed =
-          prebuilt.holes.length > 0 ||
-          prebuilt.metadataDynamic ||
-          route.pprMetadata === true ||
-          routeSourcesHaveDynamicHead(route)
-        await emitConcreteNextPageArtifacts(config, route, routePath, {
-          html: postponed ? prebuilt.shell : `${prebuilt.shell}\n  </body></html>`,
-          status: probe.status,
-          postponed,
-        })
-      } catch {
-        // Probe render failed — the sub-shell itself is unaffected.
-      }
+    try {
+      const status = await probeStatus(config, route, encodeStaticRouteParams(concreteParams), url)
+      // Dynamic metadata counts: the head resumes at request time, so the shell is partial even
+      // with zero body holes. The sub-shell render may not re-flag metadataDynamic once the
+      // fallback shell recorded it, so the route-level flag joins in. http-access fallback recovery
+      // renders a BOUNDARY file's metadata, which the shell flags never see, so the route's source
+      // graph is scanned for a dynamic generateMetadata/generateViewport too.
+      const postponed =
+        prebuilt.holes.length > 0 ||
+        prebuilt.metadataDynamic ||
+        route.pprMetadata === true ||
+        routeSourcesHaveDynamicHead(route)
+      await emitConcreteNextPageArtifacts(config, route, routePath, {
+        html: postponed ? prebuilt.shell : `${prebuilt.shell}\n  </body></html>`,
+        status,
+        postponed,
+      })
+    } catch {
+      // Probe render failed — the sub-shell itself is unaffected.
     }
   }
   subShells.sort(
     (a, b) => Object.keys(b.concreteParams).length - Object.keys(a.concreteParams).length,
   )
   if (subShells.length > 0) route.pprSubShells = subShells
+}
+
+/** A build sub-shell prerender with `concreteParams` filled; a probe persists nothing. */
+function renderBuildSubShell(
+  config: Awaited<ReturnType<typeof loadConfig>>,
+  route: RouteManifestEntry,
+  concreteParams: Record<string, RouteParamValue>,
+  options: { probeShell?: boolean; prefetchShell?: boolean } = {},
+) {
+  const routePath = fillRoutePath(route.route, concreteParams)
+  const url = new URL(`http://pnext.local${routePath}`)
+  const paramKeys = routeParamKeys(route)
+  return runWithWorkUnit('render', async () => {
+    const { value, vary } = await buildCompat().withVaryParamsTracking(() =>
+      getRenderExtensions().collectRenderMeta(
+        () =>
+          runWithNextBuildPhase(() =>
+            renderSubShell({ config, route, url, concreteParams, paramKeys, ...options }),
+          ),
+        { fetchCache: route.segmentConfig?.fetchCache, route: routePath || '/', prerender: true },
+      ),
+    )
+    return { ...value, vary }
+  })
 }
 
 /**
@@ -2364,12 +2400,6 @@ function debugBuildPathMatcher(pattern: string): (file: string) => boolean {
 }
 
 /** Stable on-disk signature for a sub-shell's concrete-param prefix. */
-function subShellKey(concrete: Record<string, RouteParamValue>): string {
-  return Object.entries(concrete)
-    .map(([k, v]) => `${k}-${(Array.isArray(v) ? v.join('_') : v).replace(/[^a-zA-Z0-9_]/g, '_')}`)
-    .join('.')
-}
-
 /**
  * Bundle the proxy/middleware file with compat server aliases baked in. Raw
  * Bun imports at request time cannot resolve bare compat specifiers

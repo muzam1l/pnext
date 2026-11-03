@@ -18,7 +18,7 @@ import {
   defaultGlobalErrorUi,
   globalErrorReportScript,
 } from '../lifecycle/error-ui'
-import { getNextConfig } from '../next/config-loader'
+import { nextExperimental } from '../next/config-loader'
 import { recordPrerenderError } from '../cache/build-prerender-errors'
 import { currentRenderCacheMeta } from '../cache/revalidate'
 
@@ -51,11 +51,10 @@ export function registerErrorExtensions(config: ResolvedConfig): void {
     wrapThrownValue,
     formatErrorLog,
     // Read lazily per call: next.config loads after registration.
-    globalNotFoundEnabled: () => nextExperimental().globalNotFound === true,
-    implicitSlotChildren: () => nextExperimental().explicitParallelRouteChildren === false,
+    globalNotFoundEnabled: () =>
+      nextExperimental<{ globalNotFound: unknown }>().globalNotFound === true,
+    implicitSlotChildren: () =>
+      nextExperimental<{ explicitParallelRouteChildren: unknown }>()
+        .explicitParallelRouteChildren === false,
   })
-}
-
-function nextExperimental(): Record<string, unknown> {
-  return (getNextConfig().experimental as Record<string, unknown> | undefined) ?? {}
 }

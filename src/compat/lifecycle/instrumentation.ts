@@ -30,8 +30,6 @@ import type { ResolvedConfig } from '../../config'
 import { resolveExternalLoadTarget } from '../../resolve/imports'
 import { compatAliases, reactServerLayerAliases } from '../aliases'
 import { nextPageExtensions } from '../next/config-loader'
-import { getOtelApi } from '../otel/api'
-import { isSandboxedMiddleware } from '../edge-runtime'
 import { productionRelease } from '../../runtime/production'
 
 /**
@@ -120,6 +118,11 @@ export function instrumentationReady(): Promise<void> {
   return readyGate ?? Promise.resolve()
 }
 
+/** Next only records spans once an instrumentation file registers a provider; without one, otel stays unloaded. */
+export function hasInstrumentation(config: ResolvedConfig): boolean {
+  return (productionRelease(config)?.instrumentation ?? findInstrumentation(config)) !== undefined
+}
+
 export function findInstrumentation(config: ResolvedConfig): string | undefined {
   for (const root of instrumentationLookupRoots(config)) {
     for (const ext of nextPageExtensions()) {
@@ -168,7 +171,7 @@ export async function emitReleaseInstrumentation(config: ResolvedConfig, outDir:
   const file = findInstrumentation(config)
   if (!file) return undefined
   const node = await releaseInstrumentation(file, config, outDir, 'instrumentation')
-  if (!appHasEdgeEntities(config)) return { file: path.relative(config.outPath, node) }
+  if (!(await appHasEdgeEntities(config))) return { file: path.relative(config.outPath, node) }
   const edge = await releaseInstrumentation(file, config, outDir, 'instrumentation.edge')
   return { file: path.relative(config.outPath, node), edge: path.relative(config.outPath, edge) }
 }
@@ -256,7 +259,7 @@ export function loadInstrumentation(config: ResolvedConfig): void {
       // eslint-disable-next-line turbo/no-undeclared-env-vars
       if (!process.env.NEXT_RUNTIME) process.env.NEXT_RUNTIME = 'nodejs'
       await registerNodeInstrumentation(config, () => importInstrumentation(file, config))
-      if (appHasEdgeEntities(config)) await runEdgeRegisterPass(file, config)
+      if (await appHasEdgeEntities(config)) await runEdgeRegisterPass(file, config)
     } catch (error) {
       console.error('instrumentation register() failed:', error)
     }
@@ -284,7 +287,8 @@ async function registerNodeInstrumentation(
     throw error
   } finally {
     const end = now()
-    const api = getOtelApi(config.root)
+    // Lazy: otel stays out of the boot graph.
+    const api = (await import('../otel/api')).getOtelApi(config.root)
     if (api) {
       const emit = (type: string, name: string, start: number, finish: number, error?: unknown) => {
         const span = api.trace.getTracer('next.js', '0.0.1').startSpan(
@@ -457,7 +461,8 @@ const EDGE_RUNTIME_RE = /\bruntime\b\s*[:=]\s*['"](?:experimental-)?edge['"]/
  * Only evaluated when an instrumentation file exists (a bounded one-time scan
  * at boot; apps without instrumentation never pay).
  */
-function appHasEdgeEntities(config: ResolvedConfig): boolean {
+async function appHasEdgeEntities(config: ResolvedConfig): Promise<boolean> {
+  const { isSandboxedMiddleware } = await import('../edge-runtime')
   const roots = [config.root, path.join(config.root, 'src')]
   for (const root of roots) {
     for (const name of ['middleware', 'proxy']) {

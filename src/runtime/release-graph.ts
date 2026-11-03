@@ -8,7 +8,6 @@ import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { readFile, readdir, rm } from 'node:fs/promises'
 import path from 'node:path'
 import type { ResolvedConfig } from '../config'
-import { getExternalPackagePolicy } from '../resolve/imports'
 import { resolveFrom } from '../resolve/engine'
 import { importMetaRefs, importSpecifiers } from '../resolve/scan-facts'
 import { splitResourceQuery } from '../utils/resource-query'
@@ -65,7 +64,6 @@ export async function linkReleaseLayer(
   const dirs = new Map(layers.map(each => [each, releaseLayerArtifactDir(config, each)] as const))
   const inLayers = (file: string) => [...dirs.values()].some(dir => isInside(dir, file))
   await readLayerModules(inLayers, roots, sources)
-  const policy = getExternalPackagePolicy()
   // A native demand is imported bare; only its packages need resolving.
   const natives = new Set(
     [...demands]
@@ -115,14 +113,6 @@ export async function linkReleaseLayer(
           : undefined
       if (!demand?.entry) continue
       const edit = { start: found.start, end: found.end, suffix }
-      // Next's built-in externals load as plain imports wherever the release resolves them as the app does.
-      if (policy.releaseExternal?.(packageName(demand.specifier) ?? '')) {
-        if (!relative) continue
-        if (resolveBare(demand.specifier, file) === realFile(demand.entry)) {
-          list.push({ ...edit, to: demand.specifier })
-          continue
-        }
-      }
       list.push({ ...edit, to: entryOf(demand) })
     }
     if (list.length > 0) edits.set(file, list)

@@ -1,15 +1,14 @@
 import { isNotFoundError, isRedirectError, type PNextRedirectError } from '../../api/navigation'
 import { runWithRequest, setPhase } from '../../request/context'
+import { getRenderSpanExtensions } from '../../render/hooks'
 import { toNextRequest } from '../../api/server'
 import { revalidationEventCount } from '../cache/revalidate'
-import { rootOtelContext } from '../otel/tracer'
 import { serializeBoundaryError } from '../lifecycle/error-serialize'
 import { runWithAfterRequestApiScope } from '../lifecycle/after-scope'
 import { lookupAction } from './registry'
 import { instanceActionRouteId, isInstanceActionId, lookupActionInstance } from './instances'
 import { inlineActionModuleKey, isInlineActionId } from './rewrite'
 import {
-  ACTION_STREAM_CONTENT_TYPE,
   createTempRefScope,
   extractTempRefs,
   isReadableStreamReturn,
@@ -34,6 +33,7 @@ import {
   ACTION_ERROR_DIGEST_HEADER,
   MASKED_ACTION_ERROR,
   MAX_ACTION_ARGS,
+  ACTION_STREAM_CONTENT_TYPE,
   tooManyArgsMessage,
   type ActionSuccessBody,
 } from './protocol'
@@ -219,9 +219,9 @@ export async function runAction(request: Request, options: RunActionOptions): Pr
       nextRequest,
       () =>
         runWithAfterRequestApiScope(true, () => {
-          const run = () => Promise.resolve(action(...args))
-          const root = rootOtelContext()
-          return root ? root.api.context.with(root.context, run) : run()
+          return getRenderSpanExtensions().withRootSpanContext(() =>
+            Promise.resolve(action(...args)),
+          )
         }),
       {},
       { responseHeaders },

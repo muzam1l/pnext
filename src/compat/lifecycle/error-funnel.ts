@@ -24,9 +24,19 @@ import {
 import { isPostpone } from '../../render/ppr'
 import { markErrorLogged } from '../../utils/error-log'
 import { getUserOnRequestError, instrumentationReady } from './instrumentation'
-import { failOnDemandPrerender, runOutsideRenderCacheMeta } from '../cache/revalidate'
+import type { AsyncLocalStorage } from 'node:async_hooks'
+import type { RenderCacheMeta } from '../cache/revalidate'
 
 const ERROR_REPORTED_KEY = Symbol.for('pnext.errorReported')
+
+// Reads revalidate.ts's shared store so the cache runtime stays off the boot graph: no store, no render.
+function failOnDemandPrerender() {
+  const shared = (
+    globalThis as Record<symbol, { cacheMetaStorage?: AsyncLocalStorage<RenderCacheMeta> }>
+  )[Symbol.for('pnext.compat.revalidateGlobals')]
+  const meta = shared?.cacheMetaStorage?.getStore()
+  if (meta?.onDemandPrerender) meta.noStore = true
+}
 
 /** True for Next control-flow errors that must NOT be reported to the hook. */
 function isControlFlowError(error: unknown): boolean {
@@ -262,6 +272,7 @@ export async function reportRequestErrorToUser(
     : buildContext(error, context, path)
 
   try {
+    const { runOutsideRenderCacheMeta } = await import('../cache/revalidate')
     // The hook is not part of the render: its fetches skip the render's GET dedupe and cache meta.
     await runOutsideCacheScope(() =>
       runOutsideRenderCacheMeta(() =>

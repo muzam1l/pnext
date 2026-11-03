@@ -56,19 +56,21 @@ import {
   shouldRenderMetadataInBody,
 } from '../metadata'
 import { aliasGenerateStaticParams } from '../static-params'
-import { resolveParamMatching } from './build'
 import { paramPromotion } from '../static-params'
-import { getNextConfig } from '../next/config-loader'
+import { getNextConfig, nextExperimental } from '../next/config-loader'
 import { withSyncProps } from '../next/legacy-request-apis'
 import { renderServerInsertedHTML, setServerInsertedHTMLScope } from '../react/server-inserted-html'
 import { nextClientRouteState } from '../next/route-state'
 import { earlySubmitCaptureScript } from '../actions/early-submit'
 import { getWorkUnit, legacyRequestAPIs } from '../../request/context'
+import { readSourceSync } from '../../resolve/source-text'
+import { recordPrerenderError } from '../cache/build-prerender-errors'
 import {
   createVaryParamsAccumulator,
   createVaryingParams,
   createVaryingSearchParams,
   normalizeOptionalCatchAllParams,
+  markSearchAccessOnAwait,
 } from '../segment/vary-params'
 import type { VaryParamsTrackingContext } from '../../extensions'
 
@@ -114,7 +116,34 @@ export function registerRenderExtensions(config: ResolvedConfig): void {
       shouldRenderMetadataInBody,
       slotHead: nextSlotHead,
     })
-    setStaticParamsExtensions({ normalizeModule: aliasGenerateStaticParams, resolveParamMatching })
+    // Validation and policy resolution run at build or on an on-demand render; the modules load then.
+    setStaticParamsExtensions({
+      normalizeModule: aliasGenerateStaticParams,
+      resolveParamMatching: (...args) =>
+        import('./build').then(m => m.resolveParamMatching(...args)),
+      validateResult: async (config, route, file, result, checkComplete) => {
+        if (!nextCompatEnabled(config)) return
+        const { validateGeneratedStaticParams } = await import('../validation/validate')
+        try {
+          void validateGeneratedStaticParams(
+            config,
+            { ...route, file },
+            readSourceSync(file) ?? '',
+            result,
+            checkComplete,
+          )
+        } catch (error) {
+          // The CLI prints a validation error once.
+          if ((error as Error).name === 'PnextBuildValidationError') throw error
+          recordPrerenderError({
+            kind: 'validation',
+            route: route.route || '/',
+            consoleBlock: (error as Error).message,
+          })
+          throw error
+        }
+      },
+    })
     setRenderExtensions({
       streamingPromise: {
         shouldAwait: isCacheJoiner,
@@ -127,6 +156,7 @@ export function registerRenderExtensions(config: ResolvedConfig): void {
       paramPromotion,
       clientRouteState: nextClientRouteState,
       trackVaryParams: trackRenderVaryParams,
+      trackHangingSearchParams: markSearchAccessOnAwait,
       legacySyncProps: withSyncProps,
       // Next asserts structural selectors (`body > p`) against the live DOM, so
       // island hosts and the page slot travel as comment pairs and the inline
@@ -144,7 +174,7 @@ export function registerRenderExtensions(config: ResolvedConfig): void {
     })
     setDocumentScriptExtensions({
       documentBodyScripts: cfg =>
-        `${flightDataBootstrapScript()}${renderPartytownHeadScripts()}${basePathScript(cfg.basePath)}${trailingSlashScript(cfg.trailingSlash)}${skipTrailingSlashScript(cfg.skipTrailingSlashRedirect)}${staleTimesScript()}${segmentSchedulerScript()}${legacySyncPropsScript()}${appShellsScript()}${optimisticRoutingScript()}${nextRouterShimScript()}<script>${earlySubmitCaptureScript()}</script>${fontPreloadDomScript()}`,
+        `${flightDataBootstrapScript()}${renderPartytownHeadScripts()}${basePathScript(cfg.basePath)}${trailingSlashScript(cfg.trailingSlash)}${skipTrailingSlashScript(cfg.skipTrailingSlashRedirect)}${staleTimesScript()}${segmentSchedulerScript()}${legacySyncPropsScript()}${optimisticRoutingScript()}${nextRouterShimScript()}<script>${earlySubmitCaptureScript()}</script>${fontPreloadDomScript()}`,
       documentHeadTags: cfg =>
         `${polyfillsScript(cfg)}${fontSizeAdjustMeta()}${renderServerInsertedHTML()}`,
       streamInsertedHTML: renderServerInsertedHTML,
@@ -233,9 +263,7 @@ function needsInlineSuspenseStream(input: {
 // Inline script exposing experimental.staleTimes so the client prefetch cache
 // honors config overrides (defaults 30s dynamic / 300s static apply otherwise).
 function staleTimesScript(): string {
-  const experimental = getNextConfig().experimental as
-    { staleTimes?: { dynamic?: number; static?: number } } | undefined
-  const staleTimes = experimental?.staleTimes
+  const { staleTimes } = nextExperimental<{ staleTimes: { dynamic?: number; static?: number } }>()
   if (!staleTimes) return ''
   return `<script>window.__PNEXT_STALE_TIMES__=${JSON.stringify(staleTimes)};</script>`
 }
@@ -253,10 +281,6 @@ function segmentSchedulerScript(): string {
     : `<script>window.__PNEXT_SEGMENT_SCHEDULER__=false;</script>`
 }
 
-// `experimental.appShells`: the client fires a SECOND, param-stripped prefetch
-// per params-reading route to prime that route's shared App Shell (compat/
-// client/segment-prefetch.ts). Strictly opt-in — without the flag the extra
-// request would break the request-count contracts of every other suite.
 // Under compat.next.legacyRequestAPIs the server's params/searchParams promises also carry the
 // resolved object's own keys (withSyncProps). Those keys cannot travel on the wire, so the client
 // rebuilds them - but only if it knows the surface existed, or a strict app would grow one.
@@ -264,20 +288,12 @@ function legacySyncPropsScript(): string {
   return legacyRequestAPIs() ? `<script>window.__PNEXT_SYNC_PROPS__=1;</script>` : ''
 }
 
-function appShellsScript(): string {
-  const experimental = getNextConfig().experimental as { appShells?: unknown } | undefined
-  return experimental?.appShells === true
-    ? `<script>window.__PNEXT_APP_SHELLS__=true;</script>`
-    : ''
-}
-
 // `experimental.optimisticRouting` defaults ON, so this is an OPT-OUT marker:
 // only an app that explicitly disabled it stamps the document, and the client
 // segment cache then stops letting one URL's entry satisfy another URL's
 // PREFETCH (compat/client/segment-cache.ts). Navigation reuse is unaffected.
 function optimisticRoutingScript(): string {
-  const experimental = getNextConfig().experimental as { optimisticRouting?: unknown } | undefined
-  return experimental?.optimisticRouting === false
+  return nextExperimental<{ optimisticRouting: unknown }>().optimisticRouting === false
     ? `<script>window.__PNEXT_NO_OPTIMISTIC_ROUTING__=true;</script>`
     : ''
 }

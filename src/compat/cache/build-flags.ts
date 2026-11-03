@@ -82,18 +82,9 @@ export function servedBuildFlags(): BuildFlags | undefined {
 
 // Centralized error factories for cached function and revalidation misuse. State the scope and constraint, explain non-obvious boundaries, give the immediate fix, then link to the relevant docs.
 
-type BuildTimeGeneratorName = 'generateStaticParams' | 'unstable_generateParamMatching'
-
 const NEXT_REQUEST_IN_USE_CACHE = 'https://nextjs.org/docs/messages/next-request-in-use-cache'
 
 const UNSTABLE_CACHE_API_DOCS = 'https://nextjs.org/docs/app/api-reference/functions/unstable_cache'
-
-const USE_CACHE_PRIVATE_API_DOCS =
-  'https://nextjs.org/docs/app/api-reference/directives/use-cache-private'
-
-const CACHE_TAG_OUTSIDE_USE_CACHE = 'https://nextjs.org/docs/messages/cache-tag-outside-use-cache'
-
-const CACHE_LIFE_OUTSIDE_USE_CACHE = 'https://nextjs.org/docs/messages/cache-life-outside-use-cache'
 
 const USE_CACHE_PRIVATE_COMPOSITION =
   'https://nextjs.org/docs/messages/use-cache-private-composition'
@@ -141,30 +132,9 @@ export function createConnectionInPublicUseCacheError(route: string): Error {
   )
 }
 
-export function createConnectionInPrivateUseCacheError(route: string): Error {
-  return new Error(
-    `Route "${route}": \`connection()\` can't be called inside \`"use cache: private"\` because private cached functions may run during prefetching, without a navigation request. Call it outside the cached function.\nLearn more: ${USE_CACHE_PRIVATE_API_DOCS}`,
-  )
-}
-
 export function createConnectionInUnstableCacheError(route: string): Error {
   return new Error(
     `Route "${route}": \`connection()\` can't be called inside \`unstable_cache()\` because cached functions may run during prerendering, without an incoming request. Call it outside the cached function.\nLearn more: ${UNSTABLE_CACHE_API_DOCS}`,
-  )
-}
-
-export function createRouteHandlerRequestInUseCacheError(route: string, expression: string): Error {
-  return new Error(
-    `Route "${route}": \`${expression}\` can't be read inside \`"use cache"\`. Read it outside the cached function and pass what you need as an argument.\nLearn more: ${NEXT_REQUEST_IN_USE_CACHE}`,
-  )
-}
-
-export function createRouteHandlerRequestInUnstableCacheError(
-  route: string,
-  expression: string,
-): Error {
-  return new Error(
-    `Route "${route}": \`${expression}\` can't be read inside \`unstable_cache()\`. Read it outside the cached function and pass what you need as an argument.\nLearn more: ${UNSTABLE_CACHE_API_DOCS}`,
   )
 }
 
@@ -174,15 +144,6 @@ export function createRouteHandlerRequestInUnstableCacheError(
 export function createDraftModeMutationInUseCacheError(route: string, expression: string): Error {
   return new Error(
     `Route "${route}": \`${expression}\` can't be called inside \`"use cache"\`. Draft mode can be read inside a cached function, but enabling or disabling it must happen outside.\nLearn more: ${NEXT_REQUEST_IN_USE_CACHE}`,
-  )
-}
-
-export function createDraftModeMutationInUnstableCacheError(
-  route: string,
-  expression: string,
-): Error {
-  return new Error(
-    `Route "${route}": \`${expression}\` can't be called inside \`unstable_cache()\`. Draft mode can be read inside a cached function, but enabling or disabling it must happen outside.\nLearn more: ${UNSTABLE_CACHE_API_DOCS}`,
   )
 }
 
@@ -198,33 +159,7 @@ export function createRevalidateInCachedFunctionError(route: string, expression:
   )
 }
 
-export function createRevalidateInBuildTimeGeneratorError(
-  route: string,
-  expression: string,
-  generatorName: BuildTimeGeneratorName,
-): Error {
-  return new Error(
-    `Route "${route}": \`${expression}\` can't be called inside \`${generatorName}\`. Call it from a Server Action or Route Handler instead.\nLearn more: ${REVALIDATE_IN_USE_CACHE}`,
-  )
-}
-
 // Cache configuration and nesting
-
-function routePrefix(route: string | undefined): string {
-  return route === undefined ? '' : `Route "${route}": `
-}
-
-export function createCacheTagOutsideUseCacheError(route: string | undefined): Error {
-  return new Error(
-    `${routePrefix(route)}\`cacheTag()\` can only be called inside a \`"use cache"\` or \`"use cache: private"\` function.\nLearn more: ${CACHE_TAG_OUTSIDE_USE_CACHE}`,
-  )
-}
-
-export function createCacheLifeOutsideUseCacheError(route: string | undefined): Error {
-  return new Error(
-    `${routePrefix(route)}\`cacheLife()\` can only be called inside a \`"use cache"\` or \`"use cache: private"\` function.\nLearn more: ${CACHE_LIFE_OUTSIDE_USE_CACHE}`,
-  )
-}
 
 export function createNestedCacheZeroRevalidateError(
   route: string,

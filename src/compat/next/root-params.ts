@@ -117,21 +117,19 @@ export function rootParam<T = string | string[] | undefined>(name: string): Prom
   accumulateRootVaryParam(name)
   const error = rootParamContextError(name)
   if (error) return Promise.reject(error)
-  // A runtime-prefetch prerender renders against the REAL sampled request, so root params are concrete
-  // there (root params are always available in a static prerender, so a runtime prefetch has them too).
-  // Hanging them would postpone the ROOT LAYOUT itself - the whole document, not a boundary - so the
-  // render would produce no shell at all.
+  const value = currentUseCacheRootParams()[name]
+  // A prerender without this param (the route-level shell, an unfilled fallback param) hangs it: the
+  // read becomes a request-time hole. A runtime prefetch samples a real request, so it always resolves.
   if (
     !insideUseCacheProducer() &&
     cacheComponents() &&
     isPrerendering() &&
-    !isRuntimePrefetchPrerender()
+    !isRuntimePrefetchPrerender() &&
+    (isUnfilledShellParam(name) || value === undefined)
   ) {
     return hangingPromise<T>(`rootParam(${name})`, RUNTIME_PARAMS)
   }
-  // An unfilled fallback-shell root param hangs: its cache fill becomes a request-time hole.
   if (isUnfilledShellParam(name)) return hangingPromise<T>(`rootParam(${name})`, RUNTIME_PARAMS)
-  const value = currentUseCacheRootParams()[name]
   return Promise.resolve((Array.isArray(value) && value.length === 0 ? undefined : value) as T)
 }
 

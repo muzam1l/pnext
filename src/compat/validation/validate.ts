@@ -19,20 +19,13 @@ import path from 'node:path'
 import { workspaceRootInfo } from '../../resolve/package-json'
 import { devServerModuleHref } from '../../runtime/load'
 import { setNavigationPrerenderRoutes } from '../cache/build-prerender-errors'
-import { pageSegmentNames } from '../cache/use-cache-transform'
+import { segmentNames } from '../cache/use-cache-transform'
 import { readSourceSync } from '../../resolve/source-text'
 import type { ResolvedConfig } from '../../config'
 import { extraPageExtensions } from '../../extensions'
 import type { RouteManifestEntry } from '../../types'
 import { legacyRequestAPIs } from '../../request/context'
-import {
-  generatedStaticParamsEmptyMessage,
-  generatedStaticParamsIncompleteMessage,
-  generatedStaticParamsInvalidEntryMessage,
-  generatedStaticParamsInvalidValueMessage,
-  generatedStaticParamsRequiredParams,
-  generatedStaticParamsValueType,
-} from '../../render/renderer'
+import { routeParamKeys } from '../../render/renderer'
 import { getNextConfig } from '../next/config-loader'
 import { isPNextRuntimeFile } from '../bundler/webpack-loaders'
 import { unrenderableSlots } from '../../routing/slots'
@@ -49,6 +42,11 @@ import {
   dynamicForceDynamicWithExportMessage,
   forceDynamicPageWithExportMessage,
   exportPathMapWithAppDirMessage,
+  generatedStaticParamsEmptyMessage,
+  generatedStaticParamsIncompleteMessage,
+  generatedStaticParamsInvalidEntryMessage,
+  generatedStaticParamsInvalidValueMessage,
+  generatedStaticParamsValueType,
   incompatibleCacheComponentsSegmentConfigMessage,
   missingDefaultParallelRouteMessage,
   missingGenerateStaticParamsForExportMessage,
@@ -57,21 +55,11 @@ import {
   routeHandlerNotStaticWithExportMessage,
   undefinedDefaultExportMessage,
   unresolvedCodemodCommentMessage,
+  PnextBuildValidationError,
 } from './errors'
 
 const BASE_PAGE_EXTENSIONS = ['tsx', 'ts', 'jsx', 'js', 'mjs'] as const
 const navigationStaticRoutes = new Set<string>()
-
-/**
- * A build-error the validation pass surfaces. Carries only Next's message; the
- * build's catch surfaces `.message` to stderr, where the harness greps it.
- */
-export class PnextBuildValidationError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = 'PnextBuildValidationError'
-  }
-}
 
 /**
  * Run source-only validation checks; throws PnextBuildValidationError on the first
@@ -453,7 +441,7 @@ function validateNavigationStaticParams(
   policies: Record<string, unknown>[],
 ): void {
   const page = nextPagePath(route)
-  const required = generatedStaticParamsRequiredParams(route)
+  const required = routeParamKeys(route)
   const matching: Record<string, string> = {}
   for (const name of required) {
     const modes = new Set(policies.map(policy => policy[name]).filter(mode => mode !== undefined))
@@ -579,7 +567,7 @@ function validateUseCacheHangingInputs(routes: RouteManifestEntry[]): void {
     // function's call sites. A value produced by ANOTHER cached function resolves from the cache
     // during the prerender, so only calls into uncached code count.
     const cachedNames = new Set(scoped.map(scope => scope.name).filter(name => name !== ''))
-    // A REQUEST-BOUND promise (`cookies()`, `headers()`, a `next/root-params` accessor) is not a
+    // A REQUEST-BOUND or stage promise (`cookies()`, a `next/root-params` accessor, `prefetch()`) is not a
     // hanging input either: such a page never statically prerenders - the request API postpones the
     // boundary and the route builds as runtime-prefetchable/dynamic - so the fill resolves from
     // request data instead of hanging.
@@ -610,7 +598,7 @@ function validateUseCacheSearchParams(routes: RouteManifestEntry[]): void {
     // body is an ordinary dynamic read.
     const scoped = useCacheScopedSource(source).filter(scope => scope.kind !== 'private')
     // An own `searchParams` param is a legal vary key, except a page segment's request prop.
-    const segments = pageSegmentNames(source, route.file)
+    const segments = segmentNames(source, route.file)
     const violates = scoped.some(scope => {
       const params = new Set(scope.params)
       return awaitedIdentifiers(scope.body).some(
@@ -682,7 +670,7 @@ function validateStaticImageImports(config: ResolvedConfig, routes: RouteManifes
         if (!specifier.startsWith('.')) continue
         if (existsSync(path.resolve(path.dirname(file), specifier))) continue
         throw new PnextBuildValidationError(
-          `Module not found: Can't resolve '${specifier}'\n./app/${appDirRelativeFile(config, file)}`,
+          `Module not found: Can't resolve '${specifier}'\n./${appPath(config, file)}`,
         )
       }
     }
@@ -738,8 +726,6 @@ function hasBabelConfig(root: string): boolean {
 }
 
 function warnMultipleLockfiles(root: string): void {
-  // A configured `outputFileTracingRoot` is authoritative — Next stays silent.
-  if (typeof getNextConfig().outputFileTracingRoot === 'string') return
   const { lockfiles, boundary } = workspaceRootInfo(root)
   if (boundary) {
     const reason =
@@ -917,15 +903,15 @@ function validateCacheComponentsSegmentConfigs(
         for (const other of routes) {
           if (other.kind !== 'page') continue
           if (!other.sourceFiles.includes(file)) continue
-          importers.add(`./app/${appDirRelativeFile(config, other.file)}`)
+          importers.add(`./${appPath(config, other.file)}`)
         }
-        const layoutRel = `./app/${appDirRelativeFile(config, file)}`
+        const layoutRel = `./${appPath(config, file)}`
         for (const importer of [...importers].sort()) {
           trace += `\n\nImport trace for requested module:\n${importer}\n${layoutRel}`
         }
       }
       failures.push(
-        `./app/${appDirRelativeFile(config, file)}\n` +
+        `./${appPath(config, file)}\n` +
           incompatibleCacheComponentsSegmentConfigMessage(earliest.key) +
           trace,
       )
@@ -1031,13 +1017,13 @@ function validateUseCacheDirectives(config: ResolvedConfig, routes: RouteManifes
       for (const directive of useCacheDirectives(source)) {
         if (!enabled) {
           throw new PnextBuildValidationError(
-            useCacheNotEnabledBuildError(`./app/${appDirRelativeFile(config, file)}`, source),
+            useCacheNotEnabledBuildError(`./${appPath(config, file)}`, source),
           )
         }
         const kind = directive.kind
         if (!kinds.has(kind)) {
           throw new PnextBuildValidationError(
-            unknownCacheKindBuildError(`./app/${appDirRelativeFile(config, file)}`, source, kind),
+            unknownCacheKindBuildError(`./${appPath(config, file)}`, source, kind),
           )
         }
       }
@@ -1058,7 +1044,7 @@ function isProjectSourceFile(projectRoot: string, file: string): boolean {
 export function useCacheDirectives(source: string): { kind: string }[] {
   const directives = [
     ...directivePrologue(source, 0),
-    ...functionBodies(source).flatMap(offset => directivePrologue(source, offset)),
+    ...functionScopes(source).flatMap(scope => directivePrologue(source, scope.offset)),
   ]
   return directives.flatMap(value => {
     const match = /^use cache(?:\s*:\s*([\w-]+))?$/.exec(value)
@@ -1198,7 +1184,7 @@ function isUncachedPromiseExpression(
 function requestApiNames(source: string): Set<string> {
   const names = new Set<string>()
   const imports = source.matchAll(
-    /\bimport\s*\{([^}]*)\}\s*from\s*['"]next\/(?:headers|root-params)['"]/g,
+    /\bimport\s*\{([^}]*)\}\s*from\s*['"]next\/(?:headers|root-params|cache)['"]/g,
   )
   for (const match of imports) {
     for (const clause of match[1]!.split(',')) {
@@ -1281,13 +1267,13 @@ function staticParamsLiteral(source: string): StaticParamsLiteral | undefined {
   if (declaration?.index === undefined) return undefined
   const bodyStart = declaration.index + declaration[0].length
   const body = source.slice(bodyStart, functionBodyEnd(source, bodyStart))
-  const returned = /\breturn\s+([^;\n]+)/.exec(body)
+  const returned = /\breturn\s+([^;]+)/.exec(body)
   if (returned?.index === undefined) return undefined
   let expression = returned[1]!.trim()
   let expressionIndex = bodyStart + returned.index + returned[0].indexOf(returned[1]!)
   if (/^[A-Za-z_$][\w$]*$/.test(expression)) {
     const binding = new RegExp(
-      `\\b(?:const|let|var)\\s+${escapeRegExp(expression)}(?:\\s*:[^=;]+)?\\s*=\\s*(\\[[^;\\n]*\\])`,
+      `\\b(?:const|let|var)\\s+${escapeRegExp(expression)}(?:\\s*:[^=;]+)?\\s*=\\s*(\\[[^;]*\\])`,
     ).exec(body.slice(0, returned.index))
     if (binding?.index === undefined) return undefined
     // Any other use (push, reassignment, spread) means the literal is not what returns.
@@ -1352,7 +1338,7 @@ function validateNonEmptyStaticParams(config: ResolvedConfig, routes: RouteManif
     const before = source.slice(0, index)
     const line = before.split('\n').length
     const column = index - before.lastIndexOf('\n')
-    const displayPath = `app/${appDirRelativeFile(config, route.file)}`
+    const displayPath = appPath(config, route.file)
     throw new PnextBuildValidationError(
       'When using Cache Components, all `generateStaticParams` functions must return at least one result. ' +
         'This is to ensure that we can perform build-time validation that there is no other dynamic accesses that would cause a runtime error.\n\n' +
@@ -1389,7 +1375,7 @@ export function validateGeneratedStaticParams(
       const before = source.slice(0, index)
       const line = before.split('\n').length
       const column = index - before.lastIndexOf('\n')
-      const displayPath = `app/${appDirRelativeFile(config, route.file)}`
+      const displayPath = appPath(config, route.file)
       throw new PnextBuildValidationError(
         'When using Cache Components, all `generateStaticParams` functions must return at least one result. ' +
           'This is to ensure that we can perform build-time validation that there is no other dynamic accesses that would cause a runtime error.\n\n' +
@@ -1404,7 +1390,7 @@ export function validateGeneratedStaticParams(
     }
   }
   if (checkComplete && navigationStaticRoutes.has(route.file)) {
-    const required = generatedStaticParamsRequiredParams(route)
+    const required = routeParamKeys(route)
     for (const params of result) {
       const values = params as Record<string, unknown> | null | undefined
       const missing = required.filter(name => values?.[name] === undefined)
@@ -1416,7 +1402,7 @@ export function validateGeneratedStaticParams(
     }
   }
   if (getNextConfig().output !== 'export' || !checkComplete) return
-  const required = generatedStaticParamsRequiredParams(route)
+  const required = routeParamKeys(route)
   for (const [index, params] of result.entries()) {
     if (!params || typeof params !== 'object' || Array.isArray(params)) {
       throw new PnextBuildValidationError(
@@ -1547,10 +1533,6 @@ function directivePrologue(source: string, offset: number): string[] {
     }
     directives.push(value)
   }
-}
-
-function functionBodies(source: string): number[] {
-  return functionScopes(source).map(scope => scope.offset)
 }
 
 /**
@@ -1856,7 +1838,7 @@ function pageExtensions(): string[] {
 
 function validateAppPagesConflict(config: ResolvedConfig): void {
   const pagesDir = pagesDirFor(config)
-  if (!pagesDir || !existsSync(pagesDir)) return
+  if (!existsSync(pagesDir)) return
   const pagePaths = collectPagesRouterPaths(pagesDir)
   if (pagePaths.size === 0) return
   const appPaths = collectAppRouterPaths(path.join(config.root, 'app'))
@@ -1873,7 +1855,7 @@ function validateAppPagesConflict(config: ResolvedConfig): void {
 }
 
 /** The pages/ directory sibling to the resolved app/ directory, if any. */
-function pagesDirFor(config: ResolvedConfig): string | undefined {
+function pagesDirFor(config: ResolvedConfig): string {
   return path.join(config.root, 'pages')
 }
 
@@ -2091,14 +2073,10 @@ function validateSearchParamsSuspense(
     // This shape uses useSyncExternalStore's server snapshot to render a stable
     // shell, then fills the URLSearchParams instance after hydration.
     if (/\buseSyncExternalStore\s*\(/.test(stripped)) continue
-    if (!usesSearchParamsHook(stripped)) continue
+    if (!/\buseSearchParams\s*\(/.test(stripped)) continue
     if (fileTreeHasSuspense(config, route)) continue
     throw new PnextBuildValidationError(missingSuspenseWithCsrBailoutMessage(route.route || '/'))
   }
-}
-
-function usesSearchParamsHook(searchable: string): boolean {
-  return /\buseSearchParams\s*\(/.test(searchable)
 }
 
 /**

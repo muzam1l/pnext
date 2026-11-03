@@ -1,6 +1,4 @@
-import { ACTION_REDIRECT_HEADER } from './protocol'
-
-export const ACTION_FLIGHT_CONTENT_TYPE = 'text/x-component'
+import { ACTION_FLIGHT_CONTENT_TYPE, ACTION_REDIRECT_HEADER } from './protocol'
 
 export interface ActionFlightPayload {
   a?: unknown
@@ -15,6 +13,7 @@ export interface CreateActionFlightResponseOptions {
   actionHeaders: Headers
   redirect?: string
   redirectType?: string
+  data?: unknown
 }
 
 export function actionRedirectHeaderValue(target: string, redirectType?: string): string {
@@ -27,9 +26,11 @@ export async function createActionFlightResponse({
   actionHeaders,
   redirect,
   redirectType,
+  data,
 }: CreateActionFlightResponseOptions): Promise<Response> {
   const html = await pageResponse.text()
   const payload: ActionFlightPayload = {
+    a: data,
     f: { kind: 'pnext-html', html, url: target.pathname + target.search },
     q: target.search,
     i: false,

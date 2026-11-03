@@ -37,8 +37,6 @@ interface FactsCache {
   dir: string
   /** Resolved on first use, not at install; see restart/record.ts. */
   key: () => string | undefined
-  /** Records written this process, so a repeat save does not re-serialize. */
-  written: Set<string>
 }
 
 export function installRouteFactsCache(config: ResolvedConfig) {
@@ -48,7 +46,6 @@ export function installRouteFactsCache(config: ResolvedConfig) {
   const cache: FactsCache = {
     dir: path.join(outCachePath(config.outPath), 'route-facts'),
     key: lazyRecordCacheKey(config, RECORD_VERSION),
-    written: new Set(),
   }
   setRouteFactsStore(createStore(cache))
 }
@@ -73,10 +70,7 @@ function createStore(cache: FactsCache): RouteFactsStore {
       stats.hits += 1
       // Only the stats moved (a touch, a checkout): keep the facts, record the
       // new stats so the next boot takes the O(1) path again.
-      if (revalidated !== record.files) {
-        cache.written.delete(routeId)
-        write(cache, routeId, revalidated, record.facts)
-      }
+      if (revalidated !== record.files) write(cache, routeId, revalidated, record.facts)
       return record.facts
     },
     save(routeId, facts) {
@@ -107,8 +101,7 @@ function readRecord(cache: FactsCache, routeId: string): RecordFile | undefined 
 function write(cache: FactsCache, routeId: string, files: SourceEntry[], facts: RouteFacts) {
   const key = cache.key()
   // A config that will not serialize has no key, so nothing is recorded for it.
-  if (!key || cache.written.has(routeId)) return
-  cache.written.add(routeId)
+  if (!key) return
   const contents = JSON.stringify({
     version: RECORD_VERSION,
     key,

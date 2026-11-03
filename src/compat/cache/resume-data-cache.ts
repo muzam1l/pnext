@@ -14,10 +14,10 @@
 
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
-import { deflateSync } from 'node:zlib'
 import path from 'node:path'
 import type { ResolvedConfig } from '../../config'
 import type { BuildManifest } from '../../types'
+import { nextRoutePattern } from '../../routing/match'
 import {
   getRequestExtensions,
   type PrerenderSidecarContext,
@@ -53,6 +53,8 @@ export interface ResumeDataArtifact {
    * stale the prebuilt shell.
    */
   tags?: string[]
+  /** The shell baked a cached value no record can replay (a rendered tree). */
+  partial?: true
 }
 
 function isArtifact(value: unknown): value is ResumeDataArtifact {
@@ -112,11 +114,11 @@ export async function emitResumeDataCacheMetadata(config: ResolvedConfig, manife
       routeId: route.id,
       routePath: route.route,
     })
-    if (!artifact) continue
+    if (!artifact || !(artifact.useCache.length || artifact.fetch.length || artifact.tags)) continue
     const file = path.join(
       config.root,
       '.next/server/app',
-      `${route.route.replace(/^\/+/, '') || 'index'}.meta`,
+      `${nextRoutePattern(route.route, route.catchAllOptional).replace(/^\/+/, '') || 'index'}.meta`,
     )
     if (!existsSync(file)) continue
     const meta = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>
@@ -149,6 +151,8 @@ export async function emitResumeDataCacheMetadata(config: ResolvedConfig, manife
       ),
       encryptedBoundArgs: {},
     }
+    // Build-only: node:zlib costs dev boot ~1.5ms and 1.6MB.
+    const { deflateSync } = await import('node:zlib')
     meta.postponed = `4:null${deflateSync(JSON.stringify({ store })).toString('base64')}`
     await writeFile(file, JSON.stringify(meta))
   }
@@ -165,12 +169,14 @@ export const resumeDataCacheExtension: PrerenderSidecarExtension = {
     const tags = [
       ...new Set([...(await collectUseCacheRdcTags()), ...(currentRenderCacheMeta()?.tags ?? [])]),
     ]
-    if (useCache.length === 0 && fetch.length === 0 && tags.length === 0) return undefined
+    if (useCache.length === 0 && fetch.length === 0 && tags.length === 0 && !useCache.partial)
+      return undefined
     return {
       v: 1,
-      useCache,
+      useCache: [...useCache],
       fetch,
       ...(tags.length > 0 ? { tags } : {}),
+      ...(useCache.partial ? { partial: true } : {}),
     } satisfies ResumeDataArtifact
   },
   async persist(context, artifact) {
@@ -181,9 +187,10 @@ export const resumeDataCacheExtension: PrerenderSidecarExtension = {
   },
   async seed(context) {
     const artifact = await readArtifact(context)
-    if (!artifact) return
+    if (!artifact) return true
     seedUseCacheRdcRecords(artifact.useCache, context.routePath)
     seedFetchRdcRecords(artifact.fetch, context.routePath, artifact.tags ?? [])
+    return artifact.partial !== true
   },
   async isStale(context) {
     const freshnessAt = await sidecarFreshnessAt(context)

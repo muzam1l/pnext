@@ -28,21 +28,22 @@ export const routerState: {
   fallbackPaint?: [sequence: number, at: number]
   /** Ends the clicked link's pending state; set once the runtime installs. */
   settleLink?: () => void
+  /** Wraps location broadcasts; compat runs them as a transition. */
+  locationBroadcast?: (emit: () => void) => void
+  /** Ends compat's pending `useLinkStatus` link; set once a link subscribes. */
+  clearLinkStatus?: () => void
   /** Soft navigations started so far; an action compares it across its round trip. */
-  navigationStarts: number
-  /** The settled document, snapshotted at idle when the runtime is deferred past it. */
-  settledHtml?: string
+  navigationStarts?: number
   /** Pending until every in-flight soft navigation has settled; unset when none is. */
   navigationSettled?: Promise<void>
-  /** Navigation API key of the entry current when the hub started listening for popstate. */
-  installedEntryKey?: string
+  /** Navigation API entry current when the hub started listening for popstate. */
+  hubEntry?: { key: string } | null
 } = {
   // pathname+search of the URL the router last observed. A popstate that leaves both unchanged is a
   // same-document FRAGMENT traversal - Chrome fires popstate, not just hashchange, for those - and
   // treating one as a history traversal would refetch and swap the body, remounting the live tree
   // under the user's feet.
   observedLocationKey: locationKey(),
-  navigationStarts: 0,
 }
 
 export function locationKey() {

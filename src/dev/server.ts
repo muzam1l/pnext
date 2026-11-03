@@ -62,12 +62,12 @@ import {
   matchRoute,
   materializeRouteFactsPaced,
   parseNavState,
+  resetRouteFacts,
   routeFactsResolved,
   routeFactsVersion,
   scanRoutes,
   selectRouteForRequest,
 } from '../routing/routes'
-import { writeTypegen } from '../cli/typegen'
 import { runWithCacheScope } from '../request/cache'
 import {
   finalizeResponse,
@@ -345,6 +345,7 @@ export async function startDevServer(options: DevServerOptions) {
   async function typegenInBackground() {
     const generation = routes
     try {
+      const { writeTypegen } = await import('../cli/typegen')
       await writeTypegen(config, await materializeRouteFactsPaced(generation, typegenPause))
     } catch (error) {
       if (generation === routes) logDevPreloadError('typegen', error)
@@ -368,17 +369,23 @@ export async function startDevServer(options: DevServerOptions) {
       broadcast(clients, 'css-update')
       return
     }
-    // A route's deferred facts ride on the table: a save to a source it walked must rebuild it.
-    const factsMoved = change.files.some(file =>
-      routes.some(route => routeFactsResolved(route) && route.sourceFiles.includes(file)),
-    )
-    if (structural || factsMoved) {
+    // A save re-derives only the touched routes' facts; only structural changes rescan.
+    if (structural) {
       routes = await scanRoutes(config.appPath, config.workspaceRoot)
       // Requests that landed during the scan memoized against the old entries.
       clearDevRouteBundleKeys()
       clearAppKeyed(assetBuilds, config.outPath)
       clearAppKeyed(routeCacheKeys, config.outPath)
       setDevClientRoutes(config, routes)
+    } else {
+      resetRouteFacts(
+        routes.filter(
+          route =>
+            routeFactsResolved(route) &&
+            change.files.some(file => route.sourceFiles.includes(file)),
+        ),
+        change.files,
+      )
     }
     await validateProxyFiles(config)
     proxyRunner = createProxyRunner(config)
@@ -1350,7 +1357,13 @@ async function buildDevClient(config: ResolvedConfig, route: RouteManifestEntry)
     if (nextCompatEnabled(config)) await getClientActionBundler()?.ensureArmed()
     const file =
       batchRoutes.length === 1
-        ? await buildClientEntry({ config, route, outDir, dev: true })
+        ? await buildClientEntry({
+            config,
+            route,
+            outDir,
+            dev: true,
+            actions: getClientActionBundler()?.hasActionModules(),
+          })
         : await (async () => {
             // Action usage is per-request knowledge in dev; force the action runtime like the
             // single-route dev build always did.

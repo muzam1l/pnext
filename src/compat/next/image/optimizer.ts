@@ -8,8 +8,6 @@
 
 import type { ResolvedImagesConfig } from './config'
 
-export { serveImageOptimizer } from '../../image-optimizer/optimize'
-
 const BLUR_QUALITY = 70
 
 interface SharpPipeline {

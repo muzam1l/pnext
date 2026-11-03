@@ -10,9 +10,7 @@ import {
   registerRequestInterceptors,
   registerResponseFinalizers,
 } from '../../extensions'
-import { registerRevalidationInvalidator } from '../cache/revalidate'
 import {
-  bumpSegmentRevalidationVersion,
   prefetchStaleTimeFinalizer,
   rscContentTypeFinalizer,
   rscDeploymentFinalizer,
@@ -27,9 +25,6 @@ export function registerSegmentExtensions(config: ResolvedConfig): void {
   if (registered) return
   if (!nextCompatEnabled(config)) return
   registered = true
-  registerRevalidationInvalidator(() => {
-    bumpSegmentRevalidationVersion()
-  })
   // Register the responder FIRST so `/_tree` is handled before action dispatch.
   registerRequestInterceptors(segmentPrefetchInterceptor)
   registerResponseFinalizers(

@@ -1,3 +1,5 @@
+// The vm realm Next's edge middleware runs in. Loaded on the first sandboxed middleware import or
+// release emit, so a server without edge middleware never pays for it.
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
@@ -7,104 +9,12 @@ import { pathToFileURL } from 'node:url'
 import { types } from 'node:util'
 import vm from 'node:vm'
 import type { Plugin } from 'esbuild'
-import type { ResolvedConfig } from '../config'
-import { getBundlerExtensions, serverDefineOptions } from '../extensions'
-import { productionRelease, type CompatReleaseFacts } from '../runtime/production'
-import { reinstallCustomCacheHandlerForEdge } from './cache/custom-handler'
-import { findInstrumentation } from './lifecycle/instrumentation'
-import { edgeSandbox, getOtelApi, type OtelApi } from './otel/api'
-
-type GlobalDescriptor = PropertyDescriptor | undefined
-
-export function withEdgeRuntime<T>(callback: () => T): T {
-  const globalObject = globalThis as typeof globalThis & {
-    EdgeRuntime?: string
-    process?: NodeJS.Process
-  }
-  const previousEdgeRuntime = Object.getOwnPropertyDescriptor(globalObject, 'EdgeRuntime')
-  const previousProcess = Object.getOwnPropertyDescriptor(globalObject, 'process')
-
-  Object.defineProperty(globalObject, 'EdgeRuntime', {
-    configurable: true,
-    enumerable: false,
-    writable: true,
-    value: 'edge-runtime',
-  })
-  Object.defineProperty(globalObject, 'process', {
-    configurable: true,
-    enumerable: false,
-    writable: true,
-    value: edgeProcess(globalObject.process) ?? { env: {} },
-  })
-
-  try {
-    reinstallCustomCacheHandlerForEdge()
-    const result = callback()
-    if (isThenable(result)) {
-      return Promise.resolve(result).finally(() =>
-        restore(previousEdgeRuntime, previousProcess),
-      ) as T
-    }
-    restore(previousEdgeRuntime, previousProcess)
-    return result
-  } catch (error) {
-    restore(previousEdgeRuntime, previousProcess)
-    throw error
-  }
-}
-
-/** Next's Edge runtime exposes a minimal `process`: no `emit`, and no Node `version`/`versions`. */
-function edgeProcess(current: NodeJS.Process | undefined, env?: NodeJS.ProcessEnv) {
-  if (!current) return undefined
-  return new Proxy(current, {
-    get(target, property, receiver) {
-      if (property === 'emit' || property === 'version' || property === 'versions') return undefined
-      if (property === 'env' && env) return env
-      const value: unknown = Reflect.get(target, property, receiver)
-      return typeof value === 'function' ? (value as () => unknown).bind(target) : value
-    },
-  })
-}
-
-function restore(edgeRuntime: GlobalDescriptor, process: GlobalDescriptor): void {
-  restoreProperty('EdgeRuntime', edgeRuntime)
-  restoreProperty('process', process)
-}
-
-function restoreProperty(name: 'EdgeRuntime' | 'process', descriptor: GlobalDescriptor): void {
-  if (descriptor) {
-    Object.defineProperty(globalThis, name, descriptor)
-  } else {
-    delete (globalThis as Record<string, unknown>)[name]
-  }
-}
-
-function isThenable<T>(value: T): value is T & PromiseLike<unknown> {
-  return typeof (value as { then?: unknown } | null | undefined)?.then === 'function'
-}
-
-/** Whether `file` is edge middleware run in its own realm (Next's sandbox): only OTel needs its separate registry. */
-export function isSandboxedMiddleware(config: ResolvedConfig, file: string): boolean {
-  const release = productionRelease(config)
-  if (release) return release.compat?.edgeSandbox !== undefined
-  if (
-    path.basename(file).startsWith('proxy.') ||
-    !getOtelApi(config.root) ||
-    !findInstrumentation(config)
-  )
-    return false
-  try {
-    // Lazy: the parser stays out of a production server's graph.
-    const { staticProxyConfig } =
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      require('../routing/proxy-config') as typeof import('../routing/proxy-config')
-    const literal = staticProxyConfig(file, readFileSync(file, 'utf8')) as
-      { runtime?: unknown } | undefined
-    return literal?.runtime !== 'nodejs'
-  } catch {
-    return true
-  }
-}
+import type { ResolvedConfig } from '../../config'
+import { getBundlerExtensions, serverDefineOptions } from '../../extensions'
+import { productionRelease, type CompatReleaseFacts } from '../../runtime/production'
+import { findInstrumentation } from '../lifecycle/instrumentation'
+import { edgeSandbox, type OtelApi } from '../otel/api'
+import { edgeProcess } from './index'
 
 interface SandboxBundle {
   code: string
@@ -230,16 +140,15 @@ function hostError(error: unknown): unknown {
 
 export async function emitEdgeSandbox(
   config: ResolvedConfig,
-  file: string | undefined,
+  file: string,
   outDir: string,
 ): Promise<CompatReleaseFacts['edgeSandbox']> {
-  if (!file || !isSandboxedMiddleware(config, file)) return undefined
   const instrumentation = findInstrumentation(config)
   const [proxy, instrumentationBundle] = await Promise.all([
     bundleSandboxEntry(config, file, true),
     instrumentation ? bundleSandboxEntry(config, instrumentation) : undefined,
   ])
-  const { relocateReleaseBundle } = await import('../runtime/modules')
+  const { relocateReleaseBundle } = await import('../../runtime/modules')
   await mkdir(outDir, { recursive: true })
   const emit = async (name: string, bundle: SandboxBundle) => {
     const relocated = relocateReleaseBundle(config, path.join(outDir, `${name}.mjs`), bundle.code)
@@ -262,8 +171,8 @@ async function bundleSandboxEntry(
 ): Promise<SandboxBundle> {
   // Build-side modules load here, never in a production server's static graph.
   const [{ build }, loader] = await Promise.all([
-    import('../utils/esbuild'),
-    import('../runtime/loader'),
+    import('../../utils/esbuild'),
+    import('../../runtime/loader'),
   ])
   const tsconfig = path.join(config.root, 'tsconfig.json')
   const result = await build({

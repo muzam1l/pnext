@@ -16,6 +16,8 @@ export interface ClientActionBundler {
    * that used to run inline at startup/reload now happens lazily here. Idempotent per version.
    */
   ensureArmed: () => Promise<void>
+  /** True when discovery found any `'use server'` module. */
+  hasActionModules: () => boolean
   /** True when `file` is a discovered `'use server'` module (stub it on the client). */
   isClientActionModule: (file: string) => boolean
   /** Generate the client fetch-stub source for an action module file. */

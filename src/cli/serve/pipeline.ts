@@ -28,7 +28,7 @@ import {
   releaseModuleHref,
 } from '../../runtime/production'
 import {
-  isPprShellUpgradeEligible,
+  pprShellLeavesParamHoles,
   renderGlobalNotFoundResponse,
   renderPageResponse,
   renderPageWithStatus,
@@ -106,8 +106,7 @@ export async function createRequestHandler(
   const config = options.config ?? (await loadConfig(options.root, { serve: true }))
   // Compat plugin loader: the single gated seam that populates the core
   // extension registries when compat is enabled (no-op for pure-core apps).
-  // A prod server answers the very next request, so it takes both tiers here.
-  await bootstrapCompat(config)
+  await bootstrapCompat(config, { serve: true })
   const manifestPath = buildManifestFile(config.outPath)
   // `start` reads the manifest before binding the port (a missing build must
   // still fail there, not on the first request) and hands it over.
@@ -888,15 +887,6 @@ export async function createRequestHandler(
     // requests serve it as a HIT, Next-style.
     const lazyStaticCapable =
       matched.route.kind === 'page' &&
-      // A request that can promote a fallback shell into a more specific route
-      // shell must keep re-entering the renderer: caching its first (still
-      // un-upgraded) render on disk would serve every later request as a HIT
-      // and the upgraded shell would never reach the client.
-      !isPprShellUpgradeEligible(
-        config,
-        matched.route,
-        matched.targetPath === url.pathname ? url : new URL(matched.targetPath, url),
-      ) &&
       (forceStaticRoute ||
         onDemandPrerender ||
         (!matched.route.usesRequest &&
@@ -918,10 +908,23 @@ export async function createRequestHandler(
       method === 'GET' &&
       url.search === '' &&
       pageResponse.status === 200 &&
-      (pageResponse.headers.get('content-type') ?? '').includes('text/html')
+      (pageResponse.headers.get('content-type') ?? '').includes('text/html') &&
+      // A document whose shell still hangs a param is not this URL's static page.
+      !pprShellLeavesParamHoles(
+        matched.route,
+        matched.targetPath === url.pathname ? url : new URL(matched.targetPath, url),
+      )
     ) {
       try {
-        const file = lazyStaticHtmlPath(config.outPath, url.pathname)
+        // Stored like build prerenders (decoded) unless decoding is ambiguous; lookups try both.
+        const segments = url.pathname.split('/').map(decodeURIComponent)
+        const decoded = segments.join('/')
+        const file = lazyStaticHtmlPath(
+          config.outPath,
+          decoded.includes('%') || segments.some(segment => segment.includes('/'))
+            ? url.pathname
+            : decoded,
+        )
         if (!file) throw new Error('unsafe path')
         await mkdir(path.dirname(file), { recursive: true })
         await writeFile(file, await pageResponse.clone().text())
@@ -1226,7 +1229,12 @@ function builtFileCandidates(
   // pathname arrives percent-encoded (prerender-encoding suite).
   try {
     const decoded = decodeURIComponent(trimmed)
-    if (decoded !== trimmed && !decoded.split('/').some(seg => seg === '..' || seg === '')) {
+    // A decoded `%` would let a double-encoded request answer with its single-encoded twin's file.
+    if (
+      decoded !== trimmed &&
+      !decoded.includes('%') &&
+      !decoded.split('/').some(seg => seg === '..' || seg === '')
+    ) {
       candidates.push(
         path.join(publicPath, decoded, 'index.html'),
         path.join(publicPath, `${decoded.replace(/\/+$/, '')}.html`),

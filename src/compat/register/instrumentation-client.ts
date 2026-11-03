@@ -4,7 +4,7 @@
 //   - a BUILD STEP bundles the app's instrumentation-client.(ts|js), plus next.config
 //     `instrumentationClientInject` entries in order, into `<out>/public/assets/instrumentation-client.js`.
 //     Steps run before prerendering, so statically generated documents carry the tag too.
-//   - documentHeadTags injects the `<script type="module">` loader tag - COMPOSED with whatever a previous
+//   - documentHeadTags injects the bundle's import script - COMPOSED with whatever a previous
 //     registrar installed, since setDocumentScriptExtensions overwrites per key. The orchestrator calls
 //     this AFTER registerOtelExtensions.
 //

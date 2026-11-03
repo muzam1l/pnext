@@ -13,7 +13,8 @@ import {
   isCsrBailoutPrerender,
   isPrefetchShellPrerender,
   isPrerendering,
-  isRuntimePrefetchPrerender,
+  isPrefetchOnlyRuntimePrerender,
+  markStageResolved,
   PostponeError,
 } from '../../render/ppr'
 import { fulfilledThenable, rejectedThenable } from '../react/use'
@@ -70,12 +71,14 @@ function stage(api: 'navigation' | 'prefetch', hangs: boolean): Promise<void> {
       `Route ${route} used \`${api}()\` inside ${cache}. This is not currently supported. Instead, move the "use cache" directive to a function that's called below \`await ${api}()\`, so that the cached content is deferred to the ${deferred} without caching the stage boundary itself. See more info here: https://nextjs.org/docs/messages/next-request-in-use-cache`,
     )
   }
-  return hangs ? hangingPromise<void>(`${api}()`) : fulfilledThenable()
+  if (hangs) return hangingPromise<void>(`${api}()`)
+  if (isPrerendering()) markStageResolved(api === 'navigation' ? 2 : 1)
+  return fulfilledThenable()
 }
 
 /** Defer the content after `await navigation()` to an actual navigation. */
 export function navigation(): Promise<void> {
-  return stage('navigation', isPrefetchShellPrerender() || isRuntimePrefetchPrerender())
+  return stage('navigation', isPrefetchShellPrerender() || isPrefetchOnlyRuntimePrerender())
 }
 
 /** Defer the content after `await prefetch()` out of the app shell. */

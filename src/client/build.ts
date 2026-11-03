@@ -13,7 +13,7 @@ import {
   type PluginBuild,
   type ResolveResult,
 } from 'esbuild'
-import { foldInitialChunks } from './chunk-fold'
+import type { FoldOptions } from './chunk-fold'
 import { clientEntryName } from './chunk-name'
 import { assetContentHash } from '../utils/asset-hash'
 import { clientProfile } from './profile'
@@ -92,6 +92,8 @@ interface ClientBuildOptions {
   route: RouteManifestEntry
   outDir: string
   dev?: boolean
+  /** The app has action modules: keep the action runtime even where the route's scan found none. */
+  actions?: boolean
 }
 
 interface ClientBatchBuildOptions {
@@ -462,7 +464,13 @@ function deferredDynamicExternalPlugin(): Plugin {
   }
 }
 
-export async function buildClientEntry({ config, route, outDir, dev }: ClientBuildOptions) {
+export async function buildClientEntry({
+  config,
+  route,
+  outDir,
+  dev,
+  actions,
+}: ClientBuildOptions) {
   conventionCache.clear()
   await ensureDir(outDir)
   const suspense = routeSuspenseFree(config, route) === false
@@ -472,8 +480,7 @@ export async function buildClientEntry({ config, route, outDir, dev }: ClientBui
     clientReferences: route.clientReferences,
     nextCompat: nextCompatEnabled(config),
     suspense,
-    // Single-route (dev / batch fallback) build: no app-wide action manifest here.
-    actions: true,
+    actions: actions === true || routeUsesActions(route, true),
     errorFile: routeErrorFile(config, route),
     globalErrorFile: globalErrorFile(config),
     notFoundFile: routeNotFoundFile(config, route),
@@ -1099,8 +1106,8 @@ function baseClientBuildOptions(config: ResolvedConfig, dev = false): BuildOptio
     conditions: ['browser', 'style'],
     define: {
       ...publicEnvDefines(),
-      __PNEXT_DEFER_LINKLESS_ROUTER__: 'false',
       __PNEXT_ROUTER_POLICY_SETTERS__: 'false',
+      __PNEXT_STATIC_EXPORT__: 'false',
       // compiler.define / defineServer (compat); defineServer keys fold to
       // `undefined` client-side so fallback branches stay reachable.
       ...extensions.clientDefines(),
@@ -2226,6 +2233,13 @@ function rootFromFile(file: string) {
   return path.dirname(file)
 }
 
+// The fold rides the minify flag, so dev never loads it.
+async function foldInitialChunks(options: FoldOptions) {
+  return options.buildOptions.minify
+    ? (await import('./chunk-fold')).foldInitialChunks(options)
+    : options.metafile
+}
+
 // Give every split output a payload-addressed name after its import specifiers
 // have their final values. Equal final bytes therefore collapse to one URL.
 export async function nameSharedClientChunks(outDir: string, metafile?: Metafile) {
@@ -2457,6 +2471,8 @@ function chunkDependencyGroups(names: string[], dependencies: Map<string, Set<st
 }
 
 function replaceChunkNames(source: string, renames: Map<string, string>) {
+  // An empty alternation matches at every offset: a callback per character.
+  if (renames.size === 0) return source
   const pattern = new RegExp([...renames.keys()].map(escapeRegex).join('|'), 'g')
   return source.replace(pattern, match => renames.get(match) ?? match)
 }

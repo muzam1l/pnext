@@ -10,6 +10,20 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
+import type { ResolvedConfig } from '../../config'
+import { productionRelease } from '../../runtime/production'
+
+const appRootParamsByConfig = new WeakMap<ResolvedConfig, ReadonlySet<string>>()
+
+/** The app's root params, from the production release when it recorded them, else one scan per config. */
+export function appRootParams(config: ResolvedConfig): ReadonlySet<string> {
+  let names = appRootParamsByConfig.get(config)
+  if (!names) {
+    names = new Set(productionRelease(config)?.compat?.rootParams ?? scanRootParams(config.appPath))
+    appRootParamsByConfig.set(config, names)
+  }
+  return names
+}
 
 const LAYOUT_BASENAMES = ['layout.tsx', 'layout.ts', 'layout.jsx', 'layout.js']
 

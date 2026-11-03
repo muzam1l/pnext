@@ -11,18 +11,8 @@ import { getNextConfig } from '../next/config-loader'
 import path from 'node:path'
 import type { ModularizeRule } from './modularize-imports'
 
-/** A predefined built-in set kept external server-side (Next ships this list). */
-const PREDEFINED_SERVER_EXTERNAL_PACKAGES = [
-  'sharp',
-  'sqlite3',
-  'better-sqlite3',
-  'canvas',
-  '@node-rs/argon2',
-  '@node-rs/bcrypt',
-]
-
-/** Next's `next/dist/lib/server-external-packages.jsonc`. */
-const NEXT_SERVER_EXTERNAL_PACKAGES = new Set([
+/** Next's server-external-packages.jsonc. */
+const NEXT_SERVER_EXTERNAL_PACKAGES = [
   '@alinea/generated',
   '@appsignal/nodejs',
   '@aws-sdk/client-s3',
@@ -102,7 +92,7 @@ const NEXT_SERVER_EXTERNAL_PACKAGES = new Set([
   'webpack',
   'websocket',
   'zeromq',
-])
+]
 
 function stringArray(value: unknown): string[] {
   return Array.isArray(value)
@@ -111,15 +101,17 @@ function stringArray(value: unknown): string[] {
 }
 
 /**
- * `serverExternalPackages` + the predefined built-in list: packages kept external
+ * Next's built-in list + `serverExternalPackages`, minus `transpilePackages`: packages kept external
  * (resolved from node_modules, never bundled) in the server graph.
  */
 export function serverExternalPackages(): Set<string> {
-  const config = getNextConfig()
-  return new Set([
-    ...PREDEFINED_SERVER_EXTERNAL_PACKAGES,
-    ...stringArray(config.serverExternalPackages),
-  ])
+  const transpile = new Set(transpilePackages())
+  return new Set(
+    [
+      ...NEXT_SERVER_EXTERNAL_PACKAGES,
+      ...stringArray(getNextConfig().serverExternalPackages),
+    ].filter(name => !transpile.has(name)),
+  )
 }
 
 /**
@@ -133,11 +125,6 @@ export function deploymentId(): string | undefined {
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   const fromEnv = process.env.NEXT_DEPLOYMENT_ID
   return fromEnv && fromEnv.length > 0 ? fromEnv : undefined
-}
-
-/** Next's built-in server externals, which a release keeps out of its dependency graph. */
-export function builtInServerExternalPackages(): ReadonlySet<string> {
-  return NEXT_SERVER_EXTERNAL_PACKAGES
 }
 
 /** `publicRuntimeConfig`: the subset of runtime config safe to inline into client bundles. */

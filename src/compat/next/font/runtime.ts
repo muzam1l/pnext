@@ -10,7 +10,6 @@ import { onExtensionHostReset, registerResponseFinalizers } from '../../../exten
 import { getWorkUnit } from '../../../request/context'
 import { servedRelease } from '../../../runtime/production'
 import type { MetadataLink } from '../../../types'
-import { persistFont, persistedFont } from './cache'
 import { escapeRegex } from '../../../utils/code'
 import {
   familyStack,
@@ -422,24 +421,27 @@ async function resolveFont(
  * Google stylesheet and font file to re-derive URLs whose bytes are already emitted. A build always
  * resolves for real - it owns the output directory it just emptied.
  */
+// One import site, so the server build keeps one copy of this dev-only module.
+const fontCache = () => import('./cache')
+
 async function resolveThroughCache(
   definition: FontDefinition,
   context: FontResolveContext,
   key: string,
 ): Promise<ResolvedFont> {
   if (!context.dev) return definition.resolve(context)
-  const persisted = await persistedFont(context.config, key)
-  if (persisted) return persisted
-  return resolveAndPersist(definition, context, key)
+  const { persistedFont } = await fontCache()
+  return (await persistedFont(context.config, key)) ?? resolveAndPersist(definition, context, key)
 }
 
-function resolveAndPersist(
+async function resolveAndPersist(
   definition: FontDefinition,
   context: FontResolveContext,
   key: string,
 ): Promise<ResolvedFont> {
   const resolved = definition.resolve(context)
   if (context.dev) {
+    const { persistFont } = await fontCache()
     void resolved.then(font => persistFont(context.config, key, font)).catch(() => undefined)
   }
   return resolved

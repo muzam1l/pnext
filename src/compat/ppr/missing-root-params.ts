@@ -12,36 +12,9 @@
 import type { ResolvedConfig } from '../../config'
 import type { RouteManifestEntry } from '../../types'
 import { staticParamsFor } from '../../render/renderer'
-import { PnextBuildValidationError } from '../validation/validate'
+import { nextRoutePattern } from '../../routing/match'
+import { PnextBuildValidationError } from '../validation/errors'
 import { scanRootParamsForFile } from './root-params-scan'
-
-/**
- * Convert a colon route pattern (`/:lang/blog/:slug`) to the bracket form Next
- * prints in build errors (`/[lang]/blog/[slug]`). A `*`/`+` suffix marks a
- * catch-all (`:slug*` -> `[...slug]`); a trailing `?` marks it optional
- * (`[[...slug]]`).
- */
-export function toBracketPattern(pattern: string): string {
-  return pattern
-    .split('/')
-    .map(segment => {
-      if (!segment.startsWith(':')) return segment
-      let name = segment.slice(1)
-      let optional = false
-      let catchAll = false
-      if (name.endsWith('?')) {
-        optional = true
-        name = name.slice(0, -1)
-      }
-      if (name.endsWith('*') || name.endsWith('+')) {
-        catchAll = true
-        name = name.slice(0, -1)
-      }
-      if (catchAll) return optional ? `[[...${name}]]` : `[...${name}]`
-      return `[${name}]`
-    })
-    .join('/')
-}
 
 /** The keys generateStaticParams actually enumerated for this route. */
 function providedParamKeys(allSets: Record<string, unknown>[]): Set<string> {
@@ -75,7 +48,7 @@ export async function validateRootParamsProvided(
     const missing = routeRootParams.filter(name => !provided.has(name))
     if (missing.length === 0) continue
 
-    const routePattern = toBracketPattern(route.route || '/')
+    const routePattern = nextRoutePattern(route.route || '/', route.catchAllOptional)
     if (missing.length === 1) {
       throw new PnextBuildValidationError(
         `Error: A required root parameter (${missing[0]}) was not provided in ` +

@@ -56,7 +56,7 @@ export { ViewTransition, addTransitionType } from './view-transition'
 
 // Same passthrough semantics preact/compat gives these.
 export const StrictMode = Fragment
-export const startTransition = (callback: () => void) => callback()
+export { startTransition } from './use'
 export const useDeferredValue = <T>(value: T): T => value
 export const useInsertionEffect = useLayoutEffect
 export const version = '19.0.0'

@@ -6,7 +6,7 @@ import {
   requireRequest,
   requestApiPromise as coreRequestApiPromise,
 } from '../../request/context'
-import { isHangingPromise, RUNTIME_SESSION } from '../../render/ppr'
+import { currentPrerenderScope, isHangingPromise, RUNTIME_SESSION } from '../../render/ppr'
 import { withSyncAccess } from './legacy-request-apis'
 import type { NextRequestCookies } from '../../types'
 import {
@@ -38,6 +38,9 @@ function requestApiPromise<T>(api: string, produce: () => T): Promise<T> {
     get(target, property) {
       if (property === 'then') {
         return (...args: Parameters<typeof target.then>) => {
+          // A bare `.then(fn)` derives a promise; only consuming that one postpones.
+          if (typeof args[0] === 'function' && typeof args[1] !== 'function')
+            return target.then(...args)
           const shared = observe()
           if (typeof args[0] === 'function')
             void target.then(
@@ -87,14 +90,16 @@ const HIDDEN_REQUEST_HEADERS = new Set([
   'x-nextjs-request-id',
   'x-nextjs-html-request-id',
 ])
-const readonlyHeaderViews = new WeakMap<Headers, Headers>()
+const readonlyHeaderViews = new WeakMap<object, Headers>()
 
 /**
  * headers() exposes the REQUEST headers, which Next makes read-only: append(), set() and delete() throw
  * instead of mutating. The cached view stays live while hiding framework-only headers.
  */
 function readonlyHeaders(source: Headers): Headers {
-  const cached = readonlyHeaderViews.get(source)
+  // One view per render pass, so identity-keyed memos never cross a prerender into the dynamic render.
+  const pass = currentPrerenderScope() ?? source
+  const cached = readonlyHeaderViews.get(pass)
   if (cached) return cached
 
   const visibleEntries = function* () {
@@ -141,7 +146,7 @@ function readonlyHeaders(source: Headers): Headers {
         : value
     },
   })
-  readonlyHeaderViews.set(source, view)
+  readonlyHeaderViews.set(pass, view)
   return view
 }
 

@@ -3,7 +3,13 @@ import { rewriteFacts, rewriteSpecifierLiterals } from '../../resolve/scan-facts
 import { spliceSource } from '../../runtime/module-transform'
 import { uniqueIdentifier } from '../../utils/code'
 
-export const nextDefaultImportSpecifiers = ['next/cache', 'next/offline', 'next/web-vitals']
+export const nextDefaultImportSpecifiers = [
+  'next/cache',
+  'next/client',
+  'next/compat/router',
+  'next/offline',
+  'next/web-vitals',
+]
 
 export function rewriteNextCallableRequires(
   source: string,

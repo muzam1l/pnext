@@ -8,7 +8,7 @@ import { recordRewrite } from '../protocol'
 import { recordCanonicalUrl } from '../next/canonical-url'
 import { getNextConfig, nextPageExtensions } from '../next/config-loader'
 import { activateTestProxy } from '../lifecycle/testmode'
-import { importEdgeMiddleware, isSandboxedMiddleware } from '../edge-runtime'
+import { isSandboxedMiddleware } from '../edge-runtime'
 import { legacyRequestAPIs } from '../../request/context'
 
 export function registerProxyExtensions(config: ResolvedConfig): void {
@@ -22,7 +22,9 @@ export function registerProxyExtensions(config: ResolvedConfig): void {
     validateFiles: validateNextProxyFiles,
     handlerExport: module => module.proxy ?? module.default ?? module.middleware,
     importModule: (file, load) =>
-      isSandboxedMiddleware(config, file) ? importEdgeMiddleware(config, file) : load(),
+      isSandboxedMiddleware(config, file)
+        ? import('../edge-runtime/sandbox').then(m => m.importEdgeMiddleware(config, file))
+        : load(),
     skipUrlNormalize: () => getNextConfig().skipProxyUrlNormalize === true,
     locale: proxyLocale,
     onExternalRewrite: request => activateTestProxy(request.headers),

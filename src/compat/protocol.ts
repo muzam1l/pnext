@@ -27,7 +27,7 @@ import { selectRouteForRequest } from '../routing/match'
 
 // Next's router vary tokens appended to every app-router response so a CDN
 // keys its cache on the RSC negotiation headers. Order + spelling match Next.
-const ROUTER_VARY = [
+export const ROUTER_VARY = [
   'rsc',
   'next-router-state-tree',
   'next-router-prefetch',
@@ -107,7 +107,10 @@ function applyEdgeRuntimeHeader(ctx: ResponseFinalizerContext): void {
 
 // Append `values` to the response's Vary header, preserving any existing tokens
 // (user- or middleware-set) and never duplicating (case-insensitive).
-function mergeVary(headers: Headers, values: readonly string[]): void {
+/** Interceptor responses bypass the finalizer, so they merge the router's CDN vary themselves. */
+export const mergeRouterVary = (headers: Headers): void => mergeVary(headers, ROUTER_VARY)
+
+export function mergeVary(headers: Headers, values: readonly string[]): void {
   const existing = headers.get('vary')
   const present = new Set(
     (existing ?? '')

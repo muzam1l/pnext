@@ -6,6 +6,18 @@ import type { BuildManifest, RouteManifestEntry, StaticFileMetadata } from '../t
 import { nextCompatEnabled } from './aliases'
 import { discoverStaticMetadataFiles } from '../routing/metadata-files'
 import { toPosixPath } from '../utils/fs'
+import { cacheComponents } from '../render/ppr'
+import { routeParamKeys } from '../render/renderer'
+import { nextRoutePattern } from '../routing/match'
+import { PREVIEW_MODE_ID } from './pages/api'
+import {
+  fillNextRoutePattern,
+  nextPatternRegex,
+  paramMatchingCandidates,
+  routeRootParams,
+} from './register/build'
+import { routeRuntimePrefetch } from './next/route-state'
+import { buildRootTreePrefetch, segmentMetaFile, type SegmentMeta } from './segment/tree'
 
 interface EmitMetadataRouteArtifactsContext {
   config: ResolvedConfig
@@ -26,11 +38,6 @@ export async function emitMetadataRouteArtifacts(
 ): Promise<void> {
   if (!nextCompatEnabled(ctx.config)) return
 
-  const routes = ctx.manifest.routes.filter(
-    route => route.kind === 'handler' && route.metadataRoute !== undefined,
-  )
-  if (routes.length === 0) return
-
   const outPath = ctx.config.outPath
   const outputRoots = Array.from(
     new Set([
@@ -40,6 +47,11 @@ export async function emitMetadataRouteArtifacts(
       path.resolve(process.cwd(), '.next'),
     ]),
   )
+  await writePrerenderManifests(ctx.config, outputRoots, ctx.manifest)
+  const routes = ctx.manifest.routes.filter(
+    route => route.kind === 'handler' && route.metadataRoute !== undefined,
+  )
+  if (routes.length === 0) return
   const staticFiles = ctx.manifest.staticFiles ?? {}
   const routeFilesById = staticFilesByRouteId(staticFiles)
   const appDir = path.join(ctx.config.root, ctx.config.appDir)
@@ -88,7 +100,6 @@ export async function emitMetadataRouteArtifacts(
   await emitStaticMetadataRouteTraces(outputRoots, appDir, emittedRouteDirs)
   await writeAppPathsManifest(outputRoots, routes, appDir)
   await mergeMiddlewareFunctionsManifest(outputRoots, routes, appDir, ctx.manifest.routes)
-  await writePrerenderManifests(outputRoots, ctx.manifest)
 }
 
 const prerenderAllowHeader = [
@@ -105,9 +116,13 @@ const prerenderBypass = [
   { key: 'content-type', type: 'header', value: 'multipart/form-data;.*' },
 ]
 
-async function writePrerenderManifests(outputRoots: string[], manifest: BuildManifest) {
+async function writePrerenderManifests(
+  config: ResolvedConfig,
+  outputRoots: string[],
+  manifest: BuildManifest,
+) {
   const byId = new Map(manifest.routes.map(route => [route.id, route]))
-  const entries: Record<string, unknown> = {}
+  const entries: Record<string, { srcRoute: string }> = {}
 
   for (const [relative, metadata] of Object.entries(manifest.staticFiles ?? {})) {
     const route = metadata.routeId ? byId.get(metadata.routeId) : undefined
@@ -128,6 +143,60 @@ async function writePrerenderManifests(outputRoots: string[], manifest: BuildMan
     entries[route.route] = prerenderEntry(route.route, undefined, route)
   }
 
+  const dynamicRoutes: Record<string, DynamicRouteEntry> = {}
+  const prefetchHints: Record<string, SegmentMeta['prefetchHints']> = {}
+  for (const route of cacheComponents() ? manifest.routes : []) {
+    if (route.kind !== 'page' || route.interception) continue
+    const page = nextRoutePattern(route.route, route.catchAllOptional)
+    const meta = await readJsonManifest<SegmentMeta>(segmentMetaFile(config.outPath, route.id))
+    // A route without a baked shell announces the hints its runtime tree response sends.
+    prefetchHints[page] = meta?.prefetchHints ?? {
+      hints:
+        buildRootTreePrefetch({
+          pathname: route.route,
+          isStatic: false,
+          partialPrefetching: routeRuntimePrefetch(route),
+        }).tree.h ?? 0,
+      slots: null,
+    }
+    const names = routeParamKeys(route)
+    for (const set of route.prerenderedParams ?? []) {
+      if (!names.every(name => set[name] !== undefined)) continue
+      const pathname = fillNextRoutePattern(route, set)
+      entries[pathname] ??= prerenderEntry(pathname, undefined, route)
+    }
+    const rootParams = routeRootParams(config.appPath, route)
+    for (const candidate of paramMatchingCandidates(route, rootParams)) {
+      const regex = nextPatternRegex(candidate.pathname)
+      const dynamicAt = candidate.unfilled.findIndex(
+        name => route.paramMatching?.[name] === 'dynamic',
+      )
+      const remaining = candidate.unfilled.slice(0, dynamicAt < 0 ? undefined : dynamicAt)
+      dynamicRoutes[candidate.pathname] = {
+        routeRegex: `^${regex}(?:/)?$`,
+        dataRoute: `${candidate.pathname}.rsc`,
+        dataRouteRegex: `^${regex}\\.rsc$`,
+        fallback: candidate.fallback,
+        fallbackSourceRoute: page,
+        fallbackRouteParams: candidate.unfilled.map(name => paramEntry(route, name)),
+        fallbackRootParams: candidate.unfilled.filter(name => rootParams.has(name)),
+        remainingPrerenderableParams: remaining.length
+          ? remaining.map(name => paramEntry(route, name))
+          : undefined,
+        throwOnEmptyStaticShell: candidate.validated,
+        experimentalPPR: true,
+        allowHeader: prerenderAllowHeader,
+        experimentalBypassFor: prerenderBypass,
+        ...(route.segmentConfig?.ensureStatic === 'navigation'
+          ? { _isEnsureStaticPage: true }
+          : {}),
+      }
+    }
+  }
+  // eslint-disable-next-line turbo/no-undeclared-env-vars -- Next's own debug switch
+  if (process.env.NEXT_PRIVATE_DEBUG_PARAM_MATCHING)
+    printParamMatchingDigest(entries, dynamicRoutes)
+
   for (const root of outputRoots) {
     const file = path.join(root, 'prerender-manifest.json')
     const existing = await readJsonManifest<{
@@ -143,10 +212,10 @@ async function writePrerenderManifests(outputRoots: string[], manifest: BuildMan
         {
           version: 4,
           routes: { ...(existing?.routes ?? {}), ...entries },
-          dynamicRoutes: existing?.dynamicRoutes ?? {},
+          dynamicRoutes: { ...(existing?.dynamicRoutes ?? {}), ...dynamicRoutes },
           notFoundRoutes: existing?.notFoundRoutes ?? [],
           preview: existing?.preview ?? {
-            previewModeId: 'pnext-preview-id',
+            previewModeId: PREVIEW_MODE_ID,
             previewModeSigningKey: 'pnext-preview-signing-key',
             previewModeEncryptionKey: 'pnext-preview-encryption-key',
           },
@@ -155,6 +224,84 @@ async function writePrerenderManifests(outputRoots: string[], manifest: BuildMan
         2,
       )}\n`,
     )
+    if (Object.keys(prefetchHints).length === 0) continue
+    await mkdir(path.join(root, 'server'), { recursive: true })
+    await writeFile(path.join(root, 'server', 'prefetch-hints.json'), JSON.stringify(prefetchHints))
+  }
+}
+
+interface DynamicRouteEntry {
+  fallback: string | null | false
+  fallbackSourceRoute: string
+  [key: string]: unknown
+}
+
+function paramEntry(route: RouteManifestEntry, paramName: string) {
+  const paramType =
+    paramName !== route.catchAll
+      ? 'dynamic'
+      : route.catchAllOptional
+        ? 'optional-catchall'
+        : 'catchall'
+  return { paramName, paramType }
+}
+
+/** Next's NEXT_PRIVATE_DEBUG_PARAM_MATCHING digest (build/utils.ts `printPrerenderMatchers`). */
+function printParamMatchingDigest(
+  routes: Record<string, { srcRoute: string }>,
+  dynamicRoutes: Record<string, DynamicRouteEntry>,
+) {
+  const sources = [
+    ...new Set([
+      ...Object.values(dynamicRoutes).map(route => route.fallbackSourceRoute),
+      ...Object.values(routes).map(route => route.srcRoute),
+    ]),
+  ].sort()
+  if (sources.length === 0) return
+  const dynamicSegments = (pathname: string) => pathname.match(/\[[^/]+\]/g)?.length ?? 0
+  const matchersFor = (source: string) =>
+    Object.entries(dynamicRoutes)
+      .filter(([, route]) => route.fallbackSourceRoute === source)
+      .map(([pathname, route]) => ({
+        behavior:
+          route.fallback === false
+            ? 'not-found'
+            : route.fallback === null
+              ? 'blocking'
+              : 'fallback',
+        pathname,
+      }))
+      .sort(
+        (a, b) =>
+          dynamicSegments(b.pathname) - dynamicSegments(a.pathname) ||
+          a.pathname.localeCompare(b.pathname),
+      )
+  const tree = (rows: string[]) =>
+    rows.forEach((row, index) => console.log(`  ${index === rows.length - 1 ? '└' : '├'} ${row}`))
+  console.log('Experimental parameter matching')
+  console.log('More-specific rows override broader rows for the same request.')
+  console.log()
+  for (const source of sources) {
+    const entries = [
+      ...matchersFor(source),
+      ...Object.keys(routes)
+        .filter(pathname => routes[pathname]!.srcRoute === source)
+        .sort((a, b) => a.localeCompare(b))
+        .map(pathname => ({ behavior: 'prerender', pathname })),
+    ]
+    const width = Math.max(...entries.map(({ behavior }) => behavior.length))
+    console.log(source)
+    tree(entries.map(({ behavior, pathname }) => `${behavior.padEnd(width)}  ${pathname}`))
+    console.log()
+  }
+  console.log('Emitted dynamic route patterns')
+  console.log('These are the patterns available to deployment routing metadata.')
+  console.log()
+  for (const source of sources) {
+    const patterns = matchersFor(source).map(({ pathname }) => pathname)
+    console.log(`${source} (${patterns.length})`)
+    tree(patterns)
+    console.log()
   }
 }
 
@@ -182,12 +329,12 @@ function prerenderEntry(
   metadata: StaticFileMetadata | undefined,
   route: RouteManifestEntry | undefined,
 ) {
+  // A shell without a static file carries its `use cache` lifetime on the route.
+  const life = metadata ?? route?.cacheLife
   return {
-    initialRevalidateSeconds: metadata?.revalidateSeconds ?? false,
-    ...(metadata?.expireSeconds !== undefined
-      ? { initialExpireSeconds: metadata.expireSeconds }
-      : {}),
-    srcRoute: route?.route ?? pathname,
+    initialRevalidateSeconds: life?.revalidateSeconds ?? false,
+    ...(life?.expireSeconds !== undefined ? { initialExpireSeconds: life.expireSeconds } : {}),
+    srcRoute: route ? nextRoutePattern(route.route, route.catchAllOptional) : pathname,
     dataRoute: pathname === '/' ? '/index.rsc' : `${pathname}.rsc`,
     allowHeader: prerenderAllowHeader,
     experimentalBypassFor: prerenderBypass,

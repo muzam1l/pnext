@@ -61,7 +61,12 @@ function withRouter<T>(use: (module: RouterRuntime) => T): Promise<Awaited<T>> {
   })
   // Any first use installs the full router, so it binds to the hard load before navigating away.
   return runtime.then(module => {
-    if (hubInstalled) installFull(module)
+    if (hubInstalled) {
+      hubInstalled = false
+      document.removeEventListener('click', hubLinkClick)
+      window.removeEventListener('popstate', hubPopState)
+      module.installRouterFull()
+    }
     return use(module)
   }) as Promise<Awaited<T>>
 }
@@ -98,17 +103,9 @@ export function rearmVisiblePrefetches() {
   return withRouter(module => module.rearmVisiblePrefetches())
 }
 
-// A click intercepted before the runtime lands waits for it. The wait is
-// bounded: a chunk that never arrives (offline, a failed deploy) must still
-// navigate, so the queued click falls back to a real browser navigation rather
-// than leaving the user on a dead link.
-const QUEUED_CLICK_TIMEOUT_MS = 3_000
-
-let pendingClicks: LinkClickTarget[] = []
+const pendingClicks: LinkClickTarget[] = []
 let pendingPop = false
 let hubInstalled = false
-let linkWatcher: MutationObserver | undefined
-declare const __PNEXT_DEFER_LINKLESS_ROUTER__: boolean | undefined
 let hardNavTimer: ReturnType<typeof setTimeout> | undefined
 
 function hubLinkClick(event: MouseEvent) {
@@ -116,10 +113,11 @@ function hubLinkClick(event: MouseEvent) {
   if (!target) return
   event.preventDefault()
   pendingClicks.push(target)
+  // A runtime that never lands (offline, a failed deploy) still navigates, as a hard load after 3s.
   hardNavTimer ??= setTimeout(() => {
     const queued = pendingClicks[0]
     if (queued) location.href = queued.url.href
-  }, QUEUED_CLICK_TIMEOUT_MS)
+  }, 3_000)
   void loadRuntime()
 }
 
@@ -132,22 +130,11 @@ function hubPopState() {
   void loadRuntime()
 }
 
-function installFull(module: RouterRuntime) {
-  hubInstalled = false
-  if (typeof __PNEXT_DEFER_LINKLESS_ROUTER__ !== 'undefined' && __PNEXT_DEFER_LINKLESS_ROUTER__)
-    linkWatcher?.disconnect()
-  document.removeEventListener('click', hubLinkClick)
-  window.removeEventListener('popstate', hubPopState)
-  module.installRouterFull()
-}
-
 function loadRuntime() {
   return withRouter(module => {
+    // The hub's listeners are gone by now, so nothing queues behind this drain.
     clearTimeout(hardNavTimer)
-    hardNavTimer = undefined
-    const clicks = pendingClicks
-    pendingClicks = []
-    for (const click of clicks) module.commitLinkNavigation(click)
+    for (const click of pendingClicks.splice(0)) module.commitLinkNavigation(click)
     if (pendingPop) {
       pendingPop = false
       module.onPopState()
@@ -155,50 +142,28 @@ function loadRuntime() {
   })
 }
 
-const SOFT_LINK = 'a[data-pnext-link]'
-
-// Idle load is for prefetching links. A page with none defers the runtime until a link appears or
-// something uses it, and leaves the runtime the settled document it would have read here.
-function loadWhenNavigable() {
-  const linked = () => hubInstalled && document.querySelector(SOFT_LINK) && loadRuntime()
-  if (!hubInstalled || linked()) return
-  // A reload keeps the departed document's nav state on this entry; restamp it while it is current.
-  // A host may need the runtime installed before interaction even with no link on the page.
-  if (
-    (history.state as { __pnextNavState?: unknown } | null)?.__pnextNavState ||
-    (window as { __PNEXT_EAGER_RUNTIME__?: boolean }).__PNEXT_EAGER_RUNTIME__
-  )
-    return void loadRuntime()
-  routerState.settledHtml = `<!doctype html>${document.documentElement.outerHTML}`
-  linkWatcher = new MutationObserver(linked)
-  linkWatcher.observe(document.documentElement, { childList: true, subtree: true })
-}
-
-function whenIdle(run: () => void) {
-  if (typeof requestIdleCallback === 'function') requestIdleCallback(() => run(), { timeout: 1000 })
-  else setTimeout(run, 1)
+export function whenIdle(run: () => void) {
+  // Without requestIdleCallback (Safari), setTimeout reads the options object as a zero delay.
+  const idle: (callback: () => void, options: object) => unknown =
+    globalThis.requestIdleCallback ?? setTimeout
+  idle(run, { timeout: 1000 })
 }
 
 export function installRouter() {
   if ((!process.browser && typeof window === 'undefined') || window.__PNEXT_ROUTER_INSTALLED__)
     return
   window.__PNEXT_ROUTER_INSTALLED__ = true
-  if ('scrollRestoration' in history) history.scrollRestoration = 'manual'
+  history.scrollRestoration = 'manual'
   // Seed the bfcache departing key with the hard-loaded route so the first
   // navigation away stashes this route's island state under the right key.
   // `locationKey()` IS `bfRouteKey(location.pathname, location.search)` — the
   // hub's own definition — and it is already on the first-paint graph.
   routerState.activeRouteKey = locationKey()
   // Lets the runtime tell a Back/Forward that landed before this listener from later history writes.
-  routerState.installedEntryKey = (window as { navigation?: NavigationApi }).navigation
-    ?.currentEntry?.key
+  routerState.hubEntry = (window as { navigation?: NavigationApi }).navigation?.currentEntry
 
   hubInstalled = true
   document.addEventListener('click', hubLinkClick)
   window.addEventListener('popstate', hubPopState)
-  whenIdle(
-    typeof __PNEXT_DEFER_LINKLESS_ROUTER__ !== 'undefined' && __PNEXT_DEFER_LINKLESS_ROUTER__
-      ? loadWhenNavigable
-      : loadRuntime,
-  )
+  whenIdle(loadRuntime)
 }

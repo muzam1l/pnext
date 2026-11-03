@@ -268,9 +268,9 @@ function resolveSpecifier(root: string, fromDir: string, specifier: string): str
 export function rewriteResolveAliasImports(source: string, file: string, root: string): string {
   const aliases = turbopackResolveAlias()
   if (Object.keys(aliases).length === 0) return source
-  // Bun links CJS named imports strictly: inline webpack's empty-module values for `false` aliases.
+  // Bun links CJS named imports strictly and a require() reaches ESM: inline `false` aliases' empty values.
   if (Object.values(aliases).includes(EMPTY_ALIAS_MODULE)) {
-    const { imports, reexports } = rewriteFacts(file, source)
+    const { imports, reexports, edges } = rewriteFacts(file, source)
     const edits = [...imports, ...reexports]
       .filter(statement => bareAliasTarget(statement.specifier, root) === EMPTY_ALIAS_MODULE)
       .map(statement => {
@@ -285,6 +285,14 @@ export function rewriteResolveAliasImports(source: string, file: string, root: s
           .join(' ')
         return { start: statement.start, end: statement.end, value }
       })
+    for (const edge of edges) {
+      if (edge.kind !== 'require' || bareAliasTarget(edge.specifier, root) !== EMPTY_ALIAS_MODULE)
+        continue
+      const before = /(?<![\w$.])require\s*\(\s*$/.exec(source.slice(0, edge.start))
+      const after = /^\s*\)/.exec(source.slice(edge.end))
+      if (before && after)
+        edits.push({ start: before.index, end: edge.end + after[0].length, value: '{}' })
+    }
     source = spliceSource(source, edits)
   }
   return rewriteSpecifierLiterals(source, file, (specifier, kind) => {

@@ -152,7 +152,7 @@ export async function readProductionManifest(config: ResolvedConfig): Promise<Bu
 
 // Export output is unservable; pnext production output remains serveable for standalone apps.
 async function guardUnservableOutputMode(config: ResolvedConfig) {
-  await bootstrapCompat(config)
+  await bootstrapCompat(config, { serve: true })
   const mode = getBuildExtensions().compat.nextOutputMode()
   if (mode === 'export') {
     console.error(

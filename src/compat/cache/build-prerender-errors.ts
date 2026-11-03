@@ -22,7 +22,7 @@ import {
 // prints Next's messages and aborts. Collection is armed only for a compat build's prerender pass, so
 // the serving runtime and pure-core builds are unaffected.
 
-import { staticNavigationRuntimeDiagnostic } from '../validation/prerender-diagnostics'
+import { staticNavigationRuntimeDiagnostic } from '../validation/errors'
 
 export type PrerenderErrorKind =
   | 'hanging'
@@ -31,6 +31,7 @@ export type PrerenderErrorKind =
   | 'use-cache-dynamic'
   | 'unstable-cache-dynamic'
   | 'validation'
+  | 'sync-io'
 
 export interface PrerenderError {
   kind: PrerenderErrorKind

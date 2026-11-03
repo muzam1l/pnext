@@ -9,6 +9,9 @@ import type {
   StylesheetReconciler,
 } from './types'
 
+// Compat builds always register the staleTime policy, so they drop core's header fallback.
+declare const __PNEXT_NEXT_ROUTER__: boolean | undefined
+
 // Fallback reuse window when compat did not register a staleTime policy (pure
 // core has no static/dynamic split).
 export const PREFETCH_TTL_MS = 300_000
@@ -49,6 +52,7 @@ export function setPrefetchStaleTimePolicy(policy: (ctx: PrefetchStaleContext) =
 
 export function prefetchStaleTimeMs(ctx: PrefetchStaleContext): number {
   if (prefetchStaleTimePolicy) return prefetchStaleTimePolicy(ctx)
+  if (typeof __PNEXT_NEXT_ROUTER__ !== 'undefined') return PREFETCH_TTL_MS
   // Pure core honors a server-declared window so dynamic pages can stay fresh, capped at the flat TTL.
   const header = ctx.headerStaleTimeSeconds
   return header !== undefined && Number.isFinite(header) && header >= 0
@@ -67,7 +71,8 @@ export let revalidationPrefetchDelayMs = 0
 export interface NavigationHistoryPolicy {
   start(replace: boolean): void
   push(state: Record<string, unknown>, href: string, sequence: number, silent: boolean): void
-  commit(sequence: number): void
+  /** Called once the destination mounted; settles when its history entry is committed or abandoned. */
+  commit(sequence: number): void | Promise<void>
 }
 
 export let navigationHistoryPolicy: NavigationHistoryPolicy | undefined

@@ -792,7 +792,7 @@ if (import.meta.main) {
   // This helper's stderr is forwarded to the user-facing build. The parent
   // already validated and printed next.config warnings, so avoid duplicates.
   const config = await loadConfig(root, { warnings: false })
-  await bootstrapCompat(config)
+  await bootstrapCompat(config, { serve: true })
   // Only the vercel adapter reads the specifier manifests back (its trace step);
   // a plain build would write them for nothing.
   setEmitCompiledSpecifiersManifest(mode === 'full')

@@ -38,9 +38,10 @@ export async function writeFileAtomic(file: string, contents: string, tempDirect
 export async function listFiles(root: string): Promise<string[]> {
   if (!existsSync(root)) return []
   const entries = await readdir(root, { withFileTypes: true })
+  // Sorted so every platform scans in one order.
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
   // Subdirectories are walked concurrently — a depth-first await chain spends
   // the whole walk waiting on one readdir at a time (0.6 s on a ~1k-file app).
-  // Results stay in readdir order so callers keep a stable file order.
   const branches = await Promise.all(
     entries.map(entry => {
       const entryPath = path.join(root, entry.name)

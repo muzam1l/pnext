@@ -8,3 +8,8 @@ export function outCachePath(outPath: string) {
   const owner = path.basename(outPath) === standaloneOutSegment ? path.dirname(outPath) : outPath
   return path.join(owner, 'cache')
 }
+
+/** Per-route size record `pnext analyze` and the build summary diff against. */
+export function analyzeSizesFile(outPath: string) {
+  return path.join(outCachePath(outPath), 'analyze', 'sizes.json')
+}

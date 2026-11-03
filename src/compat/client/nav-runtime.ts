@@ -14,10 +14,18 @@ import { installRouteAnnouncer } from './route-announcer'
 
 import {
   onNavigationCommit,
+  onNavigationStart,
   setNavigationScrollAction,
   withSilentLocationChange,
 } from '../../client/router/events'
 import { historyState } from '../../client/router/history'
+import { installSuspenseCatch, setSuspendHook, type SuspenseVNode } from '../react/use'
+
+// Compat builds load this module as the router runtime (register/bundler.ts).
+export * from '../../client/router/runtime-entry'
+
+declare const __PNEXT_STATIC_EXPORT__: boolean | undefined
+declare const __PNEXT_HAS_BASE_PATH__: boolean | undefined
 
 // Type-only: the setters arrive on the runtime module, so this chunk shares no module with it.
 type PolicySetters = Pick<
@@ -32,6 +40,22 @@ type PolicySetters = Pick<
   | 'setStylesheetReconciler'
 >
 
+/** Pending thenables an island root's own boundary caught: a navigation commits once they settle. */
+export const rootSuspensions = new Set<PromiseLike<unknown>>()
+
+function trackRootSuspension(error: unknown, vnode: SuspenseVNode) {
+  const thenable = error as PromiseLike<unknown> | null
+  if (typeof thenable?.then !== 'function') return
+  // The nearest Suspense; one directly under a render root is an island root's own boundary.
+  let boundary = vnode.__
+  while (boundary && !boundary.__c?.__c) boundary = boundary.__
+  if (boundary && !boundary.__?.__) {
+    rootSuspensions.add(thenable)
+    const settle = () => void rootSuspensions.delete(thenable)
+    thenable.then(settle, settle)
+  }
+}
+
 export function installNavigationHistoryPolicy(
   setNavigationHistoryPolicy: PolicySetters['setNavigationHistoryPolicy'],
 ) {
@@ -42,8 +66,11 @@ export function installNavigationHistoryPolicy(
     pendingPush = undefined
     withSilentLocationChange(() => history.replaceState(state, '', href))
   }
+  setSuspendHook(trackRootSuspension)
   setNavigationHistoryPolicy({
     start(replace) {
+      installSuspenseCatch()
+      rootSuspensions.clear()
       if (replace) pendingPush = undefined
     },
     push(state, href, sequence, silent) {
@@ -56,7 +83,16 @@ export function installNavigationHistoryPolicy(
         history.pushState(state, '', href)
       }
     },
-    commit(sequence) {
+    async commit(sequence) {
+      // Held while the destination's island roots suspend; a newer navigation ends the wait.
+      while (rootSuspensions.size && pendingPush?.sequence === sequence) {
+        let off!: () => void
+        await Promise.race([
+          Promise.allSettled([...rootSuspensions]),
+          new Promise<void>(resolve => (off = onNavigationStart(() => resolve()))),
+        ])
+        off()
+      }
       if (pendingPush?.sequence !== sequence) return
       const { href, state } = pendingPush
       pendingPush = undefined
@@ -79,7 +115,8 @@ export function installNavPolicies(router: PolicySetters) {
   // this tier lands on idle, long before one can happen.
   installRouteAnnouncer(onNavigationCommit)
   // `output: 'export'` document fetching, in place before the router's first prefetch.
-  installExportDocumentFetcher(router.setExportDocumentFetcher)
+  if (typeof __PNEXT_STATIC_EXPORT__ === 'undefined' || __PNEXT_STATIC_EXPORT__)
+    installExportDocumentFetcher(router.setExportDocumentFetcher)
   // Prefetch staleTime policy: static 300s / dynamic 0, with the
   // experimental.staleTimes override injected as window.__PNEXT_STALE_TIMES__,
   // and a response `x-nextjs-stale-time` header overriding both when present.
@@ -98,10 +135,6 @@ export function installNavPolicies(router: PolicySetters) {
   router.setStylesheetReconciler(reconcileNextStylesheets)
   // basePath boundary: a same-origin URL outside the configured basePath must
   // hard-navigate (a `basePath:false` target), not soft-swap.
-  setSoftNavBoundary(isOutsideBasePath)
-  // NOTE: the standalone segment-prefetch wire runtime (segment-prefetch.ts) is
-  // deliberately NOT installed: its intent-time tree/body fetches fed caches
-  // nothing consumed and broke Next's request-count contracts (a hover inside a
-  // "no-requests" scope must not fetch). The router's own prefetch cache +
-  // loading-shell cache cover the segment semantics on the HTML-swap model.
+  if (typeof __PNEXT_HAS_BASE_PATH__ === 'undefined' || __PNEXT_HAS_BASE_PATH__)
+    setSoftNavBoundary(isOutsideBasePath)
 }

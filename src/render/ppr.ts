@@ -22,7 +22,29 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 // (and its AsyncLocalStorage) into the browser bundle. Re-exported here so
 // every server caller keeps importing them from ppr.
 export { PostponeError, isPostpone, RUNTIME_PARAMS, RUNTIME_SESSION, RUNTIME_URL } from './postpone'
-import { isPostpone as isPostponeError, PostponeError } from './postpone'
+import {
+  isPostpone as isPostponeError,
+  PostponeError,
+  RUNTIME_PARAMS,
+  RUNTIME_SESSION,
+  RUNTIME_SHELL,
+  RUNTIME_URL,
+} from './postpone'
+import type { RouteManifestEntry } from '../types'
+
+/** `x-pnext-runtime-needed` bits (1 shell, 2 prefetch) from the RUNTIME_* data each render waited on. */
+export function runtimeNeededBits(
+  route: Pick<RouteManifestEntry, 'hasStaticParams' | 'segmentConfig'>,
+  shellRuntime: number,
+  documentRuntime = shellRuntime,
+): number {
+  const ensureStatic = route.segmentConfig?.ensureStatic
+  const urlData = RUNTIME_SESSION | RUNTIME_URL | (route.hasStaticParams ? 0 : RUNTIME_PARAMS)
+  const shell = ensureStatic === undefined && (shellRuntime & RUNTIME_SESSION) !== 0
+  const prefetch =
+    !(ensureStatic !== undefined && ensureStatic !== 'shell') && (documentRuntime & urlData) !== 0
+  return (shell ? 1 : 0) | (prefetch ? 2 : 0)
+}
 
 // The prerender scope carries an AbortController so a hanging promise whose
 // settlement microtask has not yet run stays pending once the prerender has
@@ -41,9 +63,11 @@ interface PrerenderScope {
   /**
    * Runtime-prefetch prerenders only: a runtime API (cookies/headers/params/searchParams, or a `use cache`
    * read) has been AWAITED somewhere in this render. From that point on, synchronous platform IO aborts its
-   * boundary - see runWithRuntimePrefetchSyncIoAbort.
+   * boundary - see runWithSyncIoAbort.
    */
   awaitedRuntimeApi?: boolean
+  /** The runtime stage of a live navigation: `navigation()` resolves. */
+  readonly navigationStage?: boolean
   /**
    * A prerender whose output becomes a PREFETCH shell (the body segment the client's segment cache stores),
    * NOT the document served for a direct request. Short-lived `use cache` scopes are omitted from it exactly
@@ -77,25 +101,46 @@ interface PrerenderDynamicTracker {
   dynamic: boolean
   /** RUNTIME_* bits of the postpones seen. */
   runtime: number
+  /** 1 past `prefetch()` or a param read, 2 past `navigation()`. */
+  stage: number
 }
 
 const prerenderDynamicTrackerStorage = new AsyncLocalStorage<PrerenderDynamicTracker>()
+const stagedPostpones = new WeakMap<PostponeError, number>()
 
 export async function trackPrerenderDynamic<T>(callback: () => Promise<T>): Promise<{
   value: T
   dynamic: boolean
   runtime: number
 }> {
-  const tracker: PrerenderDynamicTracker = { dynamic: false, runtime: 0 }
-  const value = await prerenderDynamicTrackerStorage.run(tracker, callback)
-  return { value, dynamic: tracker.dynamic, runtime: tracker.runtime }
+  const stage = prerenderDynamicTrackerStorage.getStore()?.stage ?? 0
+  const tracker: PrerenderDynamicTracker = { dynamic: false, runtime: 0, stage }
+  try {
+    const value = await prerenderDynamicTrackerStorage.run(tracker, callback)
+    return { value, dynamic: tracker.dynamic, runtime: tracker.runtime }
+  } catch (error) {
+    if (tracker.stage && isPostponeError(error)) stagedPostpones.set(error, tracker.stage)
+    throw error
+  }
+}
+
+// Next: past navigation() nothing needs a runtime request, past prefetch() not the shell.
+const staged = (runtime: number, stage: number) =>
+  stage > 1 ? 0 : stage || !(runtime & RUNTIME_SESSION) ? runtime : runtime | RUNTIME_SHELL
+
+export const postponeRuntime = (error: PostponeError) =>
+  staged(error.runtime, stagedPostpones.get(error) ?? 0)
+
+export function markStageResolved(stage: 1 | 2): void {
+  const tracker = prerenderDynamicTrackerStorage.getStore()
+  if (tracker && tracker.stage < stage) tracker.stage = stage
 }
 
 function markPrerenderDynamic(runtime: number): void {
   const tracker = prerenderDynamicTrackerStorage.getStore()
   if (!tracker) return
   tracker.dynamic = true
-  tracker.runtime |= runtime
+  tracker.runtime |= staged(runtime, tracker.stage)
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +194,7 @@ export function runInPrerender<T>(
   callback: () => T,
   options: {
     runtimePrefetch?: boolean
+    navigationStage?: boolean
     prefetchShell?: boolean
     taskBoundary?: boolean
     route?: string
@@ -161,6 +207,7 @@ export function runInPrerender<T>(
     signal: controller.signal,
     abort: () => controller.abort(),
     ...(options.runtimePrefetch ? { runtimePrefetch: true, awaitedRuntimeApi: false } : {}),
+    ...(options.navigationStage ? { navigationStage: true } : {}),
     ...(options.prefetchShell ? { prefetchShell: true } : {}),
     ...(options.taskBoundary ? { taskBoundary: true } : {}),
     ...(options.route !== undefined ? { route: options.route } : {}),
@@ -217,6 +264,12 @@ export function isRuntimePrefetchPrerender(): boolean {
   return prerenderStorage.getStore()?.runtimePrefetch === true
 }
 
+/** True inside a runtime prefetch that is not a navigation's runtime stage: `navigation()` hangs. */
+export function isPrefetchOnlyRuntimePrerender(): boolean {
+  const scope = prerenderStorage.getStore()
+  return scope?.runtimePrefetch === true && scope.navigationStage !== true
+}
+
 /** True inside a prefetch-shell prerender (see PrerenderScope.prefetchShell). */
 export function isPrefetchShellPrerender(): boolean {
   return prerenderStorage.getStore()?.prefetchShell === true
@@ -263,8 +316,15 @@ export function isTaskBoundaryPrerender(): boolean {
   return prerenderStorage.getStore()?.taskBoundary === true
 }
 
-const taskBoundaryArmedStorage = new AsyncLocalStorage<true>()
+// The armed cell records a boundary that lost its task deadline: its continuation is dynamic.
+const taskBoundaryArmedStorage = new AsyncLocalStorage<{ lost: boolean }>()
 const taskBoundarySuspendedStorage = new AsyncLocalStorage<true>()
+const clientRenderStorage = new AsyncLocalStorage<true>()
+
+/** Run a client-component (island) SSR pass; its sync IO is never a build error. */
+export function runInClientRender<T>(callback: () => T): T {
+  return clientRenderStorage.run(true, callback)
+}
 
 /**
  * Render `callback` with the task boundary ARMED. The renderer arms it only while resolving a <Suspense>
@@ -273,7 +333,7 @@ const taskBoundarySuspendedStorage = new AsyncLocalStorage<true>()
  * shell, matching Next, where such work escaping the root is a separate blocking-prerender concern.
  */
 export function runWithTaskBoundaryArmed<T>(callback: () => T): T {
-  return taskBoundaryArmedStorage.run(true, callback)
+  return taskBoundaryArmedStorage.run({ lost: false }, callback)
 }
 
 /**
@@ -284,6 +344,23 @@ export function runWithTaskBoundaryArmed<T>(callback: () => T): T {
  */
 export function runWithTaskBoundarySuspended<T>(callback: () => T): T {
   return taskBoundarySuspendedStorage.run(true, callback)
+}
+
+const CACHED_SUBTREE_STORAGE = Symbol.for('pnext.cachedSubtreeStorage')
+const cachedSubtreeStorage = ((globalThis as Record<PropertyKey, unknown>)[
+  CACHED_SUBTREE_STORAGE
+] ??= new AsyncLocalStorage<boolean>()) as AsyncLocalStorage<boolean>
+
+/** Resolve inside (a `'use cache'` subtree, rendered in the fill upstream) or outside (its element args). */
+export function runInCachedSubtree<T>(inside: boolean, callback: () => T): T {
+  return cachedSubtreeStorage.run(inside, callback)
+}
+
+/** Element arguments of `'use cache'` calls, swapped back into the cached output per invocation. */
+export const cacheArgumentVNodes = new WeakSet<object>()
+
+export function insideCachedSubtree(): boolean {
+  return cachedSubtreeStorage.getStore() === true
 }
 
 // compat/cache/use-cache tags both shapes of "renders inside a cache scope" with globally-registered
@@ -308,15 +385,18 @@ export function awaitAtTaskBoundary<T>(value: T): T {
   if (!isTaskBoundaryPrerender()) return value
   // Only armed inside a <Suspense> subtree (see runWithTaskBoundaryArmed), and
   // never inside a `'use cache'` subtree (runWithTaskBoundarySuspended).
-  if (taskBoundaryArmedStorage.getStore() !== true) return value
+  const armed = taskBoundaryArmedStorage.getStore()
+  if (!armed) return value
   if (taskBoundarySuspendedStorage.getStore() === true) return value
   if (typeof (value as { then?: unknown } | null)?.then !== 'function') return value
   const deadline = taskDeadline()
+  const lost = deadline.promise.catch((error: unknown) => {
+    armed.lost = true
+    throw error
+  })
   // Cancel on settle so a component that wins the race does not leave its
   // deadline burning through the rest of its microtask budget.
-  return Promise.race([value as PromiseLike<unknown>, deadline.promise]).finally(
-    deadline.cancel,
-  ) as T
+  return Promise.race([value as PromiseLike<unknown>, lost]).finally(deadline.cancel) as T
 }
 
 // Cache fills are the one kind of task-queue work a build prerender must WAIT for rather than cut off.
@@ -537,66 +617,23 @@ export function cacheComponents(): boolean {
   return (globalThis as Record<PropertyKey, unknown>)[CACHE_COMPONENTS] === true
 }
 
-// ---------------------------------------------------------------------------
-// Prerender determinism (Stage C-5).
-//
-// During a build prerender, incidental Math.random()/Date.now()/new Date() must
-// not vary or fail the build. We patch them to deterministic values for the
-// duration of a build prerender pass and restore afterwards. Build-only and
-// single-route-at-a-time, so global patching is safe; at request time the real
-// implementations run (random varies across requests). Applied only under
-// cacheComponents so the legacy path is byte-identical.
-// ---------------------------------------------------------------------------
-
-// Real wall-clock that survives the determinism patch below. Cache bookkeeping
-// (use-cache storedAt) must never be stamped with the frozen build clock — a
-// `storedAt: 0` entry reads as perpetually expired at runtime.
+// Real wall clock while Date.now is shimmed: cache bookkeeping (storedAt) must never read a shim.
 const REAL_NOW = Symbol.for('pnext.realNow')
 export function realNow(): number {
   const stored = (globalThis as Record<PropertyKey, unknown>)[REAL_NOW]
   return typeof stored === 'function' ? (stored as () => number)() : Date.now()
 }
 
-// A `use cache` body is allowed to be non-deterministic - its output is what gets cached, and Next's
-// work-unit store inside a cache scope is `cache`, not `prerender-runtime`, so
-// abortOnSynchronousPlatformIOAccess never applies there. The scope ALS is read off its globalThis symbol
-// rather than imported: ppr.ts is core and must not depend on compat/cache.
+// Sync IO inside a cache producer is legal; the compat scope ALSes are read off globalThis symbols.
 const USE_CACHE_SCOPE_STORAGE = Symbol.for('pnext.compat.useCacheScopeStorage')
+const DATA_CACHE_PRODUCER_STORAGE = Symbol.for('pnext.compat.dataCacheProducerStorage')
 
 function insideUseCacheScope(): boolean {
-  const storage = (globalThis as Record<PropertyKey, unknown>)[USE_CACHE_SCOPE_STORAGE] as
-    { getStore(): unknown } | undefined
-  return storage?.getStore() !== undefined
-}
-
-export async function runWithPrerenderDeterminism<T>(fn: () => Promise<T>): Promise<T> {
-  if (!cacheComponents()) return fn()
-  const deterministicTime = 1
-  const realRandom = Math.random
-  const RealDate = Date
-  ;(globalThis as Record<PropertyKey, unknown>)[REAL_NOW] = RealDate.now.bind(RealDate)
-  let counter = 0
-  Math.random = () => {
-    counter = (counter * 1103515245 + 12345) & 0x7fffffff
-    return (counter % 1000000) / 1000000
-  }
-  const PatchedDate = function (this: unknown, ...args: unknown[]) {
-    if (!new.target) return new RealDate(deterministicTime).toString()
-    if (args.length === 0) return new RealDate(deterministicTime)
-    return Reflect.construct(RealDate, args) as Date
-  } as unknown as DateConstructor
-  Object.setPrototypeOf(PatchedDate, RealDate)
-  Object.defineProperty(PatchedDate, 'prototype', { value: RealDate.prototype })
-  PatchedDate.now = () => deterministicTime
-  // eslint-disable-next-line no-global-assign
-  Date = PatchedDate
-  try {
-    return await fn()
-  } finally {
-    Math.random = realRandom
-    // eslint-disable-next-line no-global-assign
-    Date = RealDate
-  }
+  const root = globalThis as unknown as Record<PropertyKey, { getStore(): unknown } | undefined>
+  return (
+    root[USE_CACHE_SCOPE_STORAGE]?.getStore() !== undefined ||
+    root[DATA_CACHE_PRODUCER_STORAGE]?.getStore() === true
+  )
 }
 
 interface ClockTape {
@@ -673,9 +710,9 @@ export async function runWithClockTape<T>(
  * the abort - the same dynamic-at-await-site rule hangingPromise implements, and via the same Proxy trick,
  * since `await` on a native promise bypasses a monkey-patched `then`.
  */
-export function markRuntimeApiOnAwait<T>(promise: Promise<T>): Promise<T> {
+export function markRuntimeApiOnAwait<T>(promise: Promise<T>, subShellParams = false): Promise<T> {
   const scope = prerenderStorage.getStore()
-  if (scope?.runtimePrefetch !== true) return promise
+  if (!scope || (scope.runtimePrefetch !== true && !subShellParams)) return promise
   return new Proxy(promise, {
     get(target, property) {
       if (property === 'then') {
@@ -692,23 +729,41 @@ export function markRuntimeApiOnAwait<T>(promise: Promise<T>): Promise<T> {
   })
 }
 
-// Reports each sync-IO abort of a runtime prefetch; anchored on globalThis for dual module copies.
+// Reports each sync-IO abort (runtime prefetch or build shell); anchored on globalThis for dual module copies.
 const SYNC_IO_REPORTER = Symbol.for('pnext.runtimePrefetchSyncIoReporter')
-type SyncIoReporter = (expression: string, route: string) => void
+type SyncIoReporter = (expression: string, route: string, build: boolean) => void
 const syncIoReporter = globalThis as { [SYNC_IO_REPORTER]?: SyncIoReporter }
 
 export function setRuntimePrefetchSyncIoReporter(reporter: SyncIoReporter): void {
   syncIoReporter[SYNC_IO_REPORTER] = reporter
 }
 
-/** Throw the boundary-aborting postpone when sync IO happens post-runtime-API. */
+/** Throw the boundary-aborting postpone on sync IO in a build shell, or post-runtime-API in a runtime prefetch. */
 function abortOnSynchronousPlatformIOAccess(expression: string): void {
   const scope = prerenderStorage.getStore()
-  if (scope?.runtimePrefetch !== true || scope.awaitedRuntimeApi !== true) return
-  // Sync IO inside a `use cache` body is legal — see insideUseCacheScope above.
-  if (insideUseCacheScope()) return
-  syncIoReporter[SYNC_IO_REPORTER]?.(expression, scope.route || '/')
+  const build = scope?.taskBoundary === true && cacheComponents()
+  if (!scope || (!build && (scope.runtimePrefetch !== true || scope.awaitedRuntimeApi !== true)))
+    return
+  if (insideUseCacheScope() || calledFromModuleScope()) return
+  if (build) {
+    const armed = taskBoundaryArmedStorage.getStore()
+    // A completed prerender or a boundary past its task deadline is already dynamic.
+    if (scope.signal.aborted || armed?.lost) return
+    // A client component's sync IO is a hole inside <Suspense>; outside, the source scan reports it.
+    if (clientRenderStorage.getStore()) {
+      if (armed) throw new PostponeError('sync IO')
+      return
+    }
+  }
+  // Next hangs params with an unfilled key, so sync IO behind sub-shell params is a silent hole.
+  if (!build || !scope.awaitedRuntimeApi)
+    syncIoReporter[SYNC_IO_REPORTER]?.(expression, scope.route || '/', build)
   throw new PostponeError('sync IO')
+}
+
+// Module top-level code (a lazy require mid-render) is not part of the render; frame 4 is the shim's caller.
+function calledFromModuleScope(): boolean {
+  return /^\s*at [^(]*:\d+(?::\d+)?$/.test(new Error().stack?.split('\n')[4] ?? '')
 }
 
 /** Install `value` as an own property of `owner`, returning a restore thunk. */
@@ -787,16 +842,6 @@ function installSyncIoShims(): void {
     Math.random = realRandom
     root[REAL_NOW] = previousRealNow
   })
-  const perf = globalThis.performance as Performance | undefined
-  if (perf) {
-    const realPerfNow = perf.now.bind(perf)
-    state.restore.push(
-      patchMethod(perf, 'now', () => {
-        abortOnSynchronousPlatformIOAccess('performance.now()')
-        return realPerfNow()
-      }),
-    )
-  }
   const webCrypto = globalThis.crypto as Crypto | undefined
   if (typeof webCrypto?.getRandomValues === 'function') {
     const realGetRandomValues = webCrypto.getRandomValues.bind(webCrypto)
@@ -818,12 +863,8 @@ function restoreSyncIoShims(): void {
   for (const undo of restore) undo()
 }
 
-/**
- * Run a runtime-prefetch render with the sync-IO shims installed. Sync IO that
- * happens once a runtime API has been awaited (see markRuntimeApiOnAwait)
- * postpones its nearest <Suspense> boundary instead of returning a value.
- */
-export async function runWithRuntimePrefetchSyncIoAbort<T>(fn: () => Promise<T>): Promise<T> {
+/** Run a prerender with the sync-IO shims installed (see abortOnSynchronousPlatformIOAccess). */
+export async function runWithSyncIoAbort<T>(fn: () => Promise<T>): Promise<T> {
   installSyncIoShims()
   try {
     return await fn()

@@ -201,6 +201,8 @@ interface ScanContext {
   entryReasons: Map<string, ClientEntryReason[]>
   /** Root-layout CSS closure — itself a content walk, so it resolves with the first CSS fact. */
   globalCssImports(): Set<string>
+  /** Drop everything memoized from these files' text (a dev save), so a reset route re-reads them. */
+  forget(files: string[]): void
 }
 
 function createScanContext(
@@ -210,7 +212,7 @@ function createScanContext(
 ): ScanContext {
   const root = rootFromAppPath(appPath)
   let memo: Set<string> | undefined
-  return {
+  const context: ScanContext = {
     root,
     workspaceRoot,
     appPath,
@@ -225,7 +227,24 @@ function createScanContext(
     globalCssImports:
       globalCss ??
       (() => (memo ??= new Set(globalCssSourcesForPaths(root, appPath, workspaceRoot)))),
+    forget(files) {
+      const maps = [
+        context.sources,
+        context.edges,
+        context.requestImportUsage,
+        context.exists,
+        context.useClient,
+        context.usesLink,
+        context.usesNavigation,
+        context.entryReasons,
+      ]
+      for (const file of files) for (const map of maps) map.delete(path.resolve(file))
+      // Published-export edges are keyed on importer + target; the target may be the saved file.
+      for (const key of context.edges.keys()) if (key.includes('\0')) context.edges.delete(key)
+      memo = undefined
+    },
   }
+  return context
 }
 
 /** `existsSync` once per path per scan — the closure walk asks the same paths per route. */
@@ -289,6 +308,7 @@ const deferredFields = [
 type RoutePathEntry = Omit<RouteManifestEntry, keyof RouteFacts>
 
 const resolvedRoutes = new WeakSet<RouteManifestEntry>()
+const resetters = new WeakMap<RouteManifestEntry, () => ScanContext>()
 let factsVersion = 0
 
 /** Bumped each time a route resolves its deferred facts (dev re-keys watch roots off it). */
@@ -298,6 +318,13 @@ export function routeFactsVersion() {
 
 export function routeFactsResolved(route: RouteManifestEntry) {
   return resolvedRoutes.has(route)
+}
+
+/** Forget these routes' resolved facts after a save to `files`; the next access re-walks from disk. */
+export function resetRouteFacts(routes: RouteManifestEntry[], files: string[]) {
+  let context: ScanContext | undefined
+  for (const route of routes) context = resetters.get(route)?.() ?? context
+  context?.forget(files)
 }
 
 /**
@@ -349,16 +376,23 @@ export function setRouteFactsStore(store: RouteFactsStore | undefined) {
 }
 
 function withDeferredFacts(
-  appPath: string,
+  context: ScanContext,
   base: RoutePathEntry,
   compute: () => RouteFacts,
 ): RouteManifestEntry {
+  const { appPath } = context
   const entry = base as RouteManifestEntry
   let facts: RouteFacts | undefined
   // Consumers still assign some of these (the build marks needsRouterEntry), so
   // each field keeps a setter that wins over the computed value without forcing
   // the scan.
   const overrides = new Map<string, unknown>()
+  resetters.set(entry, () => {
+    facts = undefined
+    overrides.clear()
+    resolvedRoutes.delete(entry)
+    return context
+  })
 
   for (const field of deferredFields) {
     Object.defineProperty(entry, field, {
@@ -437,7 +471,7 @@ function buildRouteTable(
       if (!metadataParts) continue
       routes.push(
         withDeferredFacts(
-          appPath,
+          context,
           {
             id: `metadata-${routeId(metadataParts.route)}`,
             kind: 'handler',
@@ -485,7 +519,7 @@ function buildRouteTable(
     const interception = parts.interception
     routes.push(
       withDeferredFacts(
-        appPath,
+        context,
         {
           id: interception ? `intercept-${sanitizeIdPart(routeDir)}` : routeId(parts.route || '/'),
           kind,
@@ -881,7 +915,7 @@ function appendSlotDerivedRoutes(
       // interceptor during slot rendering. Kept minimal on purpose.
       routes.push(
         withDeferredFacts(
-          appPath,
+          context,
           {
             id: `intercept-${sanitizeIdPart(candidate.relative.replace(pageOrRouteTrailing(), ''))}`,
             kind: 'page',
@@ -944,7 +978,7 @@ function appendSlotDerivedRoutes(
 
     routes.push(
       withDeferredFacts(
-        appPath,
+        context,
         {
           id: `slot-${routeId(parts.route || '/')}`,
           kind: 'page',
@@ -1091,7 +1125,7 @@ function appendDefaultDerivedRoutes(
 
     routes.push(
       withDeferredFacts(
-        appPath,
+        context,
         {
           id: `default-${routeId(parts.route || '/')}`,
           kind: 'page',

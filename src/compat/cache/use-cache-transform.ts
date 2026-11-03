@@ -97,13 +97,14 @@ export function rewriteUseCacheSource(source: string, file: string, root?: strin
   }
 
   const hoisted = hoistRootParamsImports(out)
-  const pageSegments = pageSegmentNames(source, file)
+  const segments = segmentNames(source, file)
+  const segmentKind = path.basename(file).startsWith('layout.') ? '"layout"' : '"page"'
   const assignments = [...wrapped]
     .map(name => {
       const kind = kinds.get(name)
       const id = JSON.stringify(`${idBase}#${name}`)
       if (kind === 'private') return `${name} = __pnextUseCachePrivate(${id}, ${name});`
-      const segment = pageSegments?.has(name) ? `${kindArg(kind) || ', undefined'}, true` : ''
+      const segment = segments?.has(name) ? `${kindArg(kind) || ', undefined'}, ${segmentKind}` : ''
       return `${name} = __pnextUseCache(${id}, ${name}${segment || kindArg(kind)});`
     })
     .join('\n')
@@ -116,9 +117,9 @@ function kindArg(kind: string | undefined): string {
   return kind && kind !== 'default' ? `, ${JSON.stringify(kind)}` : ''
 }
 
-/** Next's page-segment functions: a page file's default export, generateMetadata and generateViewport. */
-export function pageSegmentNames(source: string, file: string): Set<string> | undefined {
-  if (!/^page\.\w+$/.test(path.basename(file))) return undefined
+/** Next's segment functions: a page or layout file's default export, generateMetadata and generateViewport. */
+export function segmentNames(source: string, file: string): Set<string> | undefined {
+  if (!/^(page|layout)\.\w+$/.test(path.basename(file))) return undefined
   const defaultName =
     /\bexport\s+default\s+(?:async\s+)?(?:function\s*\*?\s*)?([A-Za-z_$][\w$]*)/.exec(source)?.[1]
   return new Set(['generateMetadata', 'generateViewport', ...(defaultName ? [defaultName] : [])])
@@ -915,7 +916,18 @@ function rewriteFunctionLevelDirectives(
     }
     wrapped.add(declaration.name)
     if (directive[2]) kinds.set(declaration.name, directive[2])
-    out = head + out.slice(index + directive[0].length)
+    const body = index + directive[0].length
+    const close = matchClosingBrace(out, prefix.lastIndexOf('{') + 1)
+    const asyncHead = new RegExp(
+      `async\\s+(?=function\\s+${escapeIdent(declaration.name)}\\b)`,
+    ).exec(head)
+    // Bun loses `arguments` in an async function that awaits; a sync function over an async arrow keeps it.
+    if (asyncHead && close > body && /\barguments\b/.test(out.slice(body, close))) {
+      out = `${head.slice(0, asyncHead.index)}${head.slice(asyncHead.index + asyncHead[0].length)}return (async () => {${out.slice(body, close)}})()${out.slice(close)}`
+      searchFrom = asyncHead.index
+      continue
+    }
+    out = head + out.slice(body)
     searchFrom = index
   }
   return out

@@ -1,5 +1,5 @@
 import { cacheComponents } from '../../render/ppr'
-import { loadSegmentModules, routeSegmentFiles } from '../../render/renderer'
+import { loadSegmentModules, routeParamKeys, routeSegmentFiles } from '../../render/renderer'
 import { readSourceSync } from '../../resolve/source-text'
 import {
   childrenDefaultFile,
@@ -7,7 +7,7 @@ import {
   slotConventionFile,
   slotPageForRoute,
 } from '../../routing/slots'
-import { PnextBuildValidationError } from '../validation/validate'
+import { PnextBuildValidationError, prerenderShellErrorMessage } from '../validation/errors'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import {
@@ -15,15 +15,15 @@ import {
   registerBuildCompleteHooks,
   registerBuildSteps,
   setBuildCompatExtensions,
-  setCompatModeExtensions,
   type BuildStep,
 } from '../../extensions'
 import type { BuildManifest, RouteManifestEntry, RouteParamValue } from '../../types'
 import type { ResolvedConfig } from '../../config'
-import { nextCompatEnabled, reactCompatEnabled, reactCompilerOptions } from '../aliases'
-import { warnNextMetadataBuildIssues } from '../metadata'
+import { nextCompatEnabled } from '../aliases'
 import { getNextConfig } from '../next/config-loader'
+import { warnNextMetadataBuildIssues } from '../metadata'
 import { routeRuntimePrefetch } from '../next/route-state'
+import { appRootParams, scanRootParamsForFile } from '../ppr/root-params-scan'
 import { preferredRegionForRoute } from '../next/preferred-region'
 import { deploymentId } from '../bundler/config'
 import { aliasGenerateStaticParams, runParamMatchingGenerator } from '../static-params'
@@ -38,6 +38,7 @@ import { takeFontHeaderPreloads, fontLinkHeaderValue } from '../next/font/runtim
 import { takeResourceHintHeader } from '../next/resource-hints'
 import {
   bodySegmentFile,
+  shellSegmentFile,
   buildRootTreePrefetch,
   buildSegmentMeta,
   DEFAULT_DYNAMIC_STALE_TIME_SECONDS,
@@ -58,24 +59,13 @@ export function registerBuildCompatExtensions(): void {
   registerBuildCompleteHooks(({ config }) => writeTraceBuildFile(config))
   // Next's `adapterPath` / NEXT_ADAPTER_PATH deployment-adapter hook.
   registerBuildCompleteHooks(({ config, manifest }) => runBuildCompleteAdapter(config, manifest))
-  setCompatModeExtensions({
-    nextEnabled: nextCompatEnabled,
-    reactEnabled: reactCompatEnabled,
-    reactCompilerOptions,
-  })
   setBuildCompatExtensions({
     warnMetadataIssues: ({ appPath, routes, staticMetadataFiles }) =>
       warnNextMetadataBuildIssues(appPath, routes, staticMetadataFiles),
     nextOutputExport: () => getNextConfig().output === 'export',
-    nextOutputMode: () => {
-      const output = getNextConfig().output
-      return output === 'export' || output === 'standalone' ? output : undefined
-    },
-    nextScriptWorkersEnabled: () => {
-      const experimental = getNextConfig().experimental as
-        { nextScriptWorkers?: boolean } | undefined
-      return experimental?.nextScriptWorkers === true
-    },
+    nextScriptWorkersEnabled: () =>
+      (getNextConfig().experimental as { nextScriptWorkers?: boolean } | undefined)
+        ?.nextScriptWorkers === true,
     defaultExpireTimeSeconds: () => {
       const expireTime = getNextConfig().expireTime
       return typeof expireTime === 'number' ? expireTime : undefined
@@ -99,12 +89,26 @@ export function registerBuildCompatExtensions(): void {
     defaultStaticStaleTimeSeconds: DEFAULT_STATIC_STALE_TIME_SECONDS,
     buildRootTreePrefetch,
     routePartialPrefetching: routeRuntimePrefetch,
+    rootParams: appRootParams,
     rootTreePrefetchText,
     buildSegmentMeta,
     segmentDir,
     treeSegmentFile,
     bodySegmentFile,
+    shellSegmentFile,
     segmentMetaFile,
+    validateParamShells: async (route, isEmpty) => {
+      for (const { pathname, filled, validated } of paramMatchingCandidates(route)) {
+        if (validated && (await isEmpty(filled))) {
+          throw new PnextBuildValidationError(
+            prerenderShellErrorMessage(
+              pathname,
+              nextRoutePattern(route.route, route.catchAllOptional),
+            ),
+          )
+        }
+      }
+    },
   })
 }
 
@@ -237,7 +241,7 @@ export async function resolveParamMatching(
   generated: Record<string, RouteParamValue>[],
 ): Promise<ParamMatching | undefined> {
   const page = nextRoutePattern(route.route, route.catchAllOptional)
-  const paramNames = [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
+  const paramNames = routeParamKeys(route)
   const tree = await segmentTree(config, route, modules)
   const fragments = new Map<SegmentNode, ParamMatching>()
   const nodes = [tree]
@@ -269,6 +273,7 @@ export const resolveDeclaredParamMatching: BuildStep = async ({ config, routes }
   if (!nextCompatEnabled(config)) return
   for (const route of routes as RouteManifestEntry[]) {
     if (route.kind !== 'page' || route.interception || route.hasStaticParams) continue
+    if (route.params.length === 0 && !route.catchAll) continue
     const files = routeSegmentFiles(config, route)
     const declared = files.some(file =>
       /\bunstable_(?:generateParamMatching|paramMatching)\b/.test(readSourceSync(file)),
@@ -280,6 +285,108 @@ export const resolveDeclaredParamMatching: BuildStep = async ({ config, routes }
     // A closed route with nothing generated admits nothing outside draft mode.
     if (Object.values(policy).includes('not-found')) route.prerenderedParams ??= []
   }
+}
+
+export interface ParamMatchingCandidate {
+  /** Next's pattern for the candidate: the route with `filled` substituted (`/en/items/[slug]`). */
+  pathname: string
+  filled: Record<string, RouteParamValue>
+  unfilled: string[]
+  /** Next's prerender-manifest `fallback`: false closes, null blocks, a pathname serves that shell. */
+  fallback: string | null | false
+  /** An explicit policy requires this candidate's shell to be non-empty. */
+  validated: boolean
+}
+
+/**
+ * The matchers Next's param matching emits for a page route: the route itself, then every leading
+ * prefix its generated params fill. Each behaves as the policy of its first unfilled param; an
+ * unconfigured one blocks for a root param or a candidate without a baked shell, else falls back.
+ */
+export function paramMatchingCandidates(
+  route: RouteManifestEntry,
+  rootParams: ReadonlySet<string> = new Set(),
+): ParamMatchingCandidate[] {
+  const names = routeParamKeys(route)
+  if (route.kind !== 'page' || route.interception || names.length === 0) return []
+  const prefixes = new Map<string, Record<string, RouteParamValue>>([['{}', {}]])
+  for (const set of route.prerenderedParams ?? []) {
+    for (let filled = 1; filled < names.length && set[names[filled - 1]!] !== undefined; filled++) {
+      const prefix = Object.fromEntries(names.slice(0, filled).map(name => [name, set[name]!]))
+      prefixes.set(JSON.stringify(prefix), prefix)
+    }
+  }
+  const policy = route.paramMatching ?? {}
+  const fallbackParam = names.find(name => policy[name] === 'fallback')
+  const candidates = [...prefixes].map(([key, filled]): ParamMatchingCandidate => {
+    const unfilled = names.slice(Object.keys(filled).length)
+    const first = unfilled[0]!
+    const shell =
+      key === '{}'
+        ? route.pprHoles !== undefined
+        : route.pprSubShells?.some(sub => JSON.stringify(sub.concreteParams) === key) === true
+    const mode = policy[first] ?? (rootParams.has(first) || !shell ? 'blocking' : 'fallback')
+    const pathname = fillNextRoutePattern(route, filled)
+    return {
+      pathname,
+      filled,
+      unfilled,
+      fallback: mode === 'not-found' ? false : mode === 'blocking' ? null : pathname,
+      validated: route.paramMatching !== undefined && first === fallbackParam,
+    }
+  })
+  // Without a candidate at the fallback param, a route with no examples must still have a generic shell.
+  if (
+    route.paramMatching &&
+    !candidates.some(candidate => candidate.validated) &&
+    !route.prerenderedParams?.length &&
+    route.segmentConfig?.unstableInstant !== false
+  ) {
+    candidates[0]!.validated = true
+  }
+  return candidates.sort((a, b) => a.unfilled.length - b.unfilled.length)
+}
+
+const rootParamsByRoute = new WeakMap<RouteManifestEntry, Set<string>>()
+
+/** A page route's root params, scanned once per build. */
+export function routeRootParams(appPath: string, route: RouteManifestEntry): Set<string> {
+  if (route.kind !== 'page') return new Set()
+  let names = rootParamsByRoute.get(route)
+  if (!names) rootParamsByRoute.set(route, (names = scanRootParamsForFile(appPath, route.file)))
+  return names
+}
+
+/** Next's pattern for `route` with `filled` params substituted. */
+export function fillNextRoutePattern(
+  route: RouteManifestEntry,
+  filled: Record<string, RouteParamValue>,
+): string {
+  return nextRoutePattern(route.route, route.catchAllOptional).replace(
+    /\[{1,2}(?:\.\.\.)?([^\]]+)\]{1,2}/g,
+    (pattern, name: string) => [filled[name] ?? pattern].flat().join('/'),
+  )
+}
+
+/** Next's regex group / `$` reference name for a param (its query key stays `nxtP<name>`). */
+export function nxtPKey(name: string): string {
+  return `nxtP${name.replace(/\W/g, '')}`
+}
+
+/** A Next pattern (`/en/[slug]`) as regex source; `named` labels each param group by `nxtPKey`. */
+export function nextPatternRegex(pathname: string, named = false): string {
+  const group = (name: string, body: string) => `(${named ? `?<${nxtPKey(name)}>` : ''}${body})`
+  return pathname.replace(
+    /\/\[\[\.\.\.([^\]]+)\]\]|\/\[\.\.\.([^\]]+)\]|\/\[([^\]]+)\]|[.*+?^${}()|[\]\\]/g,
+    (token, optional?: string, catchAll?: string, single?: string) =>
+      optional
+        ? `(?:/${group(optional, '.+?')})?`
+        : catchAll
+          ? `/${group(catchAll, '.+?')}`
+          : single
+            ? `/${group(single, '[^/]+?')}`
+            : `\\${token}`,
+  )
 }
 
 /** The route's layout chain and page, with every `@slot` branch the route renders hung off its owner. */

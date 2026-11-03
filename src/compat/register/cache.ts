@@ -36,6 +36,7 @@ import { installCustomCacheHandler } from '../cache/custom-handler'
 import { installModernCacheHandlers, pendingModernCacheInstall } from '../cache/modern-handler'
 import { rewriteUseCacheSource } from '../cache/use-cache-transform'
 import { resumeDataCacheExtension } from '../cache/resume-data-cache'
+import { staleTimeSecondsFor } from '../segment/serve'
 
 const SETTLED = Promise.resolve(undefined)
 
@@ -47,6 +48,7 @@ export function registerCacheExtensions(config: ResolvedConfig): void {
     // Peek (never consume) the render's aggregated cacheLife stale window, so
     // the document can inline its own reuse window for hard loads.
     currentCacheStaleSeconds: () => currentRenderCacheMeta()?.staleSeconds,
+    defaultStaticStaleTimeSeconds: () => staleTimeSecondsFor(true),
     prerenderSidecar: resumeDataCacheExtension,
   })
 

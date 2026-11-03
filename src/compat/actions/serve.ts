@@ -1,10 +1,6 @@
 import { resolveAction, runAction, type RunActionOptions } from './endpoint'
 import { allActions, lookupAction } from './registry'
-import {
-  ACTION_FLIGHT_CONTENT_TYPE,
-  actionRedirectHeaderValue,
-  createActionFlightResponse,
-} from './flight'
+import { actionRedirectHeaderValue, createActionFlightResponse } from './flight'
 import { INVALID_ORIGIN_MESSAGE, isActionOriginAllowed } from './origin'
 import {
   ACTION_ID_FIELD,
@@ -18,6 +14,7 @@ import {
   FORM_STATE_FIELD,
   MASKED_ACTION_ERROR,
   REDIRECT_TYPE_HEADER,
+  ACTION_FLIGHT_CONTENT_TYPE,
   type ActionSuccessBody,
 } from './protocol'
 
@@ -242,10 +239,29 @@ export async function serveAction(
       headers.set('content-type', 'application/json; charset=utf-8')
       return new Response(JSON.stringify({ redirect: target }), { status: 200, headers })
     }
-    // A non-redirect action returns its plain JSON envelope. When it also revalidated (or mutated
-    // cookies), the refresh header rides along and the JS client soft-refreshes the current route in
-    // place, preserving hydrated island state. Wrapping the return in a full-page flight envelope here
-    // would force the client to rewrite the document, discarding that live state.
+    // A revalidating action carries the refreshed page, which the client soft-applies without another request.
+    if (
+      wantsFlight &&
+      response.status === 200 &&
+      response.headers.has(ACTION_REFRESH_HEADER) &&
+      response.headers.get('content-type')?.includes('application/json') &&
+      plainNavState(request) &&
+      options.renderActionFlight
+    ) {
+      const target = new URL(request.url)
+      const rendered = await options
+        .renderActionFlight(requestWithAppliedCookies(request, target, response.headers), target)
+        .catch(() => null)
+      if (rendered?.status === 200) {
+        const { data } = (await response.json()) as ActionSuccessBody
+        return createActionFlightResponse({
+          pageResponse: rendered,
+          target,
+          actionHeaders: response.headers,
+          data,
+        })
+      }
+    }
     return response
   }
 
@@ -306,6 +322,18 @@ function progressiveReturnTarget(request: Request): string {
   const referer = request.headers.get('referer')
   if (referer) return referer
   return new URL(request.url).pathname || '/'
+}
+
+// Parallel-slot or interception state needs the router's own refresh.
+function plainNavState(request: Request): boolean {
+  try {
+    const state = JSON.parse(
+      decodeURIComponent(request.headers.get('x-pnext-nav-state') ?? '{}'),
+    ) as { slots?: unknown; hostRender?: unknown }
+    return !state.slots && !state.hostRender
+  } catch {
+    return false
+  }
 }
 
 function acceptsActionFlight(request: Request): boolean {

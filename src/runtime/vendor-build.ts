@@ -475,7 +475,7 @@ function releaseExternalsPlugin(
           args.kind === 'require-call'
             ? serverBundleRequireConditions(conditionTarget)
             : serverBundleConditions(conditionTarget)
-        const external = policy.external(name) || policy.releaseExternal?.(name)
+        const external = policy.external(name)
         if (!external && inPlace.size === 0) return undefined
         const fromImporter = resolveNestedPackageFromImporter(args.importer, args.path, conditions)
         // A package that loads in place is imported where it lies, when Bun loads it as-is.

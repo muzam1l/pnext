@@ -48,8 +48,6 @@ export interface ExternalPackagePolicy {
    * transpile.
    */
   transpiled?: () => readonly string[]
-  /** Kept out of a release's server dependency graph beyond `external`: Next's built-in list. */
-  releaseExternal?: (packageName: string) => boolean
   /** ESM external mode for package exports interop. */
   esmExternals: () => boolean | 'loose'
 }
