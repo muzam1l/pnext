@@ -460,7 +460,7 @@ function entryScriptSrc(doc: Document) {
 
 // A fetched page carries its own request's nonce; only this document's, read before any navigation, satisfies its CSP.
 const bootNonce =
-  typeof document === 'undefined'
+  typeof document === 'undefined' || typeof document.querySelector !== 'function'
     ? undefined
     : document.querySelector<HTMLScriptElement>('script[nonce]')?.nonce
 
