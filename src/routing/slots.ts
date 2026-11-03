@@ -1,6 +1,6 @@
 import path from 'node:path'
-import { safeDecode } from '../utils/decode'
 import { readDirListing, toPosixPath } from '../utils/fs'
+import { getRoutingExtensions } from '../extensions'
 import type { InterceptionMarker, RouteParamValue } from '../types'
 
 // Parallel-route (@slot) and intercepting-route ((.)segment) tree matching.
@@ -35,6 +35,17 @@ export function isSlotSegment(name: string) {
 
 export function isGroupSegment(name: string) {
   return name.startsWith('(') && name.endsWith(')') && !interceptionMarkerOf(name)
+}
+
+/** The dynamic param names introduced AT or ABOVE `dir`. */
+export function layoutParamNamesForDir(appPath: string, dir: string): string[] {
+  const relativeDir = path.relative(appPath, dir)
+  if (relativeDir.startsWith('..')) return []
+  return relativeDir
+    .split(path.sep)
+    .flatMap(
+      name => optionalCatchAllName(name) ?? catchAllName(name) ?? dynamicParamName(name) ?? [],
+    )
 }
 
 /** Nearest existing `<base>.<ext>` convention file in `dir`. */
@@ -160,7 +171,7 @@ export function matchSegments(
       path.join(dir, name),
       rest,
       options,
-      { ...params, [param]: safeDecode(head) },
+      { ...params, [param]: getRoutingExtensions().paramValue(head) },
       [...dirs, name],
     )
     if (match) return match
@@ -175,12 +186,21 @@ export function matchSegments(
       path.join(dir, name),
       [],
       options,
-      { ...params, [param]: segments.map(safeDecode) },
+      { ...params, [param]: segments.map(getRoutingExtensions().paramValue) },
       [...dirs, name],
     )
     if (match) return match
   }
 
+  // Inside an intercepted unit a path that only a parallel slot routes renders the layout pageless.
+  if (
+    options.markersAsSegments &&
+    children.some(
+      name => isSlotSegment(name) && matchSegments(path.join(dir, name), segments, options),
+    )
+  ) {
+    return { dirs, params }
+  }
   return null
 }
 
@@ -204,6 +224,84 @@ function catchAllName(name: string) {
 function optionalCatchAllName(name: string) {
   const match = /^\[\[\.\.\.([^\]]+)\]\]$/.exec(name)
   return match?.[1]
+}
+
+export interface SlotGap {
+  /** Directory hosting the slot. */
+  dir: string
+  /** The `@slot` dir name, or 'children' when the dir's own pages serve other URLs only. */
+  slot: string
+}
+
+/**
+ * Slots along the segment chain of `route` (URL form, `/a/:id/:rest*`) that can render neither a
+ * matching page nor a `default.*`. A slot matches when its tree holds a page at the route's remaining
+ * segments (tokens compared by name) or a catch-all page below it. The children tree counts as a slot
+ * only where named slots exist beside it.
+ */
+export function unrenderableSlots(appPath: string, route: string): SlotGap[] {
+  const tokens = route.split('/').filter(Boolean)
+  const gaps: SlotGap[] = []
+  const walk = (dir: string, index: number) => {
+    const slotDirs = slotDirectoriesIn(dir).filter(
+      slotDir => path.basename(slotDir) !== '@children',
+    )
+    for (const slotDir of slotDirs) {
+      if (servingPage(slotDir, tokens, index)) walk(slotDir, index)
+      else if (!slotConventionFile(slotDir, 'default')) {
+        gaps.push({ dir, slot: path.basename(slotDir) })
+      }
+    }
+    if (
+      slotDirs.length > 0 &&
+      hasPages(dir) &&
+      !servingPage(dir, tokens, index) &&
+      !slotConventionFile(dir, 'default')
+    ) {
+      gaps.push({ dir, slot: 'children' })
+    }
+    for (const name of childDirectories(dir)) {
+      if (isSlotSegment(name)) continue
+      const child = path.join(dir, name)
+      if (isGroupSegment(name)) walk(child, index)
+      else if (index < tokens.length && segmentToken(name).route === tokens[index])
+        walk(child, index + 1)
+    }
+  }
+  walk(appPath, 0)
+  return gaps
+}
+
+/** The page file a `@slot` dir renders for `route` (URL form), given the segments consumed above it. */
+export function slotPageForRoute(slotDir: string, route: string, consumed: number) {
+  return servingPage(slotDir, route.split('/').filter(Boolean), consumed)
+}
+
+/** The page under `dir` (through groups, never slots) that serves `tokens[index..]`. */
+function servingPage(dir: string, tokens: string[], index: number): string | undefined {
+  if (index === tokens.length) {
+    const page = slotConventionFile(dir, 'page')
+    if (page) return page
+  }
+  for (const name of childDirectories(dir)) {
+    if (isSlotSegment(name)) continue
+    const child = path.join(dir, name)
+    let page: string | undefined
+    if (isGroupSegment(name)) page = servingPage(child, tokens, index)
+    else if (catchAllName(name) || optionalCatchAllName(name)) {
+      if (index < tokens.length || optionalCatchAllName(name))
+        page = slotConventionFile(child, 'page')
+    } else if (index < tokens.length && segmentToken(name).route === tokens[index]) {
+      page = servingPage(child, tokens, index + 1)
+    }
+    if (page) return page
+  }
+  return undefined
+}
+
+function hasPages(dir: string): boolean {
+  if (slotConventionFile(dir, 'page')) return true
+  return childDirectories(dir).some(name => !isSlotSegment(name) && hasPages(path.join(dir, name)))
 }
 
 /**
@@ -234,6 +332,25 @@ function childSegmentDir(dir: string, segment: string): string | undefined {
   const dynamic = children.find(name => dynamicParamName(name))
   if (dynamic) return path.join(dir, dynamic)
   return undefined
+}
+
+/**
+ * Whether `dir` declares an ordinary children branch: a page/default of its own, or one anywhere below a
+ * non-slot child directory. A layout composed only of named slots declares none.
+ */
+export function declaresChildren(dir: string): boolean {
+  if (slotConventionFile(dir, 'page') || slotConventionFile(dir, 'default')) return true
+  return childDirectories(dir).some(
+    name =>
+      !isSlotSegment(name) && !name.startsWith('_') && containsPageOrDefault(path.join(dir, name)),
+  )
+}
+
+function containsPageOrDefault(dir: string): boolean {
+  if (slotConventionFile(dir, 'page') || slotConventionFile(dir, 'default')) return true
+  return childDirectories(dir).some(
+    name => !name.startsWith('_') && containsPageOrDefault(path.join(dir, name)),
+  )
 }
 
 export interface InterceptorUnit {
@@ -380,8 +497,8 @@ export function matchSlotInterceptor(
     unit.params.forEach((param, index) => {
       const value = match[index + 1] ?? ''
       params[param.name] = param.catchAll
-        ? value.split('/').filter(Boolean).map(safeDecode)
-        : safeDecode(value)
+        ? value.split('/').filter(Boolean).map(getRoutingExtensions().paramValue)
+        : getRoutingExtensions().paramValue(value)
     })
     const rest = unit.catchAllTail ? [] : segments.slice(unit.targetSegments.length)
     const inner = matchSegments(unit.dir, rest, { markersAsSegments: true }, params, [])
@@ -421,8 +538,8 @@ function matchTargetTokens(
     .forEach((token, index) => {
       const value = match[index + 1] ?? ''
       params[token.param!] = token.catchAll
-        ? value.split('/').filter(Boolean).map(safeDecode)
-        : safeDecode(value)
+        ? value.split('/').filter(Boolean).map(getRoutingExtensions().paramValue)
+        : getRoutingExtensions().paramValue(value)
     })
   return params
 }

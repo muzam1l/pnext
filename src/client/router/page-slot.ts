@@ -74,9 +74,13 @@ function childNodes(segment: Element): ChildNode[] | null {
 }
 
 /** Replace a kept layout's children (its child layout or page slot) with the incoming ones. */
-export function graftSegmentChildren(liveSegment: Element, incomingSegment: Element): boolean {
+export function graftSegmentChildren(
+  liveSegment: Element,
+  incomingSegment: Element,
+  morph = false,
+): boolean {
   if (!childSegment(liveSegment) && !childSegment(incomingSegment))
-    return graftPageSlot(liveSegment, incomingSegment)
+    return graftPageSlot(liveSegment, incomingSegment, morph)
   const live = childNodes(liveSegment)
   const incoming = childNodes(incomingSegment)
   if (!live || !incoming) return false
@@ -89,11 +93,15 @@ export function graftSegmentChildren(liveSegment: Element, incomingSegment: Elem
  * Graft a destination page into a preserved layout without changing the destination's mount shape.
  * Client pages need the real `#pnext-page` element; server/island-only pages need the marker range.
  */
-export function graftPageSlot(liveSegment: Element, incomingSegment: Element): boolean {
+export function graftPageSlot(
+  liveSegment: Element,
+  incomingSegment: Element,
+  morph = false,
+): boolean {
   const live = pageSlotRange(liveSegment)
   const incoming = pageSlotRange(incomingSegment)
   if (!live || !incoming) return false
-  const nodes = reusePageNodes(live[2], incoming[2])
+  const nodes = (morph ? morphNodes : reusePageNodes)(live[2], incoming[2])
   for (const stale of live[2]) stale.remove()
   const end = incoming[1]
   if (!end) (incoming[0] as Element).replaceChildren(...nodes)
@@ -119,6 +127,45 @@ function reusePageNodes(live: readonly ChildNode[], incoming: readonly Node[]): 
     const index = candidates.findIndex(candidate => candidate.outerHTML === node.outerHTML)
     return index === -1 ? node : candidates.splice(index, 1)[0]!
   })
+}
+
+// A same-URL refresh re-renders the page in place: Next keeps element identity, so morph the
+// live nodes position by position instead of swapping them.
+const UNMORPHABLE = 'script, pnext-client, pnext-suspense, #pnext-page, [data-pnext-island]'
+
+/** Each incoming node, or the live node at its position morphed to match it. */
+function morphNodes(live: readonly ChildNode[], incoming: readonly ChildNode[]): Node[] {
+  return incoming.map((node, index) => {
+    const current = live[index]
+    if (current?.nodeType === 3 && node.nodeType === 3) {
+      if (current.nodeValue !== node.nodeValue) current.nodeValue = node.nodeValue
+      return current
+    }
+    if (
+      !(current instanceof Element && node instanceof Element) ||
+      current.tagName !== node.tagName ||
+      current.matches(UNMORPHABLE) ||
+      node.matches(UNMORPHABLE)
+    )
+      return node
+    morphInto(current, node)
+    return current
+  })
+}
+
+export function morphInto(live: Element, incoming: Element): void {
+  for (const { name } of [...live.attributes])
+    if (!incoming.hasAttribute(name)) live.removeAttribute(name)
+  for (const { name, value } of incoming.attributes)
+    if (live.getAttribute(name) !== value) live.setAttribute(name, value)
+  const current = [...live.childNodes]
+  const next = morphNodes(current, [...incoming.childNodes])
+  next.forEach((node, index) => {
+    const at = current[index]
+    if (!at) live.append(node)
+    else if (at !== node) at.replaceWith(node)
+  })
+  for (const extra of current.slice(next.length)) extra.remove()
 }
 
 export interface LoadingShellTarget {

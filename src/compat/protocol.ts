@@ -13,12 +13,21 @@
 
 import type { ResolvedConfig } from '../config'
 import { getWorkUnit, type WorkUnit } from '../request/context'
-import type { RequestInterceptor, ResponseFinalizer, ResponseFinalizerContext } from '../extensions'
+import type {
+  RequestInterceptor,
+  ResponseFinalizer,
+  ResponseFinalizerContext,
+  ResponseFinalizerRequest,
+} from '../extensions'
+import { getRequestRuntime } from '../routing/request-environment'
+import { matchInterception, parseNavState } from '../routing/match'
+import { interceptionMarkerLevels } from '../routing/slots'
 import { nextCompatEnabled } from '../compat/aliases'
+import { selectRouteForRequest } from '../routing/match'
 
 // Next's router vary tokens appended to every app-router response so a CDN
 // keys its cache on the RSC negotiation headers. Order + spelling match Next.
-const ROUTER_VARY = [
+export const ROUTER_VARY = [
   'rsc',
   'next-router-state-tree',
   'next-router-prefetch',
@@ -98,7 +107,10 @@ function applyEdgeRuntimeHeader(ctx: ResponseFinalizerContext): void {
 
 // Append `values` to the response's Vary header, preserving any existing tokens
 // (user- or middleware-set) and never duplicating (case-insensitive).
-function mergeVary(headers: Headers, values: readonly string[]): void {
+/** Interceptor responses bypass the finalizer, so they merge the router's CDN vary themselves. */
+export const mergeRouterVary = (headers: Headers): void => mergeVary(headers, ROUTER_VARY)
+
+export function mergeVary(headers: Headers, values: readonly string[]): void {
   const existing = headers.get('vary')
   const present = new Set(
     (existing ?? '')
@@ -131,8 +143,26 @@ function applyRewrittenHeaders(ctx: ResponseFinalizerContext): void {
   if (!unit) return
   const info = rewrites.get(unit)
   if (!info) return
-  if (info.path !== undefined) ctx.headers.set('x-nextjs-rewritten-path', info.path)
+  if (info.path !== undefined)
+    ctx.headers.set('x-nextjs-rewritten-path', interceptionRewritePath(ctx.request, info.path))
   if (info.query !== undefined) ctx.headers.set('x-nextjs-rewritten-query', info.query)
+}
+
+// Next's interception is itself a rewrite applied after any earlier one: report the interceptor's path.
+export function interceptionRewritePath(
+  request: ResponseFinalizerRequest,
+  pathname: string,
+): string {
+  const from = parseNavState(request)?.children
+  const routes = getRequestRuntime()?.routes
+  if (!from || !routes) return pathname
+  const interception = matchInterception(routes, pathname, from)?.route.interception
+  if (!interception) return pathname
+  const depth = interception.base.split('/').filter(Boolean).length
+  const kept = Math.max(0, depth - interceptionMarkerLevels(interception.marker))
+  const target = pathname.split('/').filter(Boolean)
+  const base = from.split('/').filter(Boolean).slice(0, depth)
+  return `/${[...base, `${interception.marker}${target[kept]}`, ...target.slice(kept + 1)].join('/')}`
 }
 
 function normalizeRscRedirectStatus(ctx: ResponseFinalizerContext): void {
@@ -183,6 +213,11 @@ function validateRouterStateTree(request: Request): Response | undefined {
   if (request.headers.has('x-pnext-soft-nav')) return undefined
   const header = request.headers.get('next-router-state-tree')
   if (header === null) return undefined
+  const runtime = getRequestRuntime()
+  const route =
+    runtime && selectRouteForRequest(runtime.routes, new URL(request.url).pathname)?.route
+  // Static fallbacks render without Flight request headers, including the router state.
+  if (route?.segmentConfig?.dynamic === 'force-static') return undefined
 
   let tree: unknown
   try {

@@ -26,29 +26,22 @@ export const DEFAULT_DYNAMIC_STALE_TIME_SECONDS = 0
 export const DEFAULT_STATIC_STALE_TIME_SECONDS = 300
 
 export const enum PrefetchHint {
-  HasRuntimePrefetch = 0b00001,
+  SubtreeHasPartialPrefetching = 0b00010,
   IsRootLayout = 0b10000,
   ParentInlinedIntoSelf = 0b100000,
   InlinedIntoChild = 0b1000000,
   HeadInlinedIntoSelf = 0b10000000,
   HeadOutlined = 0b100000000,
   PrefetchDisabled = 0b10000000000,
+  ShouldAttemptStaticShell = 0b100000000000000,
+  ShouldAttemptStaticPrefetch = 0b1000000000000000,
 }
 
-/**
- * A single prefetch-tree node. Milestone 1 emits one whole-route node; the
- * shape mirrors Next's `TreePrefetch` (name/param/slots) so the client keying
- * and a later milestone-2 upgrade stay wire-compatible.
- */
+/** Next's PartialTransportNode: segment, prefetch hints, child slots. */
 export interface SegmentTreeNode {
-  /** Route segment name (the whole pathname for the single-node milestone). */
-  name: string
-  /** Dynamic param name captured at this segment, when any. */
-  param: null | { type: 'd' | 'c' | 'oc'; key: string | null; siblings: string[] | null }
-  /** Child slots keyed by slot name (empty for the whole-route node). */
-  slots: Record<string, SegmentTreeNode> | null
-  /** Next-compatible prefetch hint bitmask. */
-  prefetchHints: number
+  s: string | { n: string; t: 'd' | 'c' | 'oc'; k: null; s: string[] | null }
+  h?: number
+  c?: Record<string, SegmentTreeNode>
   /** Byte size of this segment payload when it is available at build time. */
   sizeBytes?: number
   /** Body segment path in the per-route segment store, when outlined. */
@@ -99,16 +92,20 @@ interface BuildTreeOptions {
   pathname: string
   isStatic: boolean
   staleTimeSeconds?: number
-  buildId?: string
   routeId?: string
   bodySizeBytes?: number
   inlineBudgetBytes?: number
   runtimePrefetch?: boolean
   postponed?: boolean
+  partialPrefetching?: boolean
+  /** `runtimeNeededBits` of the route's build renders. */
+  runtimeNeeded?: number
   /** Segment-M2 vary sets collected while rendering this route, when tracked. */
   vary?: SegmentVaryPayload
   /** The matched route pattern (client vary-key identity). */
   routePattern?: string
+  /** The pattern's trailing catch-all is optional (`[[...x]]`). */
+  catchAllOptional?: boolean
   /** Concrete params of the requested URL. */
   params?: Record<string, string | string[]>
   /** The route's head is outlined into a separate `/_head` response. */
@@ -123,7 +120,6 @@ export function buildRootTreePrefetch(options: BuildTreeOptions): RootTreePrefet
     options.staleTimeSeconds ??
     (options.isStatic ? DEFAULT_STATIC_STALE_TIME_SECONDS : DEFAULT_DYNAMIC_STALE_TIME_SECONDS)
   return {
-    ...(options.buildId ? { buildId: options.buildId } : {}),
     tree: buildTree(options),
     staleTime,
     isStatic: options.isStatic,
@@ -151,18 +147,28 @@ function buildTree(options: BuildTreeOptions): SegmentTreeNode {
       isStatic: options.isStatic,
       canInlineBody,
       runtimePrefetch: options.runtimePrefetch,
+      catchAllOptional: options.catchAllOptional,
     })
   }
   return {
-    name: '',
-    param: null,
-    slots: { children: child },
-    prefetchHints: PrefetchHint.IsRootLayout | (canInlineBody ? PrefetchHint.InlinedIntoChild : 0),
+    s: '',
+    c: { children: child },
+    h:
+      PrefetchHint.IsRootLayout |
+      (canInlineBody ? PrefetchHint.InlinedIntoChild : 0) |
+      (options.partialPrefetching ? PrefetchHint.SubtreeHasPartialPrefetching : 0) |
+      staticHint(options.runtimeNeeded, 1, PrefetchHint.ShouldAttemptStaticShell) |
+      staticHint(options.runtimeNeeded, 2, PrefetchHint.ShouldAttemptStaticPrefetch),
   }
 }
 
+/** A static attempt is hinted only when the build judged the stage (`bits` known) and it read no runtime data. */
+function staticHint(bits: number | undefined, bit: number, hint: PrefetchHint): number {
+  return bits !== undefined && !(bits & bit) ? hint : 0
+}
+
 function routeParts(options: BuildTreeOptions): string[] {
-  const source = options.routeId ?? options.pathname
+  const source = options.routePattern ?? options.routeId ?? options.pathname
   if (source === 'index' || source === '/') return []
   return source
     .split('/')
@@ -176,22 +182,35 @@ function routeNode(
   name: string,
   child: SegmentTreeNode,
   parentInlined: boolean,
-  options: { isStatic: boolean; canInlineBody: boolean; runtimePrefetch?: boolean },
+  options: {
+    isStatic: boolean
+    canInlineBody: boolean
+    runtimePrefetch?: boolean
+    catchAllOptional?: boolean
+  },
 ): SegmentTreeNode {
-  const dynamic = !options.isStatic || name.includes('instant-false')
-  const runtime = Boolean(options.runtimePrefetch) || name.includes('runtime')
-  const inlinesIntoChild = options.canInlineBody && !dynamic && !runtime
+  const dynamic = !options.isStatic
+  const inlinesIntoChild = options.canInlineBody && !dynamic && !options.runtimePrefetch
+  const param = /^:(.+?)(\*)?$/.exec(name)
+  const h =
+    (parentInlined ? PrefetchHint.ParentInlinedIntoSelf : 0) |
+    (dynamic ? PrefetchHint.PrefetchDisabled : 0) |
+    (inlinesIntoChild ? PrefetchHint.InlinedIntoChild : 0)
   return {
-    name,
-    param: name.startsWith('[') ? { type: 'd', key: null, siblings: null } : null,
-    slots: {
-      children: { ...child, prefetchHints: child.prefetchHints | parentHint(inlinesIntoChild) },
+    s: param
+      ? {
+          n: param[1]!,
+          t: param[2] ? (options.catchAllOptional ? 'oc' : 'c') : 'd',
+          k: null,
+          s: null,
+        }
+      : name,
+    ...(h ? { h } : {}),
+    c: {
+      children: inlinesIntoChild
+        ? { ...child, h: (child.h ?? 0) | PrefetchHint.ParentInlinedIntoSelf }
+        : child,
     },
-    prefetchHints:
-      (parentInlined ? PrefetchHint.ParentInlinedIntoSelf : 0) |
-      (runtime ? PrefetchHint.HasRuntimePrefetch : 0) |
-      (dynamic ? PrefetchHint.PrefetchDisabled : 0) |
-      (inlinesIntoChild ? PrefetchHint.InlinedIntoChild : 0),
   }
 }
 
@@ -205,20 +224,14 @@ function pageNode(
   },
 ): SegmentTreeNode {
   return {
-    name: '__PAGE__',
-    param: null,
-    slots: null,
-    prefetchHints:
+    s: '__PAGE__',
+    h:
       (parentInlined ? PrefetchHint.ParentInlinedIntoSelf : 0) |
       (options.canInlineBody ? PrefetchHint.HeadInlinedIntoSelf : PrefetchHint.HeadOutlined),
     ...(options.bodySizeBytes !== undefined ? { sizeBytes: options.bodySizeBytes } : {}),
     ...(options.canInlineBody ? {} : { segmentPath: ROUTE_SEGMENT_PATH }),
     ...(options.varyParams ? { varyParams: options.varyParams } : {}),
   }
-}
-
-function parentHint(enabled: boolean): number {
-  return enabled ? PrefetchHint.ParentInlinedIntoSelf : 0
 }
 
 export function rootTreePrefetchText(
@@ -236,10 +249,10 @@ export function rootTreePrefetchText(
  */
 export function treePrefetchResponse(
   payload: RootTreePrefetch,
-  options: { format?: 'json' | 'flight' } = {},
+  options: { format?: 'json' | 'flight'; status?: number; headers?: Record<string, string> } = {},
 ): Response {
   return new Response(rootTreePrefetchText(payload, options.format), {
-    status: 200,
+    status: options.status ?? 200,
     headers: {
       'content-type': RSC_CONTENT_TYPE_HEADER,
       'x-nextjs-postponed': '2',
@@ -252,6 +265,7 @@ export function treePrefetchResponse(
       'cache-control': payload.isStatic
         ? 's-maxage=31536000, stale-while-revalidate'
         : 'private, no-store',
+      ...options.headers,
     },
   })
 }
@@ -309,6 +323,8 @@ export interface SegmentAppShell {
   html: string
   /** The route pattern (colon form) the shell is shared across. */
   route: string
+  /** The params the shell varies on (its root params); absent means none. */
+  vary?: string[]
 }
 
 /** Segment-M2 vary metadata a producer attaches to a segment body response. */
@@ -366,7 +382,15 @@ export interface SegmentMeta {
   /** Segment request keys whose payload was inlined into the route tree. */
   inlinedSegmentPaths?: string[]
   /** Route-level prefetch hints, mirrored into Next-shaped metadata. */
-  prefetchHints?: Record<string, number>
+  prefetchHints?: { hints: number; slots: null }
+  /** RUNTIME_* bits the baked body's holes wait on. */
+  runtime?: number
+  /** RUNTIME_* bits the route's App Shell (prefetch-shell stage) waited on. */
+  shellRuntime?: number
+  /** Which static attempts the latest render proved insufficient: 1 = shell, 2 = prefetch. */
+  runtimeNeeded?: number
+  /** `staleTime` comes from the route's own cacheLife(), so even 0 is the route's word, not a default. */
+  staleTimeDeclared?: boolean
   /**
    * The vary set the BUILD render tracked for this baked body, in the same wire encoding a live response
    * publishes. ABSENT means "unknown" - the client then keys the entry on its exact URL.
@@ -378,11 +402,6 @@ export interface SegmentMeta {
   pageVary?: string[]
 }
 
-/** The segment-request key the client sends for the whole-route body segment. */
-export function segmentBodyPath(): string {
-  return ROUTE_SEGMENT_PATH
-}
-
 /** Build the `.meta` sidecar for a route (whole-route single-segment milestone). */
 export function buildSegmentMeta(options: {
   status: number
@@ -390,7 +409,11 @@ export function buildSegmentMeta(options: {
   postponed: boolean
   bodySizeBytes?: number
   inlineBudgetBytes?: number
-  prefetchHints?: Record<string, number>
+  prefetchHints?: number
+  runtime?: number
+  shellRuntime?: number
+  runtimeNeeded?: number
+  staleTimeDeclared?: boolean
   /** The build render's tracked vary set — omitted when it is not trustworthy. */
   vary?: ResponseVaryParams
 }): SegmentMeta {
@@ -408,7 +431,13 @@ export function buildSegmentMeta(options: {
       ? { segmentSizes: { [ROUTE_SEGMENT_PATH]: options.bodySizeBytes } }
       : {}),
     ...(inlined ? { inlinedSegmentPaths: [ROUTE_SEGMENT_PATH] } : {}),
-    ...(options.prefetchHints ? { prefetchHints: options.prefetchHints } : {}),
+    ...(options.prefetchHints !== undefined
+      ? { prefetchHints: { hints: options.prefetchHints, slots: null } }
+      : {}),
+    ...(options.runtime !== undefined ? { runtime: options.runtime } : {}),
+    ...(options.shellRuntime !== undefined ? { shellRuntime: options.shellRuntime } : {}),
+    ...(options.runtimeNeeded ? { runtimeNeeded: options.runtimeNeeded } : {}),
+    ...(options.staleTimeDeclared ? { staleTimeDeclared: true } : {}),
     ...(options.vary
       ? {
           vary: varyNamesFor(options.vary, 'body'),
@@ -431,28 +460,44 @@ export function buildSegmentMeta(options: {
  * Same content-type + staleness headers as the tree; the client stitches this
  * fragment into the DOM on navigation.
  */
-export function segmentBodyResponse(
-  body: string,
-  staleTimeSeconds: number,
+export function segmentBodyResponse({
+  body,
+  staleTime,
   postponed = false,
   prerendered = false,
-  deploymentId?: string,
-  segment: string = ROUTE_SEGMENT_PATH,
-  vary?: SegmentVaryInfo,
-  shell?: SegmentAppShell,
-): Response {
+  deploymentId,
+  segment = ROUTE_SEGMENT_PATH,
+  vary,
+  shell,
+  fallback,
+  runtimeNeeded,
+}: {
+  body: string
+  staleTime: number
+  postponed?: boolean
+  prerendered?: boolean
+  deploymentId?: string
+  segment?: string
+  vary?: SegmentVaryInfo
+  shell?: SegmentAppShell
+  /** An upgradeable ISR fallback: 1 = a runtime prefetch may replace it, 2 = static only. */
+  fallback?: 1 | 2
+  runtimeNeeded?: number
+}): Response {
   // A COMPLETE prerendered segment is static content: CDN-cacheable, exactly like Next serves prerendered
   // payloads. Correctness against a Vary-ignoring CDN comes from the per-variant `_rsc` cache-buster and
   // the revalidation-versioned redirects, NOT from no-store. Anything dynamic or truncated stays private.
-  const cacheable = prerendered && !postponed
+  const cacheable = prerendered && !postponed && !fallback
   return new Response(segmentBodyText(segment, body, 'flight', vary, shell), {
     status: 200,
     headers: {
       'content-type': RSC_CONTENT_TYPE_HEADER,
-      'x-nextjs-stale-time': String(staleTimeSeconds),
+      'x-nextjs-stale-time': String(staleTime),
       'x-nextjs-postponed': '2',
       ...(postponed ? { 'x-pnext-segment-postponed': '1' } : {}),
       ...(prerendered ? { 'x-nextjs-prerender': '1' } : {}),
+      ...(fallback ? { 'x-pnext-fallback': String(fallback) } : {}),
+      ...(runtimeNeeded ? { 'x-pnext-runtime-needed': String(runtimeNeeded) } : {}),
       ...(deploymentId ? { 'x-nextjs-deployment-id': deploymentId } : {}),
       // Mirrored onto headers so a header-only consumer (and the client's
       // cheap pre-parse path) sees the vary set without decoding the body.
@@ -476,6 +521,10 @@ export function treeSegmentFile(outPath: string, routeId: string): string {
 }
 export function bodySegmentFile(outPath: string, routeId: string): string {
   return `${segmentDir(outPath, routeId)}/index.segment.rsc`
+}
+/** The prefetch shell baked for one root-param prefix of a route (`pprSubShells[].key`). */
+export function shellSegmentFile(outPath: string, routeId: string, key: string): string {
+  return `${segmentDir(outPath, routeId)}/${key}.shell.rsc`
 }
 export function segmentMetaFile(outPath: string, routeId: string): string {
   return `${segmentDir(outPath, routeId)}/route.segment.meta`

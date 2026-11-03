@@ -15,6 +15,9 @@ declare global {
   var __PNEXT_BASE_PATH__: string | undefined
 }
 
+// Compat client builds define it from next.config, so an app without a basePath drops these helpers.
+declare const __PNEXT_HAS_BASE_PATH__: boolean | undefined
+
 /**
  * The configured basePath ('' when unset). Isomorphic: the client reads the
  * `window` global the server injects (register-render basePathScript); the
@@ -34,6 +37,7 @@ export function basePath(): string {
  * no-basePath app is always a no-op.
  */
 export function addBasePath(path: string): string {
+  if (typeof __PNEXT_HAS_BASE_PATH__ === 'boolean' && !__PNEXT_HAS_BASE_PATH__) return path
   const base = basePath()
   if (!base) return path
   if (!path.startsWith('/') || path.startsWith('//')) return path
@@ -44,6 +48,7 @@ export function addBasePath(path: string): string {
 
 /** Strip the configured basePath prefix from an in-app path (inverse of addBasePath). */
 export function stripBasePath(path: string): string {
+  if (typeof __PNEXT_HAS_BASE_PATH__ === 'boolean' && !__PNEXT_HAS_BASE_PATH__) return path
   const base = basePath()
   if (!base) return path
   if (path === base) return '/'
@@ -56,6 +61,7 @@ export function stripBasePath(path: string): string {
  * hard-navigate to it (a `basePath:false` target). Always false when no basePath is configured.
  */
 export function isOutsideBasePath(url: URL): boolean {
+  if (typeof __PNEXT_HAS_BASE_PATH__ === 'boolean' && !__PNEXT_HAS_BASE_PATH__) return false
   const base = basePath()
   if (!base) return false
   if ((process.browser || typeof window !== 'undefined') && url.origin !== window.location.origin)

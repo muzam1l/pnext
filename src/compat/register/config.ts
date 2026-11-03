@@ -7,11 +7,19 @@
 
 import { registerConfigSource as registerCoreConfigSource } from '../../config'
 import type { ConfigSourceOverrides } from '../../config'
-import { loadNextConfig } from '../next/config-loader'
+import { setBuildCompatExtensions } from '../../extensions'
+import { getNextConfig, loadNextConfig } from '../next/config-loader'
 
 export function registerConfigSource(): void {
   registerCoreConfigSource(async (root, options): Promise<ConfigSourceOverrides> => {
     const { overrides } = await loadNextConfig(root, options)
     return overrides
+  })
+  // `start` reads the output mode without the build tier.
+  setBuildCompatExtensions({
+    nextOutputMode: () => {
+      const output = getNextConfig().output
+      return output === 'export' || output === 'standalone' ? output : undefined
+    },
   })
 }

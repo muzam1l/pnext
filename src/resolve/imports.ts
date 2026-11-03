@@ -48,8 +48,6 @@ export interface ExternalPackagePolicy {
    * transpile.
    */
   transpiled?: () => readonly string[]
-  /** Kept out of a release's server dependency graph beyond `external`: Next's built-in list. */
-  releaseExternal?: (packageName: string) => boolean
   /** ESM external mode for package exports interop. */
   esmExternals: () => boolean | 'loose'
 }
@@ -202,7 +200,12 @@ export function resolveImport(
     return resolveLocalFile(path.dirname(realImportPath(fromFile)), specifier)
   }
 
-  if (path.isAbsolute(specifier)) return probeFile(specifier, localConditions)
+  if (path.isAbsolute(specifier)) {
+    return (
+      probeFile(specifier, localConditions) ??
+      probeFile(path.join(root, specifier), localConditions)
+    )
+  }
 
   const resolutionRoot = resolutionRootForFile(root, fromFile)
 
@@ -350,7 +353,7 @@ function resolveWorkspacePackageImport(root: string, specifier: string, boundary
   const packageName = packageNameFromSpecifier(specifier)
   if (!packageName) return undefined
 
-  const packageRoot = workspacePackages(workspaceRoot).get(packageName)
+  const packageRoot = workspacePackageRoot(root, packageName, workspaceRoot)
   if (!packageRoot) return undefined
 
   const packageJson = readPackageJson(packageRoot)
@@ -963,6 +966,18 @@ function workspacePackages(root: string) {
 
 const workspaceMembershipCache = new Map<string, boolean>()
 
+function workspacePackageRoot(root: string, name: string, boundary: string): string | undefined {
+  let dir = path.resolve(root)
+  while (isInside(boundary, dir)) {
+    const declared = workspacePackages(dir).get(name)
+    if (declared) return declared
+    const parent = path.dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return undefined
+}
+
 /**
  * True when `name` is first-party workspace source. The workspace manifest (bun/npm `workspaces`,
  * pnpm-workspace.yaml) is the only authority - a node_modules symlink is not, since pnpm links every
@@ -975,12 +990,12 @@ export function isWorkspacePackage(root: string, name: string, boundary?: string
   if (cached !== undefined) return cached
 
   const workspaceRoot = boundary ? path.resolve(boundary) : findWorkspaceRoot(root)
-  let member = Boolean(workspaceRoot && workspacePackages(workspaceRoot).has(name))
+  let member = Boolean(workspaceRoot && workspacePackageRoot(root, name, workspaceRoot))
   if (!member && !boundary) {
     const packageRoot = findNodePackageRoot(path.resolve(root), name)
     const real = packageRoot ? realImportPath(packageRoot) : undefined
     const linkedRoot = real ? findWorkspaceRoot(real) : undefined
-    const declared = linkedRoot ? workspacePackages(linkedRoot).get(name) : undefined
+    const declared = linkedRoot && real ? workspacePackageRoot(real, name, linkedRoot) : undefined
     member = Boolean(declared && realImportPath(declared) === real)
   }
 

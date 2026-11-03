@@ -9,6 +9,7 @@ import {
   consumedSegments,
   isGroupSegment,
   isSlotSegment,
+  layoutParamNamesForDir,
   matchSegments,
   matchSlotInterceptor,
   pathnameSegments,
@@ -16,6 +17,7 @@ import {
   slotDirectoriesIn,
   type SegmentMatch,
 } from '../routing/slots'
+export { layoutParamNamesForDir } from '../routing/slots'
 import { toPosixPath } from '../utils/fs'
 import { PROMISE_MARKER_KEY, revivePromiseMarkers } from '../utils/serialize'
 import { getRenderExtensions } from '../extensions'
@@ -31,7 +33,10 @@ interface SlotRenderOptions {
     state?: { childrenSearch?: string; slots?: Record<string, string> }
   }
   route: Pick<RouteManifestEntry, 'clientReferences' | 'slotDirs'>
+  slotFallback?: { dir: string; tree: ComponentChildren }
   params?: Record<string, RouteParamValue>
+  fallbackParams?: boolean
+  fallbackConcreteParams?: Record<string, RouteParamValue>
   clientComponents?: Map<string, ComponentType<Record<string, unknown>>>
   slotStateOut?: Record<string, string>
   moduleLoader?: (file: string) => Promise<Record<string, unknown>> | Record<string, unknown>
@@ -158,7 +163,7 @@ export async function renderDirSlots<Options extends SlotRenderOptions>(
     // the boundary marker would make it a truthy VNode, and an unmatched
     // `@children` slot must stay falsy so childrenFromSlots can fall back to
     // the segment-matched children tree.
-    props[basename(slotDir).slice(1)] = content == null ? null : wrapSlotBoundary(content)
+    props[basename(slotDir).slice(1)] = content == null ? null : wrapSlotBoundary(content, slotDir)
   }
   return props
 }
@@ -168,6 +173,7 @@ async function resolveSlotContent<Options extends SlotRenderOptions>(
   slotDir: string,
   consumed: number,
 ): Promise<ComponentChildren> {
+  if (context.options.slotFallback?.dir === slotDir) return context.options.slotFallback.tree
   const key = toPosixPath(relative(context.appPath, slotDir))
 
   // Interceptor targets are absolute paths, so the navigated URL applies to
@@ -312,7 +318,11 @@ export const paramsScopeSymbol = Symbol.for('pnext.paramsScope')
 
 const PARAMS_SCOPE_PROP = '__pnextParams'
 
-const paramsSnapshotStorage = new AsyncLocalStorage<RouteParamsSnapshot>()
+// Anchored on globalThis so the built compat-server copy of this module reads the same scope.
+const PARAMS_SNAPSHOT_STORAGE = Symbol.for('pnext.paramsSnapshotStorage')
+const paramsSnapshotStorage = ((globalThis as Record<PropertyKey, unknown>)[
+  PARAMS_SNAPSHOT_STORAGE
+] ??= new AsyncLocalStorage<RouteParamsSnapshot>()) as AsyncLocalStorage<RouteParamsSnapshot>
 
 type ParamsScopeMarker = ((props: ServerVNodeProps) => ComponentChildren) & {
   [paramsScopeSymbol]?: true
@@ -336,9 +346,35 @@ type SlotBoundaryMarker = ((props: ServerVNodeProps) => ComponentChildren) & {
 const SlotBoundaryMarker: SlotBoundaryMarker = props => props.children
 SlotBoundaryMarker[slotBoundarySymbol] = true
 
+const SLOT_DIR_PROP = '__pnextSlotDir'
+
 /** Wrap a named parallel-route slot subtree in the task-boundary marker. */
-export function wrapSlotBoundary(content: ComponentChildren): ComponentChildren {
-  return h(SlotBoundaryMarker as ComponentType<ServerVNodeProps>, null, content)
+export function wrapSlotBoundary(content: ComponentChildren, slotDir: string): ComponentChildren {
+  return h(
+    SlotBoundaryMarker as ComponentType<ServerVNodeProps>,
+    { [SLOT_DIR_PROP]: slotDir },
+    content,
+  )
+}
+
+/**
+ * A slot marker the server-tree resolver reached is rendered: record it, and wrap its content in the
+ * slot's metadata outlet so the outcome surfaces where the slot renders.
+ */
+export function enterSlotMarker<Node extends { type: unknown; props: Record<string, unknown> }>(
+  node: Node,
+  rendered: Set<string> | undefined,
+  outlets: Map<string, (content: ComponentChildren) => ComponentChildren> | undefined,
+): Node {
+  if (!(node.type as { [slotBoundarySymbol]?: true })[slotBoundarySymbol]) return node
+  const dir = node.props[SLOT_DIR_PROP] as string
+  rendered?.add(dir)
+  const outlet = outlets?.get(dir)
+  if (!outlet) return node
+  return {
+    ...node,
+    props: { ...node.props, children: outlet(node.props.children as ComponentChildren) },
+  }
 }
 
 /** Read the params for the slot scope active in the current async resolution. */
@@ -440,9 +476,11 @@ function slotPageProps<Options extends SlotRenderOptions>(
     context.soft && context.childrenPath !== trimPathname(context.options.url.pathname)
       ? context.childrenSearch
       : context.urlSearch
+  const shell = context.options.fallbackParams || context.options.fallbackConcreteParams
   return {
     ...base,
-    params: Promise.resolve({ ...(context.options.params ?? {}), ...params }),
+    // A shell prerender's params hang (or fill only a concrete prefix): the slot reads the same view.
+    ...(shell ? {} : { params: Promise.resolve({ ...(context.options.params ?? {}), ...params }) }),
     // A slot rendered from a source whose query differs (a recorded refetch
     // URL, or the target URL's query on a host render) sees ITS source's
     // searchParams — mirrors Next's per-segment refetch semantics.
@@ -617,30 +655,12 @@ export function layoutParamsForDir(
   layoutDir: string,
   params: Record<string, RouteParamValue>,
 ): Record<string, RouteParamValue> {
-  const relativeDir = relative(appPath, layoutDir)
-  if (relativeDir.startsWith('..')) return {}
   const scoped: Record<string, RouteParamValue> = {}
-  for (const name of relativeDir.split(sep).filter(Boolean)) {
-    if (isSlotSegment(name) || isGroupSegment(name)) continue
-    const optional = /^\[\[\.\.\.([^\]]+)\]\]$/.exec(name)
-    if (optional?.[1]) {
-      const value = params[optional[1]]
-      // Empty optional catch-all: omit entirely (no params object for the layout).
-      if (value !== undefined && (Array.isArray(value) ? value.length > 0 : value != null)) {
-        scoped[optional[1]] = value
-      }
-      continue
-    }
-    const catchAll = /^\[\.\.\.([^\]]+)\]$/.exec(name)
-    if (catchAll?.[1]) {
-      const value = params[catchAll[1]]
-      if (value !== undefined) scoped[catchAll[1]] = value
-      continue
-    }
-    const dynamic = /^\[([^\].]+)\]$/.exec(name)
-    if (dynamic?.[1]) {
-      const value = params[dynamic[1]]
-      if (value !== undefined) scoped[dynamic[1]] = value
+  for (const name of layoutParamNamesForDir(appPath, layoutDir)) {
+    const value = params[name]
+    // Empty optional catch-all: omit entirely (no params object for the layout).
+    if (value !== undefined && (Array.isArray(value) ? value.length > 0 : value != null)) {
+      scoped[name] = value
     }
   }
   return scoped

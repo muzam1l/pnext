@@ -1,48 +1,30 @@
 // FIRST-PAINT half of the client error runtime. Everything ./install does only ever runs once
-// something has already thrown, so it rides the router runtime's deferred tier instead of first
-// paint. The in-tree ClientErrorBoundary stays eager: it renders.
+// something has already thrown, so it loads on idle instead of at first paint. The in-tree
+// ClientErrorBoundary stays eager: it renders.
 //
 // What DOES stay eager is a pair of capture-only listeners: an error thrown during hydration or in
-// a first-paint effect fires long before the idle tier lands, and Next still shows global-error for
-// it. They buffer the value, pull ./install right away, and hand it over - so a healthy page still
-// never fetches the chunk.
-import { options } from 'preact'
-import { registerDeferredInstall } from '../../../client/router'
+// a first-paint effect fires before the idle load lands, and Next still shows global-error for it.
+// They buffer the value, pull ./install right away, and hand it over.
 import type { InstallOptions } from './install'
-
-// Same key ./install reads (Symbol.for crosses the chunk boundary): only values the preact
-// boundary walk rethrew — a ROOT RENDER failure, Next's global-error case — may replace the
-// document. Every other uncaught window value (event handlers, third-party noise, ResizeObserver
-// loop events) is buffered for triage but the page survives, as it does under Next.
-const RENDER_ESCAPE = Symbol.for('pnext.renderEscape')
-
-/** Tag boundary-walk escapes before the deferred runtime exists (a hydration throw fires first). */
-function tagRenderEscapes(): void {
-  const hooks = options as unknown as Record<string, unknown>
-  const key = (['_catchError', '__e'] as const).find(name => typeof hooks[name] === 'function')
-  if (!key) return
-  const walkBoundaries = hooks[key] as (...args: unknown[]) => unknown
-  hooks[key] = function taggedCatchError(this: unknown, ...args: unknown[]) {
-    try {
-      return walkBoundaries.apply(this, args)
-    } catch (error) {
-      if (error !== null && typeof error === 'object') {
-        try {
-          ;(error as Record<symbol, unknown>)[RENDER_ESCAPE] = true
-        } catch {
-          // frozen throw value: the runtime's own escalation still mounts post-install
-        }
-      }
-      throw error
-    }
-  }
-}
+import { whenIdle } from '../../../client/router'
+import { installSuspenseCatch } from '../../react/use'
 
 type ErrorRuntime = typeof import('./install')
 
+let installedRuntime: (() => Promise<ErrorRuntime>) | undefined
+
+/**
+ * The error runtime, installed with this page's options first: an escalation must see the app's
+ * global-error component even when no idle load ever ran the install.
+ */
+export function errorRuntime(): Promise<ErrorRuntime> {
+  return installedRuntime?.() ?? import('./install')
+}
+
 export function installClientErrors(installOptions: InstallOptions = {}): void {
   if (!process.browser && typeof window === 'undefined') return
-  tagRenderEscapes()
+  // Tags boundary-walk escapes before the deferred runtime exists (a hydration throw fires first).
+  installSuspenseCatch()
 
   let runtime: Promise<ErrorRuntime> | undefined
   const load = () =>
@@ -79,12 +61,14 @@ export function installClientErrors(installOptions: InstallOptions = {}): void {
   window.addEventListener('error', onError)
   window.addEventListener('unhandledrejection', onRejection)
 
+  installedRuntime = load
   // A streamed server error has already thrown: Next shows its boundary while hydrating, not on idle.
   const pullForStreamError = () => {
     if (document.querySelector('pnext-error')) void load()
   }
   pullForStreamError()
   document.addEventListener('DOMContentLoaded', pullForStreamError)
-
-  registerDeferredInstall(load)
+  // Idle, not with the router: a router-free page never loads that, yet errors must still reach
+  // error.js and global-error synchronously once the page is interactive.
+  whenIdle(() => void load().catch(() => undefined))
 }

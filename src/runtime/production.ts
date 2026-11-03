@@ -60,6 +60,8 @@ export interface CompatReleaseFacts {
   cacheHandlers: Record<string, string>
   /** Materialized pages-router route wrappers, root-relative. */
   pagesRoutes: string[]
+  /** Edge middleware sandbox bundles (the middleware graph, the instrumentation edge pass), out-relative. */
+  edgeSandbox?: { proxy: string; instrumentation?: string }
 }
 
 /** The loaded release, resolved against where it is served from. */

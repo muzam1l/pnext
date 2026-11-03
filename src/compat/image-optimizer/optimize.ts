@@ -255,7 +255,10 @@ async function optimizeImage(
     .rotate()
     .resize(width, undefined, { withoutEnlargement: true })
   if (contentType === AVIF) {
-    transformer = transformer.avif({ quality: Math.max(quality - 20, 1), effort: 3 })
+    transformer = transformer.avif({
+      quality: Math.max(Math.round(quality * (50 / 80)), 1),
+      effort: 3,
+    })
   } else if (contentType === WEBP) {
     transformer = transformer.webp({ quality })
   } else if (contentType === PNG) {

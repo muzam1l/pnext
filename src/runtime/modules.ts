@@ -22,6 +22,7 @@ import {
   serverBundleConditions,
   serverBundleRequireConditions,
   serverCssModuleSource,
+  serverRequireAlias,
   type ServerBundleTarget,
 } from './loader'
 import {
@@ -62,6 +63,7 @@ import {
 } from '../resolve/imports'
 import {
   absolutePathLiterals,
+  importMetaRefs,
   importSpecifiers,
   lineComments,
   moduleSpecifierEdges,
@@ -1301,11 +1303,9 @@ async function resolveRouteBundleSpecifier(
     }
   }
 
-  // A `turbopack.rules` loader chain owns this specifier (see the same check in
-  // resolveDevModuleSpecifier): import its materialized output.
-  const pendingRuleModule = getAssetExtensions().loaderRuleModule(specifier, importer)
+  const pendingRuleModule = loaderRuleSource(config, specifier, importer, options)
   const ruleModule = pendingRuleModule === undefined ? undefined : await pendingRuleModule
-  if (ruleModule) return { path: pathToFileHref(ruleModule), external: true }
+  if (ruleModule) return { path: ruleModule, namespace }
 
   if (isServerIgnoredAssetSpecifier(specifier)) return undefined
 
@@ -1727,7 +1727,11 @@ function missingCompiledArtifact(entry: string): string | undefined {
       return file
     }
     const targets: string[] = []
-    for (const { specifier, kind } of moduleSpecifierEdges(source, file)) {
+    // A release relocates a bundled `require` into a `new URL(…, import.meta.url)` literal.
+    const urls = importMetaRefs(file, source)
+      .urls.filter(url => source.startsWith('require(new URL(', url.start - 16))
+      .map(url => ({ ...url, kind: 'require' }))
+    for (const { specifier, kind } of [...moduleSpecifierEdges(source, file), ...urls]) {
       // A dynamic import is an on-demand publication boundary: its target may
       // belong to a later client-chunk phase even when both artifacts share a
       // profile directory. Static imports must be complete before evaluation.
@@ -2605,15 +2609,19 @@ async function resolveDevModuleSpecifier(
     return { path: specifier, external: true }
   }
 
-  // A `turbopack.rules` loader chain owns this specifier (`?query` and all):
-  // import the module its output was materialized to. The seam answers a bare
-  // `undefined` when nothing is configured, so the common path stays sync.
-  const pendingRuleModule = getAssetExtensions().loaderRuleModule(
+  const pendingRuleModule = loaderRuleSource(
+    config,
     specifier,
     importer && !importer.startsWith('<') ? importer : file,
+    options,
   )
   const ruleModule = pendingRuleModule === undefined ? undefined : await pendingRuleModule
-  if (ruleModule) return { path: pathToFileHref(ruleModule), external: true }
+  if (ruleModule) {
+    return {
+      path: pathToFileHref(await writeDevModule(config, ruleModule, visited, options)),
+      external: true,
+    }
+  }
 
   const { sourcePath, hash } = splitHash(specifier)
 
@@ -2638,7 +2646,12 @@ async function resolveDevModuleSpecifier(
     pagesCompatSourceAlias(config, specifier, importer, options) ?? options.aliases[specifier]
   if (compatAlias) {
     if (kind === 'require-call' && path.isAbsolute(compatAlias)) {
-      return { path: serverRequireAlias(specifier, compatAlias, options) }
+      return {
+        path:
+          options.conditionTarget === 'client'
+            ? compatAlias
+            : serverRequireAlias(specifier, compatAlias, 'require-call'),
+      }
     }
     // A compat alias pointing at a 'use client' file needs the SAME stub-and-match treatment as any
     // other local client component: the render tree walk recognizes a client boundary by a
@@ -2845,17 +2858,6 @@ function offLayerPackageTarget(
   if (!resolved) return specifier
   // `require()` takes a path; only an ESM import takes a file href.
   return isRequire ? resolved : pathToFileHref(resolved)
-}
-
-function serverRequireAlias(specifier: string, alias: string, options: DevModuleOptions) {
-  if (options.conditionTarget === 'client') return alias
-  if (specifier === 'next/navigation' && alias.endsWith(`${path.sep}navigation.ts`)) {
-    return path.join(path.dirname(alias), 'navigation.cjs')
-  }
-  if (specifier === 'next/router' && alias.endsWith(`${path.sep}router.ts`)) {
-    return path.join(path.dirname(alias), 'router.cjs')
-  }
-  return alias
 }
 
 function registerExternalLoadHandlers(
@@ -3215,6 +3217,22 @@ async function writeClientReferenceModule(file: string, sourceFile: string, expo
     file,
     clientReferenceModuleSource(sourceFile, exportNames, portableReference(file, sourceFile)),
   )
+}
+
+// Loader-rule output compiles as app source; a raw 'use client' file falls through to its stub.
+function loaderRuleSource(
+  config: ResolvedConfig,
+  specifier: string,
+  importer: string,
+  options: DevModuleOptions,
+) {
+  const pending = getAssetExtensions().loaderRuleModule(specifier, importer)
+  if (pending === undefined || !options.stubClientImports) return pending
+  return Promise.resolve(pending).then(async file => {
+    const base = splitResourceQuery(specifier).path
+    const original = file && resolveImport(config.root, importer, base, config.workspaceRoot)
+    return original && (await fileHasUseClientDirective(original)) ? undefined : file
+  })
 }
 
 async function fileHasUseClientDirective(file: string) {

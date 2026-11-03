@@ -233,7 +233,7 @@ export async function staticRouteParams(route: RouteManifestEntry, module: Route
 }
 
 export function routeParamsFromPath(
-  route: Pick<RouteManifestEntry, 'catchAll' | 'params' | 'pattern'>,
+  route: Pick<RouteManifestEntry, 'catchAll' | 'catchAllOptional' | 'params' | 'pattern'>,
   pathname: string,
 ) {
   const match = new RegExp(`^${route.pattern}$`).exec(pathname)
@@ -244,10 +244,10 @@ export function routeParamsFromPath(
     params[route.params[index]!] = safeDecode(match[index + 1] ?? '')
   }
   if (route.catchAll) {
-    params[route.catchAll] = (match[route.params.length + 1] ?? '')
-      .split('/')
-      .filter(Boolean)
-      .map(safeDecode)
+    const values = (match[route.params.length + 1] ?? '').split('/').filter(Boolean)
+    if (values.length > 0 || !route.catchAllOptional) {
+      params[route.catchAll] = values.map(safeDecode)
+    }
   }
   return params
 }

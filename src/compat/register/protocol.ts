@@ -11,6 +11,10 @@ import {
 import { cacheControlFinalizers } from '../cache-control'
 import { protocolFinalizers, protocolInterceptors } from '../protocol'
 import { registerResourceHintFinalizer } from '../next/resource-hints'
+import { syncIoMessage } from '../validation/errors'
+import { setRuntimePrefetchSyncIoReporter } from '../../render/ppr'
+import { nextRoutePattern } from '../../routing/match'
+import { recordPrerenderError } from '../cache/build-prerender-errors'
 
 /**
  * The router-state-tree validation interceptor, registered on its own so the
@@ -53,4 +57,11 @@ export function registerProtocolExtensions(config: ResolvedConfig): void {
   })
   registerResponseFinalizers(...protocolFinalizers(config), ...cacheControlFinalizers(config))
   registerResourceHintFinalizer()
+  // Sync IO fails a build shell; a runtime prefetch leaves it for the navigation and Next logs where.
+  setRuntimePrefetchSyncIoReporter((expression, route, build) => {
+    const pattern = nextRoutePattern(route)
+    const message = syncIoMessage(pattern, expression)
+    if (build) recordPrerenderError({ kind: 'sync-io', route: pattern, consoleBlock: message })
+    else console.error(message)
+  })
 }

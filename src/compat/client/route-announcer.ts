@@ -3,7 +3,6 @@
 // readers announce client-side route changes that would otherwise be silent
 // (no full document load). The DOM name is Next-specific, so it lives in compat;
 // core exposes an `onNavigationCommit` hook that this module subscribes to.
-import { onNavigationCommit } from '../../client/router/events'
 
 const ANNOUNCER_TAG = 'next-route-announcer'
 
@@ -64,7 +63,7 @@ function announce() {
   node.textContent = next
 }
 
-export function installRouteAnnouncer() {
+export function installRouteAnnouncer(onNavigationCommit: (listener: () => void) => unknown) {
   if (!process.browser && typeof window === 'undefined') return
   // Create the empty announcer up front so it exists on first load with `''`.
   ensureAnnouncer()

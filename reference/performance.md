@@ -14,11 +14,17 @@ For interactive tables and per-fixture values, see [pnext.dev/benchmarks](https:
 
 ## What ships to the browser
 
-Server-only routes ship 0 KB of route JavaScript, because they need no browser runtime to render their content.
+First paint is what a page's document loads. Deferred is what the page can fetch after that: the navigation runtime loads on idle when the page has a `<Link>` and otherwise on first navigation, the `compat.next` error runtime loads on idle, and the server-action runtime loads only on a page with an action.
 
-For client navigation and prefetching, the prefetch-only runtime is 348 B gzip. The combined router and hydrator runtime is 4.47 KB gzip.
+| Page                                 | First paint (gzip) | Deferred (gzip)              |
+| ------------------------------------ | ------------------ | ---------------------------- |
+| Server-rendered page                 | 0 KB               | 0 KB                         |
+| Server-rendered page with a `<Link>` | 1.6 KB             | 21 KB, on idle               |
+| One island, core pnext (Preact)      | 8.5 KB             | 0 KB                         |
+| One island, `compat.react`           | 15 KB              | 0 KB                         |
+| One island, `compat.next`            | 13.3 KB            | 33 KB, of which 4 KB on idle |
 
-Routes using the Next compatibility layer carry its navigation client, so their client-JS numbers are not the core zero-JS case.
+`compat.next` ships Next's router bootstrap on every page, so its pages are never the 0 KB case. These rows are the "Client runtime bundles" table of `bun bench/run.ts --bundles`.
 
 ## The HMR result
 

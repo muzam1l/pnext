@@ -26,6 +26,23 @@ export async function generateTypedRoutes(
   const typedRoutes = nextConfig.typedRoutes === true
 
   const manifest = await buildRouteTypesManifest({ config, routes, nextConfig })
+  const appPaths = [...manifest.appPagePaths]
+    .map(
+      file =>
+        [
+          '/' +
+            toPosixPath(path.relative(config.appPath, path.join(config.root, file))).replace(
+              /\.[^.]+$/,
+              '',
+            ),
+          manifest.filePathToRoute.get(file)!,
+        ] as const,
+    )
+    .sort(([a], [b]) => Number(!a.includes('/@')) - Number(!b.includes('/@')) || a.localeCompare(b))
+  await writeIfChanged(
+    path.join(config.root, '.next', 'app-path-routes-manifest.json'),
+    JSON.stringify(Object.fromEntries(appPaths), null, 2) + '\n',
+  )
 
   // Next writes generated types into `<distDir>/types`; the harness maps
   // distDir to `.next`, and the fixtures read `<distDir>/types/*` + include
@@ -33,6 +50,14 @@ export async function generateTypedRoutes(
   const typesDir = path.join(config.root, '.next', 'types')
 
   await writeIfChanged(path.join(typesDir, 'routes.d.ts'), generateRouteTypesFile(manifest))
+  const cacheLife = nextConfig.cacheLife as Record<string, unknown> | undefined
+  const profiles = Object.entries(cacheLife ?? {})
+    .filter(([, value]) => value !== null && typeof value === 'object')
+    .map(([name]) => JSON.stringify(name))
+  await writeIfChanged(
+    path.join(typesDir, 'cache-life.d.ts'),
+    `export {}\n\ndeclare module 'next/cache' {\n  export interface CacheLifeProfiles {\n${profiles.map(name => `    ${name}: true`).join('\n')}\n  }\n${profiles.map(name => `  export function cacheLife(profile: ${name}): void`).join('\n')}\n}\n`,
+  )
 
   // Import specifiers in validator.ts are relative to the validator file's dir.
   const toImportSpecifier = (rootRelativePath: string): string => {
@@ -85,6 +110,7 @@ async function writeNextEnv(root: string, typedRoutes: boolean): Promise<void> {
     '/// <reference types="next" />',
     'import "./.next/types/routes.d.ts";',
     'import "./.next/types/root-params.d.ts";',
+    'import "./.next/types/cache-life.d.ts";',
   ]
   if (typedRoutes) lines.push('import "./.next/types/link.d.ts";')
   lines.push('', '// NOTE: This file should not be edited', '')

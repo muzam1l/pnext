@@ -1,13 +1,14 @@
 import { isNotFoundError, isRedirectError, type PNextRedirectError } from '../../api/navigation'
 import { runWithRequest, setPhase } from '../../request/context'
+import { getRenderSpanExtensions } from '../../render/hooks'
 import { toNextRequest } from '../../api/server'
 import { revalidationEventCount } from '../cache/revalidate'
 import { serializeBoundaryError } from '../lifecycle/error-serialize'
+import { runWithAfterRequestApiScope } from '../lifecycle/after-scope'
 import { lookupAction } from './registry'
 import { instanceActionRouteId, isInstanceActionId, lookupActionInstance } from './instances'
 import { inlineActionModuleKey, isInlineActionId } from './rewrite'
 import {
-  ACTION_STREAM_CONTENT_TYPE,
   createTempRefScope,
   extractTempRefs,
   isReadableStreamReturn,
@@ -32,6 +33,7 @@ import {
   ACTION_ERROR_DIGEST_HEADER,
   MASKED_ACTION_ERROR,
   MAX_ACTION_ARGS,
+  ACTION_STREAM_CONTENT_TYPE,
   tooManyArgsMessage,
   type ActionSuccessBody,
 } from './protocol'
@@ -82,6 +84,23 @@ export interface RunActionOptions {
 
 export const DEFAULT_BODY_LIMIT_BYTES = 1024 * 1024
 
+const ACTION_NOT_FOUND_DOCS =
+  'Read more: https://nextjs.org/docs/messages/failed-to-find-server-action'
+
+function unrecognizedActionMessage(id: string): string {
+  if (id.length === 42) {
+    return (
+      `Failed to find Server Action "${id}". This request might be from an older or newer deployment.\n` +
+      ACTION_NOT_FOUND_DOCS
+    )
+  }
+  const encoded = JSON.stringify(id.length > 100 ? `${id.slice(0, 90)}…` : id)
+  return (
+    `The Server Reference ID did not match the expected format. Received ${encoded}.\n` +
+    ACTION_NOT_FOUND_DOCS
+  )
+}
+
 /**
  * Server-side fallback for client-action stubs. A `'use server'` function imported into a client
  * component compiles, in the CLIENT bundle, to a stub that dispatches over `window.__PNEXT_ACTIONS__`.
@@ -125,10 +144,7 @@ export async function runAction(request: Request, options: RunActionOptions): Pr
   // route, whose SSR captures client stubs that dispatch back through here).
   installServerActionDispatch(options.importModule)
 
-  // A resolution failure (a compiled action module that fails to import, a route re-render that
-  // throws) must surface as the recognizable 404 not-found wire - never an unhandled 500 the client
-  // reads as "unexpected response". A forwarded action dispatched from another page hits the same
-  // global resolution and needs the same graceful degradation.
+  // Resolution failures use the unavailable-action wire so the client can recognize version skew.
   let action: ((...args: unknown[]) => unknown) | undefined
   try {
     action = await resolveAction(id, request, options)
@@ -137,21 +153,18 @@ export async function runAction(request: Request, options: RunActionOptions): Pr
     action = undefined
   }
   if (!action) {
-    // Wire + log shape asserted by the actions-unrecognized suite: the log is
-    // the two-line "Failed to find" text; the RPC body is the exact message
-    // React's flight client throws for a missing action (unmasked even in
-    // prod — version skew is actionable for users).
-    console.error(
-      `Failed to find Server Action "${id}". This request might be from an older or newer deployment.\n` +
-        'Read more: https://nextjs.org/docs/messages/failed-to-find-server-action',
-    )
-    return new Response(`Server Action "${id}" was not found on the server.`, {
-      status: 404,
-      headers: {
-        'content-type': 'text/plain; charset=utf-8',
-        [NEXT_ACTION_NOT_FOUND_HEADER]: '1',
+    console.error(unrecognizedActionMessage(id))
+    const status = id.length === 42 ? 409 : 400
+    return new Response(
+      status === 400 ? 'Invalid Server Action request.' : 'Server Action unavailable.',
+      {
+        status,
+        headers: {
+          'content-type': 'text/plain; charset=utf-8',
+          [NEXT_ACTION_NOT_FOUND_HEADER]: '1',
+        },
       },
-    })
+    )
   }
 
   const limit = options.maxBodyBytes ?? DEFAULT_BODY_LIMIT_BYTES
@@ -204,7 +217,12 @@ export async function runAction(request: Request, options: RunActionOptions): Pr
     setPhase('action')
     const data = await runWithRequest(
       nextRequest,
-      () => Promise.resolve(action(...args)),
+      () =>
+        runWithAfterRequestApiScope(true, () => {
+          return getRenderSpanExtensions().withRootSpanContext(() =>
+            Promise.resolve(action(...args)),
+          )
+        }),
       {},
       { responseHeaders },
     ).finally(() => setPhase('render'))
@@ -275,7 +293,7 @@ export async function runAction(request: Request, options: RunActionOptions): Pr
   }
 }
 
-async function resolveAction(
+export async function resolveAction(
   id: string,
   request: Request,
   options: RunActionOptions,

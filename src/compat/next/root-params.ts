@@ -4,9 +4,15 @@ import {
   hangingPromise,
   isPrerendering,
   isRuntimePrefetchPrerender,
+  isUnfilledShellParam,
+  RUNTIME_PARAMS,
 } from '../../render/ppr'
-import { currentRenderCacheMeta, insideUnstableCacheProducer } from '../cache/revalidate'
-import { insideUseCacheProducer, recordUseCacheRootParamRead } from '../cache/use-cache'
+import { insideUnstableCacheProducer } from '../cache/revalidate'
+import {
+  currentUseCacheRootParams,
+  insideUseCacheProducer,
+  recordUseCacheRootParamRead,
+} from '../cache/use-cache'
 import { generateStaticParamsScope } from '../static-params'
 import { accumulateRootVaryParam } from '../segment/vary-params'
 
@@ -94,15 +100,15 @@ export function rootParam<T = string | string[] | undefined>(name: string): Prom
   const gsp = generateStaticParamsScope()
   if (gsp) {
     if (name in gsp.provided) return Promise.resolve(gsp.provided[name] as T)
-    const route = (currentRenderCacheMeta()?.route ?? '')
-      .replace(/:\.\.\.([^/*]+)\*?/g, '[...$1]')
-      .replace(/:([^/*]+)\*/g, '[...$1]')
-      .replace(/:([^/*]+)/g, '[$1]')
+    const reason =
+      gsp.functionName === 'generateStaticParams'
+        ? `was not provided by a parent \`generateStaticParams\`. ` +
+          `In \`generateStaticParams\`, root params are only available for segments nested below the segment that provides them.`
+        : 'is not available in this build-time generator.'
     return Promise.reject(
       new Error(
-        `Route ${route} used \`import('${['next', 'root-params'].join('/')}').${name}()\` inside \`generateStaticParams\`, ` +
-          `but the \`${name}\` parameter was not provided by a parent \`generateStaticParams\`. ` +
-          `In \`generateStaticParams\`, root params are only available for segments nested below the segment that provides them.`,
+        `Route ${gsp.route} used \`import('${['next', 'root-params'].join('/')}').${name}()\` inside \`${gsp.functionName}\`, ` +
+          `but the \`${name}\` parameter ${reason}`,
       ),
     )
   }
@@ -111,19 +117,19 @@ export function rootParam<T = string | string[] | undefined>(name: string): Prom
   accumulateRootVaryParam(name)
   const error = rootParamContextError(name)
   if (error) return Promise.reject(error)
-  // A runtime-prefetch prerender renders against the REAL sampled request, so root params are concrete
-  // there (root params are always available in a static prerender, so a runtime prefetch has them too).
-  // Hanging them would postpone the ROOT LAYOUT itself - the whole document, not a boundary - so the
-  // render would produce no shell at all.
+  const value = currentUseCacheRootParams()[name]
+  // A prerender without this param (the route-level shell, an unfilled fallback param) hangs it: the
+  // read becomes a request-time hole. A runtime prefetch samples a real request, so it always resolves.
   if (
     !insideUseCacheProducer() &&
     cacheComponents() &&
     isPrerendering() &&
-    !isRuntimePrefetchPrerender()
+    !isRuntimePrefetchPrerender() &&
+    (isUnfilledShellParam(name) || value === undefined)
   ) {
-    return hangingPromise<T>(`rootParam(${name})`)
+    return hangingPromise<T>(`rootParam(${name})`, RUNTIME_PARAMS)
   }
-  const value = currentParams()[name]
+  if (isUnfilledShellParam(name)) return hangingPromise<T>(`rootParam(${name})`, RUNTIME_PARAMS)
   return Promise.resolve((Array.isArray(value) && value.length === 0 ? undefined : value) as T)
 }
 

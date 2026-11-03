@@ -213,6 +213,12 @@ export async function fetchInternalImage(
       headers: { 'x-pnext-internal-image': '1' },
     })
 
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined)
+      console.error('internal image response failed for', href, res.status)
+      throw new ImageError(res.status, '"url" parameter is valid but internal response is invalid')
+    }
+
     if (!res.body) {
       console.error('internal image response is empty for', href)
       throw new ImageError(400, '"url" parameter is valid but internal response is invalid')

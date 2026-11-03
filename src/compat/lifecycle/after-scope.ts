@@ -57,21 +57,32 @@ export function lifecycleError(message: string): Error {
   } as unknown as Error
 }
 
+const stageSuffix = (api: string, purpose: string) =>
+  ` The \`${api}\` function is used to indicate the subsequent code ${purpose}, but \`after()\` executes after the request, so this function is not allowed in this scope. See more info here: https://nextjs.org/docs/app/api-reference/functions/after`
+const AFTER_SUFFIX: Partial<Record<string, string>> = {
+  'headers()': ' This is not supported.',
+  'cookies()': ' This is not supported.',
+  'navigation()': stageSuffix('navigation()', 'must only run during an actual navigation'),
+  'prefetch()': stageSuffix('prefetch()', 'must not run in the app shell'),
+}
+
 /**
  * Throw Next's "used inside after()" error when a request API is accessed from a
  * detached after() callback (render phase, no live request scope). Returns
  * without throwing in every legal case so callers proceed to the normal path.
  */
 export function assertRequestApiAllowedInAfter(
-  api: 'headers()' | 'cookies()' | 'connection()',
+  api: 'headers()' | 'cookies()' | 'connection()' | 'io()' | 'navigation()' | 'prefetch()',
 ): void {
   const unit = getWorkUnit()
   if (unit?.phase !== 'after') return
   // Rendering keeps a synthetic request context during prerendering, so the
   // explicit after-task capability—not merely currentRequest()—defines this.
   if (afterRequestApisAllowed() && currentRequest()) return
-  const suffix = api === 'connection()' ? '' : ' This is not supported.'
-  throw lifecycleError(`Route ${currentRoutePath()} used \`${api}\` inside \`after()\`.${suffix}`)
+  const suffix = AFTER_SUFFIX[api] ?? ''
+  throw lifecycleError(
+    `Route ${currentRoutePath()} used \`${api}\` inside \`after()\` while rendering.${suffix}`,
+  )
 }
 
 /**

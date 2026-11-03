@@ -20,6 +20,7 @@ import {
   cssClassNames,
   cssModuleClassName,
   cssModuleMapping,
+  cssModuleSourceFromMap,
   isCssModuleFile,
   recordEmittedAsset,
 } from './assets'
@@ -125,13 +126,14 @@ export async function runPostcssOffThread(
   cssFile: string,
   options: { dev?: boolean },
   from?: string,
+  dependencies?: string[],
 ) {
   const dev = options.dev ?? false
   const { root } = config
   const outDir = scanOutDir(config, dev)
-  const sent = send(id => ({ kind: 'process', id, root, dev, outDir, cssFile, from }))
+  const sent = send(id => ({ kind: 'process', id, root, dev, outDir, cssFile, from, dependencies }))
   if (sent) return sent
-  return runPostcss(root, cssFile, { dev, outDir }, from)
+  return runPostcss(root, cssFile, { dev, outDir }, from, dependencies)
 }
 
 /**
@@ -175,6 +177,15 @@ export function globalCssSources(
 // (via globalCssHref) whether the app has global CSS at all. Memoize per root+appPath; dev clears
 // this on save (invalidateDevCaches), prod sources never change in-process.
 const globalCssSourceCache = new Map<string, string[]>()
+
+export function memoizedGlobalCssSources(
+  config: Pick<ResolvedConfig, 'root' | 'appPath' | 'workspaceRoot'>,
+) {
+  return (
+    globalCssSourceCache.get(`${config.root}\0${config.appPath}\0${config.workspaceRoot ?? ''}`) ??
+    []
+  )
+}
 
 /**
  * Restart half of the walk above: the store persists the answer keyed by every
@@ -300,7 +311,7 @@ export async function buildGlobalCss(config: ResolvedConfig, options: CssBuildOp
   )
 
   const postcss = hasPostcssConfig(config.root)
-  await log.step('global css: esbuild bundle', () =>
+  const { metafile } = await log.step('global css: esbuild bundle', () =>
     build({
       stdin: {
         contents: stdinImports(config.root, sources),
@@ -310,6 +321,7 @@ export async function buildGlobalCss(config: ResolvedConfig, options: CssBuildOp
       },
       outfile,
       bundle: true,
+      metafile: postcss,
       minify: !options.dev,
       conditions: ['style', 'browser'],
       assetNames: 'files/[name]-[hash]',
@@ -335,8 +347,12 @@ export async function buildGlobalCss(config: ResolvedConfig, options: CssBuildOp
   )
   if (postcss) {
     await rewriteTailwindConfigDirectives(outfile, sources)
+    // Every bundled file, nested @imports included; the stdin entry is keyed by its sourcefile.
+    const bundled = Object.keys(metafile?.inputs ?? {})
+      .filter(input => input !== 'global.css')
+      .map(input => path.resolve(input))
     await log.step('global css: postcss', () =>
-      runPostcssOffThread(config, outfile, options, sources[0]),
+      runPostcssOffThread(config, outfile, options, sources[0], bundled),
     )
   }
 
@@ -684,7 +700,7 @@ export function cssModuleClientPlugin(): Plugin {
     setup(plugin) {
       plugin.onLoad({ filter: /\.(?:css|scss|sass)$/ }, async ({ path: file }) => ({
         contents: isCssModuleFile(file)
-          ? `export default ${JSON.stringify(await cssModuleMapping(file))};`
+          ? cssModuleSourceFromMap(await cssModuleMapping(file))
           : 'export default undefined;',
         loader: 'js',
       }))

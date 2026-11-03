@@ -475,7 +475,7 @@ function releaseExternalsPlugin(
           args.kind === 'require-call'
             ? serverBundleRequireConditions(conditionTarget)
             : serverBundleConditions(conditionTarget)
-        const external = policy.external(name) || policy.releaseExternal?.(name)
+        const external = policy.external(name)
         if (!external && inPlace.size === 0) return undefined
         const fromImporter = resolveNestedPackageFromImporter(args.importer, args.path, conditions)
         // A package that loads in place is imported where it lies, when Bun loads it as-is.
@@ -3046,6 +3046,8 @@ async function bundleExternalPackageImpl(
   if (
     packageName &&
     resolvedEntry?.match(/\.[cm]?tsx?$/) &&
+    // Next compiles any file whose real path is outside node_modules (linked workspace sources).
+    /[\\/]node_modules[\\/]/.test(resolvedEntry) &&
     !getExternalPackagePolicy().transpile(packageName)
   ) {
     const parseFailure = `${path.relative(config.root, resolvedEntry)}\nModule parse failed: Unexpected token`

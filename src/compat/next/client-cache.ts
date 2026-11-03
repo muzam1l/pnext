@@ -4,6 +4,7 @@
  * Revalidation calls throw (as in Next), unstable_cache degrades to a
  * pass-through, and the 'use cache' companions are no-ops.
  */
+import { fulfilledThenable } from '../react/use'
 
 function serverOnly(name: string): never {
   throw new Error(`${name} can only be called from a Server Component or server function.`)
@@ -44,8 +45,12 @@ export function unstable_cache<Args extends unknown[], Result>(
 export function unstable_noStore() {
   return undefined
 }
-export function io(): Promise<void> {
-  return Promise.resolve()
+export const io = fulfilledThenable
+export function navigation(): never {
+  throw new Error('`navigation` is only available in a Server Component.')
+}
+export function prefetch(): never {
+  throw new Error('`prefetch` is only available in a Server Component.')
 }
 export function cacheTag(..._tags: string[]) {
   return undefined

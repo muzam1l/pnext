@@ -58,6 +58,10 @@ function __pnextAction(id) {
   action.$$pnextActionId = id;
   return action;
 }
+if (typeof window !== 'undefined') {
+  window.__PNEXT_ACTIONS_BOUND__ = true;
+  window.__PNEXT_ACTIONS__?.warm?.();
+}
 `
 
 function sanitizeComment(value: string): string {

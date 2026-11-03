@@ -10,6 +10,20 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
+import type { ResolvedConfig } from '../../config'
+import { productionRelease } from '../../runtime/production'
+
+const appRootParamsByConfig = new WeakMap<ResolvedConfig, ReadonlySet<string>>()
+
+/** The app's root params, from the production release when it recorded them, else one scan per config. */
+export function appRootParams(config: ResolvedConfig): ReadonlySet<string> {
+  let names = appRootParamsByConfig.get(config)
+  if (!names) {
+    names = new Set(productionRelease(config)?.compat?.rootParams ?? scanRootParams(config.appPath))
+    appRootParamsByConfig.set(config, names)
+  }
+  return names
+}
 
 const LAYOUT_BASENAMES = ['layout.tsx', 'layout.ts', 'layout.jsx', 'layout.js']
 
@@ -36,6 +50,37 @@ function findLayoutFile(dir: string): string | undefined {
     if (existsSync(candidate)) return candidate
   }
   return undefined
+}
+
+/** Scan the params above the nearest root layout for one route file. */
+export function scanRootParamsForFile(appPath: string, file: string): Set<string> {
+  let directory = path.dirname(file)
+  const root = path.resolve(appPath)
+  while (directory.startsWith(root)) {
+    const layout = findLayoutFile(directory)
+    if (layout) {
+      let source = ''
+      try {
+        source = readFileSync(layout, 'utf8')
+      } catch {
+        source = ''
+      }
+      if (isRootLayoutSource(source)) {
+        return new Set(
+          path
+            .relative(root, directory)
+            .split(path.sep)
+            .flatMap(segment => {
+              const name = paramNameOfSegment(segment)
+              return name ? [name] : []
+            }),
+        )
+      }
+    }
+    if (directory === root) break
+    directory = path.dirname(directory)
+  }
+  return new Set()
 }
 
 /**

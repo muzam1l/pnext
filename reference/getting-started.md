@@ -84,7 +84,7 @@ export function Counter({ initial }: { initial: number }) {
 }
 ```
 
-Client Components hydrate on Preact for ~7.5 KB of framework, or ~12.5 KB with [`compat.react`](./compat.md) if you want to run React components and libraries unchanged. Offscreen islands can stay out of the initial bundle entirely with `dynamic({ load: 'visible' })`.
+Client Components hydrate on Preact for ~8.5 KB gzip of framework, or ~15 KB with [`compat.react`](./compat.md) if you want to run React components and libraries unchanged. Offscreen islands can stay out of the initial bundle entirely with `dynamic({ load: 'visible' })`.
 
 ### Streaming
 

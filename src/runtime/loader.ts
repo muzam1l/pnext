@@ -65,6 +65,7 @@ export {
 } from './load'
 
 const require = createRequire(import.meta.url)
+const FRAMEWORK_SRC = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 
 /**
  * Pages-router PAGE SSR layer: Next compiles it in the server bundle with `node` (or
@@ -958,7 +959,7 @@ export function serverRequireAlias(
   kind: string | undefined,
 ): string {
   if (kind !== 'require-call') return target
-  if (specifier === 'next/navigation' && target.endsWith(`${path.sep}navigation.ts`)) {
+  if (specifier === 'next/navigation' && /[\\/]navigation(?:\.react-server)?\.ts$/.test(target)) {
     return path.join(path.dirname(target), 'navigation.cjs')
   }
   if (specifier === 'next/router' && target.endsWith(`${path.sep}router.ts`)) {
@@ -1077,8 +1078,9 @@ function rootFilter(root: string, projectRoot = false) {
     .flatMap(runtime => rootPaths(path.join(runtime.resolved.outPath, 'server')))
     .map(serverRoot => `(?!${escapeRegex(serverRoot)}(?:/|$))`)
     .join('')
+  // The framework's own source loads natively, as it does from node_modules: a lazy import is never an app module.
   return new RegExp(
-    `^${serverGuard}${escapeRegex(root)}${vendorGuard}(?!.*\\/node_modules\\/)(?!\\/next\\.config\\.(?:js|cjs|mjs|ts)$)(?:/.*)?\\.(?:${exts})$`,
+    `^${serverGuard}(?!${escapeRegex(FRAMEWORK_SRC)}/)${escapeRegex(root)}${vendorGuard}(?!.*\\/node_modules\\/)(?!\\/next\\.config\\.(?:js|cjs|mjs|ts)$)(?:/.*)?\\.(?:${exts})$`,
   )
 }
 
@@ -1170,8 +1172,8 @@ function coreStaticAssetModule(
 export async function serverCssModuleSource(file: string) {
   const registered = getCssExtensions().loadCssModuleForClient(file)
   if (registered !== undefined || !file.endsWith('.module.css')) return registered
-  const { cssModuleMapping } = await import('../css/assets')
-  return `export default ${JSON.stringify(await cssModuleMapping(file))};`
+  const { cssModuleMapping, cssModuleSourceFromMap } = await import('../css/assets')
+  return cssModuleSourceFromMap(await cssModuleMapping(file))
 }
 
 export function serverAssetPlugin(config?: ResolvedConfig): Plugin {

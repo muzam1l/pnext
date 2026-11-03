@@ -22,7 +22,7 @@
 //
 // Client-escaped errors carry NO digest, matching Next.
 
-import { h, options, render } from 'preact'
+import { h, options, render, type ComponentType } from 'preact'
 import { handleControlFlowError, isControlFlowError } from './control-flow'
 import {
   wasErrorHandled,
@@ -180,7 +180,7 @@ function installRenderEscapeEscalation(
 // When a server component inside a streaming Suspense boundary throws, the server can only flush a
 // static replacement chunk - the page shell already streamed with status 200. Next's behavior is to
 // render the NEAREST error.js boundary client-side with the serialized error (redacted message +
-// digest) and working reset()/unstable_retry(). The server stamps the serialized error onto the marker;
+// digest) and working reset()/retry(). The server stamps the serialized error onto the marker;
 // here we watch for those markers (initial scan plus a MutationObserver, since stream chunks land after
 // the entry module runs) and mount the route error.js over them. Both callbacks soft-refresh, so a
 // since-recovered server render replaces the boundary with real content.
@@ -210,7 +210,13 @@ function installStreamErrorBoundaries(
     const host = document.createElement('div')
     marker.replaceWith(host)
     const reset = () => softRefreshRoute()
-    render(h(errorComponent, { error, reset, unstable_retry: reset }), host)
+    const stableErrorComponent = errorComponent as ComponentType<{
+      error: unknown
+      reset: () => void
+      retry: () => void
+      unstable_retry: () => void
+    }>
+    render(h(stableErrorComponent, { error, reset, retry: reset, unstable_retry: reset }), host)
   }
 
   const scan = (root: ParentNode): void => {

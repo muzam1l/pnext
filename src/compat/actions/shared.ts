@@ -26,11 +26,15 @@ export interface ActionRuntime {
   createAction(id: string): ActionFunction
   registerClientReference(id: string, component: ComponentType<Record<string, unknown>>): void
   reviveProps<T>(value: T): T
+  /** Fetch the dispatch chunk ahead of the first call. */
+  warm(): void
 }
 
 declare global {
   interface Window {
     __PNEXT_ACTIONS__?: ActionRuntime
+    /** Set once any action reference exists on the page (a client stub or a revived prop). */
+    __PNEXT_ACTIONS_BOUND__?: boolean
   }
 }
 

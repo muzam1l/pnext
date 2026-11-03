@@ -5,6 +5,7 @@ pnext is a small, fast framework on Preact. Core (`src/` outside `compat/`) stay
 ## Code
 
 - Plain TypeScript in the idioms already around it. Find where a concern lives and extend that file in its patterns; search `src/` for an existing helper before writing one.
+- Prefer deleting code to adding it. Fix at the right layer with the smallest diff; reuse or generalize what exists instead of adding a parallel path. No defensive branches for impossible cases, speculative options or dead code. A change that removes more lines than it adds is the goal.
 - Comments one line, only for a non-obvious why. Formatting is prettier's (`bun run format`).
 - Performance is a ratchet: no new client bytes or request/navigation work without a measured reason. Server bytes are tolerated, client bytes are not.
 - Compat matches stable Next.js (wording, headers, status codes, wire formats), never canary.

@@ -12,6 +12,7 @@
  */
 import { options as preactOptions, type ComponentType, type VNode } from 'preact'
 import { __pnextPushFormStatus } from '../react/dom'
+import { assertRouterQueueImplemented } from '../client/nav'
 import {
   ACTION_ID_FIELD,
   FORM_STATE_FIELD,
@@ -47,19 +48,32 @@ export { isActionError }
 // warm call is a microtask that drains in the click's own task.
 const dispatchRuntime = () => import('./dispatch')
 
-let warmDispatch: ((id: string, args: unknown[]) => Promise<unknown>) | undefined
+let loadedDispatch: ((id: string, args: unknown[]) => Promise<unknown>) | undefined
 
-const loadDispatch = () => dispatchRuntime().then(module => (warmDispatch = module.callAction))
+const loadDispatch = () => dispatchRuntime().then(module => (loadedDispatch = module.callAction))
 
 // Warming is speculative: offline (or any failed chunk fetch) must not surface as an unhandled
 // rejection, which the client error last-resort escalates to the global-error document. A real
 // action call still awaits - and rejects through - loadDispatch.
-const warmDispatchChunk = () => {
+const warmDispatch = () => {
   void loadDispatch().catch(() => undefined)
 }
 
+// Server-rendered action markup: progressive form fields, submit buttons and click actions.
+const ACTION_MARKUP = `[name^="$pnext_"],[${ACTION_ID_ATTR}],[${ACTION_CLICK_ID_ATTR}]`
+
+// A page with no action on it never fetches the chunk; a late stub warms through `warm()`.
+const warmDispatchChunk = () => {
+  if (window.__PNEXT_ACTIONS_BOUND__ || document.querySelector(ACTION_MARKUP)) warmDispatch()
+}
+
 function callAction(id: string, args: unknown[]): Promise<unknown> {
-  return warmDispatch ? warmDispatch(id, args) : loadDispatch().then(call => call(id, args))
+  try {
+    assertRouterQueueImplemented()
+  } catch (error) {
+    return Promise.reject(error instanceof Error ? error : new Error(String(error)))
+  }
+  return loadedDispatch ? loadedDispatch(id, args) : loadDispatch().then(call => call(id, args))
 }
 
 function registerClientReference(
@@ -109,6 +123,7 @@ function refreshCurrentRoute(): void {
 }
 
 function createAction(id: string): ActionFunction {
+  window.__PNEXT_ACTIONS_BOUND__ = true
   const action: ActionFunction = async (...args: unknown[]) => callAction(id, args)
   action.$$pnextActionId = id
   return action
@@ -521,6 +536,7 @@ export function installActionRuntime() {
       createAction,
       registerClientReference,
       reviveProps,
+      warm: warmDispatch,
     }
     installSubmitListener()
     installClickActionListener()

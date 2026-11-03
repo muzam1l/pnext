@@ -32,6 +32,7 @@ import {
   actionClientStubPlugin,
   actionStubSourceFor,
   clientActionModulesRoot,
+  hasClientActionModules,
   isClientActionModule,
   loadClientActionSource,
 } from '../actions/client-plugin'
@@ -101,6 +102,7 @@ export function registerActionExtensions(_config: ResolvedConfig): void {
       const runtime = getRequestRuntime()
       if (runtime?.dev) await ensureActionsRegistered(runtime)
     },
+    hasActionModules: hasClientActionModules,
     isClientActionModule,
     stubSource: file => actionStubSourceFor(file, clientActionModulesRoot() ?? undefined),
     loadClientSource: (file, root) => loadClientActionSource(file, root),

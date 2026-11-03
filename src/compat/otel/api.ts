@@ -93,3 +93,6 @@ export function getOtelApi(appRoot: string): OtelApi | null {
 export function resetOtelApi(): void {
   resolved = undefined
 }
+
+/** The edge middleware sandbox's own api instance (its realm has a separate global registry). */
+export const edgeSandbox: { otel?: OtelApi } = {}

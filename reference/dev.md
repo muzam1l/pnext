@@ -6,7 +6,7 @@ The `pnext` CLI carries the whole flow: `dev` while you build, `analyze` to insp
 pnext dev [directory] [--port 3000] [--hostname 127.0.0.1]
 pnext build [directory] [--adapter vercel] [--verbose]
 pnext start [directory] [--port 3000] [--hostname 127.0.0.1]
-pnext analyze [route] [directory] [--brotli] [--files] [--json]
+pnext analyze [route] [directory] [--why <package>] [--brotli] [--files] [--json]
 pnext typegen [directory]
 pnext create <directory> [--no-install]
 pnext migrate [directory] [--dry-run]
@@ -38,7 +38,26 @@ In Activity Monitor and `ps`, the dev server runs as `pnext-dev`, builds as `pne
 
 ## Analyze
 
-`pnext analyze` reports the client JavaScript behind each route. Optionally pass a route, either a template like `/users/[id]` or a concrete path, to report on that route only. `--files` breaks the report into files, `--brotli` measures with brotli instead of gzip, and `--json` emits machine-readable output.
+`pnext build` ends with each page's initial load: the gzipped HTML, CSS, and JavaScript a first visit downloads, with the change since the previous build and the command to inspect the heaviest route.
+
+`pnext analyze` lists the files behind every route. Pass a route, either a template like `/users/[id]` or a concrete path, for the full report on it:
+
+- **Chunks by content**: each chunk's packages by share, marked when the build named the file after a package that is a minority of it.
+- **Packages**: the initial JavaScript by package, with its gzip share and the import chain that pulls it in.
+- **CSS**: global and route stylesheets, how many utilities each holds and how many the route references, and which Tailwind sources produce them: the automatic scan or each `@source`.
+- **Fonts**: faces with their files and sizes, whether each is preloaded, and whether anything on the route uses it.
+- **Flags**: framework runtime the route does not need, chunks under 1 KB, CommonJS and whole-barrel imports, packages bundled into several chunks or installed twice, preloaded fonts nothing uses, and budget overruns.
+
+`--why <package>` prints the chain that pulls a package into each route:
+
+```sh
+$ pnext analyze /onboarding --why zod
+zod <- @hookform/resolvers/zod <- app/onboarding/create-org.tsx <- /onboarding
+```
+
+`--brotli` measures with brotli instead of gzip, `--files` lists the files no route loads, and `--json` emits the whole report. Analyze reads only the build output, so it runs without the app's environment variables; an app with a custom `outDir` still loads its config to find the output.
+
+To hold a route to a size, set a gzip budget per route with [`budgets`](./config.md#fields). The build warns about a route over its budget, and analyze flags it.
 
 ## Build and run
 

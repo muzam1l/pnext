@@ -23,6 +23,8 @@ export type StaticParams<Route extends RoutePath> =
 
 export interface PNextConfig {
   outDir?: string
+  /** Emit a directly servable static tree at outDir instead of a server build. Core mode only. */
+  output?: 'export'
   basePath?: string
   assetPrefix?: string
   trailingSlash?: boolean
@@ -42,6 +44,11 @@ export interface PNextConfig {
   workspaceRoot?: string
   compat?: PNextCompatConfig
   adapter?: PNextAdapterConfig
+  /**
+   * Initial-load gzip budget per page route: bytes, or a string like '150kb'. Keys are route
+   * patterns (`/users/[id]`); `'*'` applies to every route without its own key.
+   */
+  budgets?: Record<string, number | string>
 }
 
 /**
@@ -423,6 +430,8 @@ export interface NavState {
    * comparing `children` to the browser pathname under a rewrite.
    */
   hostRender?: boolean
+  /** On a host render, the route pattern of the interceptor the slot rendered. */
+  interceptedRoute?: string
 }
 
 /**
@@ -443,6 +452,13 @@ export interface RouteInterception {
    * absent, the interceptor page replaces the children tree.
    */
   slotDir?: string
+}
+
+/** A baked artifact's tracked vary names (`'?'` = searchParams): the body and its layout/page frames. */
+export interface SegmentVaryWire {
+  vary: string[]
+  layoutVary?: string[]
+  pageVary?: string[]
 }
 
 export interface RouteManifestEntry {
@@ -492,6 +508,11 @@ export interface RouteManifestEntry {
   clientEntryImports?: string[]
   /** Dynamic import closure of the client entry, for low-priority preload links. */
   clientDynamicImports?: string[]
+  /**
+   * The framework runtime chunks among `clientDynamicImports` (router, nav and error tiers, action
+   * dispatch): fetched on demand, and preloaded only where the route can soft-navigate.
+   */
+  clientRuntimeImports?: string[]
   maxDuration?: number
   /** Route opts into partial prerendering via `export const experimental_ppr = true`. */
   ppr?: boolean
@@ -501,14 +522,16 @@ export interface RouteManifestEntry {
   metadataRoute?: MetadataRouteEntry
   /** Param sets prerendered at build from params(). Compat aliases generateStaticParams to params. */
   prerenderedParams?: Record<string, RouteParamValue>[]
-  /**
-   * Per-prerendered-URL vary sets tracked by the BUILD render, keyed by the concrete pathname. A request-time
-   * render answered from that prerender executes no user code, so it tracks nothing and would publish
-   * "unknown" (exact-URL keying) - these are the sets it publishes instead.
-   */
-  prerenderVary?: Record<string, { vary: string[]; layoutVary: string[]; pageVary: string[] }>
+  /** Per-param matching policy the app declared; the compat admission hook interprets it. */
+  paramMatching?: Record<string, string>
+  /** Every build prerender of `prerenderedParams` stayed static: unbuilt params prerender on demand. */
+  onDemandStatic?: boolean
   /** Suspense boundary ids left as dynamic holes in the prebuilt PPR shell. */
   pprHoles?: number[]
+  /** The build's prerender had no holes; a regeneration keeps the verdict (serve-time only). */
+  builtStatic?: boolean
+  /** RUNTIME_* bits the latest regenerated shell's holes wait on (serve-time only). */
+  pprRuntimeData?: number
   /** Metadata postponed out of the static PPR shell and resumed into the body. */
   pprMetadata?: boolean
   /**
@@ -546,6 +569,14 @@ export interface RouteManifestEntry {
     key: string
     concreteParams: Record<string, RouteParamValue>
     holes: number[]
+    /** RUNTIME_* bits this sub-shell's holes wait on. */
+    runtime?: number
+    /** The vary sets the sub-shell render tracked (wire form). */
+    vary?: SegmentVaryWire
+    /** RUNTIME_* bits of the prefetch shell baked for this root-param prefix. */
+    shellRuntime?: number
+    /** The vary sets that prefetch shell tracked (wire form). */
+    shellVary?: SegmentVaryWire
   }[]
   /**
    * `template.*` files from app root to the route's own segment, parallel to
@@ -572,6 +603,8 @@ export interface RouteManifestEntry {
   syntheticSlotDir?: string
   /** `default.*` file rendered as children for a synthetic entry. */
   childrenDefault?: string
+  /** Synthetic entry whose owner layout declares no children branch: only named slots render. */
+  namedSlotsOnly?: boolean
   /** Intercepting-route metadata, when this route is an interceptor. */
   interception?: RouteInterception
   /** First `'use server'` module in the route's closure — core refuses these. */
@@ -588,6 +621,8 @@ export interface RouteManifestEntry {
    * collapsing them back into the boolean above loses exactly that.
    */
   clientEntryReasons?: ClientEntryReason[]
+  /** The route's closure renders a `<Link>`, so its navigation runtime is worth preloading. */
+  softLinks?: true
 }
 
 /**
@@ -729,16 +764,12 @@ export interface RouteSegmentConfig {
     | 'only-no-store'
   /** Param names governed by a `dynamicParams = false` declaration. */
   dynamicParamsFalse?: string[]
-  /**
-   * The page has its own static params export while a `dynamicParams = false`
-   * declaration governs the route: every param tuple must match a prerendered
-   * path (Next's fallback: false), not just the governed params.
-   */
-  strictDynamicParams?: boolean
   /** `export const runtime` value, when declared ('edge' | 'nodejs'). */
   runtime?: string
   /** Next app-shell prefetch policy declared by the route. */
   prefetch?: 'allow-runtime' | 'partial' | 'unstable_eager'
+  /** `export const ensureStatic`: the prefetch stages forced static even when they read runtime data. */
+  ensureStatic?: 'shell' | 'prefetch' | 'navigation'
   /**
    * `export const unstable_instant` on the page or a layout in its chain (a boolean or a sample-config object
    * means true; an explicit `false` on a leaf overrides an ancestor's opt-in). A full (`prefetch={true}`)
@@ -746,4 +777,6 @@ export interface RouteSegmentConfig {
    * response while connection()-gated content is omitted.
    */
   unstableInstant?: boolean
+  /** The instant opt-in came only from stable `export const instant`, which alone does not switch prefetching. */
+  stableInstant?: boolean
 }

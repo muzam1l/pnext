@@ -49,6 +49,8 @@ export interface WorkUnit {
   compat?: Record<symbol, unknown>
   /** The production release this request serves from; dev and build leave it unset. */
   release?: Release
+  /** Server-Timing entries (name, ms), collected only when serverTimingEnabled(). */
+  timings?: [string, number][]
 }
 
 // Anchored on globalThis (like requestStorage below) so compiled compat
@@ -74,6 +76,17 @@ export function getWorkUnit(): WorkUnit | undefined {
 export function setWorkUnitRelease(release: Release): void {
   const unit = workUnitStorage.getStore()
   if (unit) unit.release = release
+}
+
+/** Whether responses carry a Server-Timing breakdown; the Vercel function turns it on. */
+export function serverTimingEnabled(): boolean {
+  // eslint-disable-next-line turbo/no-undeclared-env-vars
+  return process.env.PNEXT_SERVER_TIMING === '1'
+}
+
+/** Add one Server-Timing entry to the current request, when it is collecting them. */
+export function recordServerTiming(name: string, ms: number): void {
+  workUnitStorage.getStore()?.timings?.push([name, ms])
 }
 
 /** Set the current work-unit phase (compat toggles render/action/handler/...). */
@@ -166,16 +179,14 @@ export function flushWorkUnitOnClose(
   response: Response,
   unit: WorkUnit | undefined,
   signal?: AbortSignal,
+  onError?: (error: unknown) => void | Promise<void>,
 ): Response {
   if (!unit) return response
   if (!response.body) {
     flushWorkUnit(unit)
     return response
   }
-  // An explicit Content-Length means the body is fully buffered upstream (image
-  // optimizer, static files) — nothing can enqueue after-tasks while it drains.
-  // Re-wrapping it in a close-observing stream would switch the transfer to
-  // chunked and drop the Content-Length header; flush immediately instead.
+  // A Content-Length body is buffered; re-wrapping would go chunked and drop the header.
   if (response.headers.has('content-length')) {
     flushWorkUnit(unit)
     return response
@@ -203,8 +214,12 @@ export function flushWorkUnitOnClose(
           controller.enqueue(chunk.value)
         }
       } catch (error) {
-        settle()
-        controller.error(error)
+        try {
+          if (onError) await workUnitStorage.run(unit, () => onError(error))
+        } finally {
+          settle()
+          controller.error(error)
+        }
       }
     },
     cancel(reason) {
@@ -417,7 +432,7 @@ export function requireRequest(api: string) {
  * PROMISE so that creating the promise does not postpone - only awaiting it inside a Suspense subtree does
  * (dynamic-at-await-site).
  */
-export function requestApiPromise<T>(api: string, produce: () => T): Promise<T> {
+export function requestApiPromise<T>(api: string, produce: () => T, runtime: number): Promise<T> {
   // Under a cacheComponents prerender the value hangs: awaiting it postpones the
   // boundary, while merely observing its rejection (the request-apis stash-and-
   // observe pattern) yields the "rejects when the prerender is complete" message
@@ -430,10 +445,10 @@ export function requestApiPromise<T>(api: string, produce: () => T): Promise<T> 
     if (isRuntimePrefetchPrerender() && api !== 'connection()') {
       // Awaiting the resolved value arms the sync-IO abort: anything the render
       // computes with Date.now() & co. AFTER a runtime API resolved belongs to
-      // the navigation, not the prefetch (see runWithRuntimePrefetchSyncIoAbort).
+      // the navigation, not the prefetch (see runWithSyncIoAbort).
       return markRuntimeApiOnAwait(Promise.resolve(produce()))
     }
-    return hangingPromise<T>(api)
+    return hangingPromise<T>(api, runtime)
   }
   // Legacy PPR (experimental_ppr, cacheComponents off): keep the call-site
   // throw so the existing shell path postpones exactly as before.

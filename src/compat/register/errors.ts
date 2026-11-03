@@ -18,7 +18,9 @@ import {
   defaultGlobalErrorUi,
   globalErrorReportScript,
 } from '../lifecycle/error-ui'
-import { getNextConfig } from '../next/config-loader'
+import { nextExperimental } from '../next/config-loader'
+import { recordPrerenderError } from '../cache/build-prerender-errors'
+import { currentRenderCacheMeta } from '../cache/revalidate'
 
 // global-error / global-not-found are CORE document conventions (discovered by
 // src/routing/routes.ts findGlobalError + src/render renderGlobalNotFoundResponse);
@@ -29,16 +31,30 @@ export function registerErrorExtensions(config: ResolvedConfig): void {
   if (!nextCompatEnabled(config)) return
 
   setRenderExtensions({
-    serializeError: serializeBoundaryError,
+    serializeError: ctx => {
+      if (
+        /^Invalid revalidate value |^Image with src .*query string.*images\.localPatterns/.test(
+          ctx.error.message,
+        )
+      ) {
+        recordPrerenderError({
+          kind: 'validation',
+          route: currentRenderCacheMeta()?.route ?? '/',
+          consoleBlock: ctx.error.message,
+        })
+      }
+      return serializeBoundaryError(ctx)
+    },
     httpAccessFallbackUi,
     defaultGlobalErrorUi,
     globalErrorReportScript,
     wrapThrownValue,
     formatErrorLog,
     // Read lazily per call: next.config loads after registration.
-    globalNotFoundEnabled: () => {
-      const experimental = getNextConfig().experimental as { globalNotFound?: boolean } | undefined
-      return experimental?.globalNotFound === true
-    },
+    globalNotFoundEnabled: () =>
+      nextExperimental<{ globalNotFound: unknown }>().globalNotFound === true,
+    implicitSlotChildren: () =>
+      nextExperimental<{ explicitParallelRouteChildren: unknown }>()
+        .explicitParallelRouteChildren === false,
   })
 }

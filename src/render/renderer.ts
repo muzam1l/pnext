@@ -1,6 +1,5 @@
-import { existsSync, readFileSync, statSync } from 'node:fs'
-import { stat, unlink, writeFile } from 'node:fs/promises'
-import { basename, dirname, join, relative, sep } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import { basename, dirname, relative, sep } from 'node:path'
 import { createHash } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import {
@@ -47,11 +46,13 @@ import {
   getSuspenseExtensions,
   nextCompatEnabled,
   reactCompatEnabled,
+  type SlotHead,
+  type SlotHeadBranch,
+  type SlotHeadPolicy,
 } from './hooks'
 import {
   getCssExtensions,
   getRenderExtensions,
-  getRequestExtensions,
   getRouterProtocolExtensions,
   reportRequestError,
   type SerializedError,
@@ -72,14 +73,20 @@ import {
   isNotFoundError,
   isRedirectError,
   isUnauthorizedError,
+  notFound,
 } from '../api/navigation'
 import { Suspense } from '../api/suspense'
-import { currentRequest, getWorkUnit, runWithRequest } from '../request/context'
+import {
+  currentRequest,
+  getWorkUnit,
+  recordServerTiming,
+  runWithRequest,
+  serverTimingEnabled,
+} from '../request/context'
 import {
   awaitAtTaskBoundary,
   cacheComponents,
-  completePrerender,
-  currentPrerenderScope,
+  frameworkNow,
   hangingPromise,
   isCachedComponent,
   isCsrBailoutPrerender,
@@ -91,21 +98,27 @@ import {
   isTaskPostpone,
   markRuntimeApiOnAwait,
   PostponeError,
-  runInPrerender,
   runWithCsrBailout,
-  runWithPrerenderDeterminism,
-  runWithRuntimePrefetchSyncIoAbort,
+  runInClientRender,
   runWithTaskBoundaryArmed,
   runWithTaskBoundarySuspended,
+  runInCachedSubtree,
+  insideCachedSubtree,
+  cacheArgumentVNodes,
+  RUNTIME_PARAMS,
+  RUNTIME_URL,
   trackPrerenderDynamic,
+  postponeRuntime,
+  markStageResolved,
 } from './ppr'
 import {
   findConventionFiles,
   findGlobalError,
   findLayouts,
+  matchInterception,
   serverActionsUnsupportedMessage,
 } from '../routing/match'
-import { matchSegments, pathnameSegments, slotDirectoriesIn } from '../routing/slots'
+import { isSlotSegment, matchSegments, pathnameSegments, slotDirectoriesIn } from '../routing/slots'
 import { getRequestRuntime } from '../routing/request-environment'
 import { toNextRequest } from '../api/server'
 import { assertNotTainted, isElementLike, serializeProps } from '../utils/serialize'
@@ -120,7 +133,7 @@ import {
   ISLAND_BOUNDARY_ERROR_ELEMENT,
   ISLAND_BOUNDARY_ERROR_MESSAGE_ATTRIBUTE,
 } from './boundary-error'
-import { captureCacheScope, runWithCacheScope } from '../request/cache'
+import { runWithCacheScope } from '../request/cache'
 import { readText } from '../utils/fs'
 import { traceEnabled } from '../utils/trace-flags'
 import {
@@ -159,6 +172,7 @@ import {
   type RenderBufferFrame,
 } from './resource-hints'
 import {
+  hasHeadMetadataFiles,
   staticMetadataForPath,
   staticMetadataForPathFromFiles,
   staticMetadataForRoute,
@@ -173,18 +187,19 @@ import {
   currentLayoutSegmentSnapshot,
   currentParamsSnapshot,
   fullLayoutSegments,
+  layoutParamNamesForDir,
   layoutParamsForDir,
   layoutSegmentDepth,
   paramsScopeParams,
   paramsScopeSymbol,
   promiseMarker,
-  promisePlaceholderJson,
   promisePlaceholderMarker,
   renderDirSlots,
   revivePromiseProps,
   runInLayoutSegmentScope,
   runInParamsScope,
   slotBoundarySymbol,
+  enterSlotMarker,
   type ResolvedSlotMatch,
   type SlotContext,
 } from './slots'
@@ -213,7 +228,6 @@ import type {
   Viewport,
 } from '../types'
 
-const useCacheJoinerPromiseSymbol = Symbol.for('pnext.compat.useCacheJoinerPromise')
 // Prop marking a loading.js Suspense boundary that has ANOTHER loading boundary deeper in the
 // tree: it resolves THROUGH in the streaming shell so the DEEPEST fallback is what the shell
 // shows. A STRING key, not a symbol: preact's `h()` copies props with `for...in`, which skips
@@ -274,7 +288,7 @@ const PROP_ERROR_RESET_MARKER = '$$pnextErrorReset'
 
 // Font collection scope (compat/next/font). Default (no compat) runs the
 // callback untouched.
-function runWithFontScope<T>(callback: () => T): T {
+export function runWithFontScope<T>(callback: () => T): T {
   return getFontExtensions().runWithFontScope(callback)
 }
 
@@ -322,6 +336,7 @@ function installRawTextRendering() {
   const diffOptions = preactOptions as { __b?: (vnode: VNode) => void }
   const previousDiff = diffOptions.__b
   diffOptions.__b = vnode => {
+    applyPrerenderSuspenseCatch(vnode)
     applyHoistable(vnode)
     previousDiff?.(vnode)
   }
@@ -535,7 +550,7 @@ export interface RenderNavOptions {
   targetPath?: string
 }
 
-interface RenderOptions {
+export interface RenderOptions {
   config: ResolvedConfig
   route: RouteManifestEntry
   params?: Record<string, RouteParamValue>
@@ -571,6 +586,14 @@ interface RenderOptions {
   nav?: RenderNavOptions
   /** Collects each slot's resolved source path during layout application. */
   slotStateOut?: Record<string, string>
+  /** Boundary tree rendered in place of the slot an error escaped from. */
+  slotFallback?: { dir: string; tree: ComponentChildren }
+  /** Slot dirs whose markers the server-tree resolver reached. */
+  renderedSlots?: Set<string>
+  /** Metadata outlets rendered slots carry, keyed by slot dir: each wraps the slot's content. */
+  slotOutlets?: Map<string, (content: ComponentChildren) => ComponentChildren>
+  /** The slot whose outlet threw the error being rendered. */
+  boundarySlot?: ErrorSlot
   /**
    * Request-time shell regeneration (stale-shell rebake, segment refresh): same partial prerender
    * but with REAL Date/Math.random - the deterministic clock exists for byte-stable builds, and
@@ -591,6 +614,8 @@ interface RenderOptions {
    * upgrade that is ultimately rejected.
    */
   probeShell?: boolean
+  /** The render produces a prebuilt shell: its document is a reusable static stage. */
+  staticStage?: boolean
   /**
    * This shell prerender produces the PREFETCH body segment, not the document served for a
    * direct request. Short-lived `use cache` scopes (stale below the client's prefetch
@@ -605,6 +630,8 @@ interface PageModule {
   viewport?: ViewportExport
   params?: () => Promise<Record<string, RouteParamValue>[]> | Record<string, RouteParamValue>[]
 }
+
+type LayoutProps = Omit<PageProps, 'searchParams'>
 
 interface LayoutModule {
   default?: ServerComponent<{ children: ComponentChildren }>
@@ -674,6 +701,8 @@ interface LayoutRender {
   metadataMissedFlush: boolean
   slotMatches: ResolvedSlotMatch[]
   viewport: Viewport[]
+  /** Dirs of children-chain layouts that define head tags. */
+  headDirs: string[]
   documentLayoutFile?: string
 }
 
@@ -684,6 +713,8 @@ interface LoadedLayout {
 
 interface StreamState {
   nextId: number
+  /** Namespaces boundary ids streamed inside a resumed hole away from the shell's. */
+  idPrefix?: string
   deferred: Promise<string>[]
   dev: boolean
   options: RenderOptions
@@ -701,6 +732,8 @@ interface StreamState {
   // component: a separate chunk render sits outside its providers. See
   // inlineSuspenseBoundary.
   inlineSuspense?: boolean
+  // Settles when the shell may flush; a boundary whose content settled first is inlined.
+  shellGate?: Promise<void>
   // Server-inserted HTML (CSS-in-JS registries) drained at the moment the shell finished rendering.
   // It belongs in the document head, so it is captured here rather than left for the deferred
   // tail's own drain - the tail's async body starts before the caller assembles the head and would
@@ -735,9 +768,9 @@ interface ResolveState {
 // boundaries are numbered in pre-order identically at build and request time so
 // the dynamic-hole ids recorded during the build shell line up with the
 // replacement chunks emitted per request. See src/ppr.ts.
-type BuildPartialState = Extract<PartialState, { mode: 'build' }>
+export type BuildPartialState = Extract<PartialState, { mode: 'build' }>
 
-type PartialState =
+export type PartialState =
   // shellPending mirrors StreamState.shellPending: true until the document
   // `<html>` shell is located. A root layout may wrap its `<html>` in a Suspense
   // (e.g. `<Suspense><html>…`); that boundary must resolve THROUGH rather than
@@ -749,13 +782,20 @@ type PartialState =
       metadataDynamic: boolean
       shellPending?: boolean
       clientOnly?: boolean
+      /** RUNTIME_* bits of the runtime data the holes wait on. */
+      runtimeData: number
     }
   | {
       mode: 'request'
       nextId: number
       known: Set<number>
-      chunks: string[]
+      /** Each hole fill streams out as it is produced. */
+      onChunk: (html: string) => void
+      /** The runtime-stage pass: the holes it filled, and the runtime part of those it could not. */
+      stage?: { filled: Set<number>; skeletons: string[] }
       metadataDynamic: boolean
+      /** A fallback shell's head: it ran on hanging params, so the request patches what differs. */
+      shellHead?: string
       shellPending?: boolean
       /**
        * Per-hole map of the boundary slots the served shell already carries as
@@ -842,12 +882,17 @@ async function importModule(file: string, options: ModuleLoadOptions) {
 }
 
 async function importClientModule(file: string, options: ModuleLoadOptions) {
-  if (options.clientModuleLoader) return options.clientModuleLoader(file)
-  if (options.moduleLoader) return options.moduleLoader(file)
-  const href = await clientModuleHref(file, options)
-  if (options.dev) return importDevModule<Record<string, unknown>>(href)
-  await drainPreplanBuilds()
-  return importModuleOnce<Record<string, unknown>>(href)
+  const finish = getRenderSpanExtensions().onClientModuleLoad?.()
+  try {
+    if (options.clientModuleLoader) return await options.clientModuleLoader(file)
+    if (options.moduleLoader) return await options.moduleLoader(file)
+    const href = await clientModuleHref(file, options)
+    if (options.dev) return await importDevModule<Record<string, unknown>>(href)
+    await drainPreplanBuilds()
+    return await importModuleOnce<Record<string, unknown>>(href)
+  } finally {
+    finish?.()
+  }
 }
 
 /** A synthetic route's CSS: in a release, the stylesheet its build emitted; else a source scan. */
@@ -874,8 +919,22 @@ function clientAssetPath(config: ResolvedConfig, asset: string) {
     : pathname
 }
 
-function needsClientEntry(route: RouteManifestEntry) {
+export function needsClientEntry(route: RouteManifestEntry) {
   return route.client || route.clientReferences.length > 0 || Boolean(route.needsRouterEntry)
+}
+
+/** A built route's module tags as its document carries them: chunk preloads, then the entry. */
+export function routeModuleTags(config: ResolvedConfig, route: RouteManifestEntry): string {
+  const href = (asset: string) =>
+    escapeHtml(withAssetPrefix(config, clientAssetPath(config, asset)))
+  const entry = needsClientEntry(route)
+    ? `<body><script type="module" src="${href(clientScriptPath(route))}"></script>`
+    : ''
+  return (
+    (route.clientEntryImports ?? [])
+      .map(asset => `<link rel="modulepreload" href="${href(asset)}">`)
+      .join('') + entry
+  )
 }
 
 interface DocumentParts {
@@ -922,6 +981,8 @@ interface RenderTreeExtra {
   pageFile?: string
   runtimePageMetadata?: boolean
   preferSlotMetadata?: boolean
+  /** The children page itself defines head tags (exports). */
+  pageDefinesHead?: boolean
   /**
    * Stream the viewport's theme-color with the request-time metadata chunk instead of emitting it
    * in the document head. Set only when the not-found boundary's metadata is deferred to request
@@ -952,7 +1013,7 @@ function titleTag(title: unknown): string {
 //
 // This only reorders the asset links; the head-vs-body split is untouched, so
 // metadataOnlyLinks still travel with the metadata and never appear when it streams into the body.
-function renderDocumentStart(page: DocumentPage) {
+export function renderDocumentStart(page: DocumentPage) {
   const rendered = page.shell === 'layout' ? page.body : `<main data-pnext-root>${page.body}</main>`
   const slotMode = pageSlotMarkerMode(page)
   const body = unwrapUnusedPageSlot(rendered, slotMode)
@@ -1012,7 +1073,7 @@ function renderDocumentStart(page: DocumentPage) {
 // preload/modulepreload `<link>` that does not already carry an explicit one - an explicit
 // nonce always wins. React stamps every float-emitted tag at emission; pnext has no single
 // float registry to hook, so the stamp runs once over the assembled head+body instead.
-function documentNonce(request: Request | undefined): string | undefined {
+export function documentNonce(request: Request | undefined): string | undefined {
   const csp =
     request?.headers.get('content-security-policy') ??
     request?.headers.get('content-security-policy-report-only')
@@ -1040,7 +1101,7 @@ function stampDocumentNonce(html: string, nonce: string | undefined): string {
     )
 }
 
-function renderDocumentEnd() {
+export function renderDocumentEnd() {
   // The closing tags flush as one chunk with no interior whitespace so a
   // streamed document ends with exactly `</body></html>` (Next's byte-exact
   // document tail; asserted by the PPR partial-hydration stream-order suite).
@@ -1058,6 +1119,10 @@ function metadataBodyHtml(page: MetadataRenderPage) {
     .filter(Boolean)
     .join('\n    ')
 }
+
+// Moves the preceding template's tags into the head, replacing the same-named ones.
+const HEAD_PATCH_SCRIPT =
+  '(function(s){var t=s.previousSibling;[].slice.call(t.content.children).forEach(function(n){var o=n.tagName=="TITLE"?document.head.querySelector("title"):n.name&&document.head.querySelector(\'meta[name="\'+n.name+\'"]\');o?o.replaceWith(n):document.head.append(n)});t.remove();s.remove()})(document.currentScript)'
 
 function metadataRedirectHtml(location: string, status: number) {
   const seconds = status === 308 ? 0 : 1
@@ -1278,6 +1343,8 @@ function styleName(name: string) {
 
 interface RenderProfile {
   label: string
+  /** Steps land in the response's Server-Timing instead of the dev trace. */
+  timing?: boolean
 }
 
 interface ProfileRenderOptions {
@@ -1286,6 +1353,7 @@ interface ProfileRenderOptions {
 }
 
 function renderProfile(options: ProfileRenderOptions): RenderProfile | undefined {
+  if (serverTimingEnabled()) return { label: options.route.route, timing: true }
   if (!traceEnabled('server') || !options.dev) return undefined
   return { label: options.route.route }
 }
@@ -1296,7 +1364,7 @@ async function profileRenderStep<T>(
   task: () => Promise<T>,
 ) {
   if (!profile) return task()
-  const start = performance.now()
+  const start = frameworkNow()
   try {
     return await task()
   } finally {
@@ -1310,7 +1378,7 @@ function profileRenderSyncStep<T>(
   task: () => T,
 ) {
   if (!profile) return task()
-  const start = performance.now()
+  const start = frameworkNow()
   try {
     return task()
   } finally {
@@ -1320,13 +1388,14 @@ function profileRenderSyncStep<T>(
 
 /** Span timing for regions that can't be wrapped in a callback (mark → log). */
 function profileRenderMark(profile: RenderProfile | undefined) {
-  return profile ? performance.now() : 0
+  return profile ? frameworkNow() : 0
 }
 
 function profileRenderSince(profile: RenderProfile | undefined, label: string, start: number) {
   if (!profile) return
+  if (profile.timing) return recordServerTiming(label, frameworkNow() - start)
   recordDevProfileLine(
-    `dev-profile render ${profile.label} ${label} in ${formatProfileDuration(performance.now() - start)}`,
+    `dev-profile render ${profile.label} ${label} in ${formatProfileDuration(frameworkNow() - start)}`,
   )
 }
 
@@ -1347,9 +1416,18 @@ interface RenderRequestOptions {
 }
 
 interface StaticParamsModule {
-  params?: (ctx?: {
-    params: Record<string, RouteParamValue>
-  }) => Promise<Record<string, RouteParamValue>[]> | Record<string, RouteParamValue>[]
+  params?: (ctx?: { params: Record<string, RouteParamValue> }) => unknown
+}
+
+export function compatNextConfig(): Record<string, unknown> {
+  const store = (globalThis as Record<PropertyKey, unknown>)[
+    Symbol.for('pnext.compat.nextConfigStore')
+  ] as { value?: Record<string, unknown> } | undefined
+  return store?.value ?? {}
+}
+
+export function routeParamKeys(route: Pick<RouteManifestEntry, 'params' | 'catchAll'>): string[] {
+  return [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
 }
 
 /**
@@ -1368,6 +1446,21 @@ export function settledPromise<T>(value: T): Promise<T> {
   return promise
 }
 
+/** Concrete values reach page props URL-encoded, like every prerendered param; keys stay raw. */
+function encodedParams(params: Record<string, RouteParamValue>): Record<string, RouteParamValue> {
+  return Object.fromEntries(
+    Object.entries(params).map(([key, value]) => [
+      key,
+      Array.isArray(value) ? value.map(encodeURIComponent) : encodeURIComponent(value),
+    ]),
+  )
+}
+
+/** A prerender's hanging `searchParams`: awaiting it postpones AND records the search access. */
+function hangingSearchParams(): Promise<PageSearchParams> {
+  return getRenderExtensions().trackHangingSearchParams(hangingPromise('searchParams', RUNTIME_URL))
+}
+
 function createPageProps(options: RenderRequestOptions): PageProps {
   // Sub-shell prerender (Stage C-4): a leading prefix of params is concrete; the
   // remaining route params hang. `params` resolves to a proxy where a concrete
@@ -1375,11 +1468,17 @@ function createPageProps(options: RenderRequestOptions): PageProps {
   // reading a concrete param renders buildtime while reading an unfilled one
   // postpones its boundary. searchParams still hangs (dynamic).
   if (options.fallbackConcreteParams) {
-    const concrete = options.fallbackConcreteParams
+    const concrete = encodedParams(options.fallbackConcreteParams)
     const keys = options.fallbackParamKeys ?? Object.keys(concrete)
+    const params = subShellParamsProxy(concrete, keys)
     return {
-      params: Promise.resolve(subShellParamsProxy(concrete, keys)),
-      searchParams: hangingPromise('searchParams'),
+      // Awaiting params in a runtime App Shell arms the sync-IO abort like any runtime API.
+      // Settled when every key is concrete, so generateMetadata re-tracks its reads on the head.
+      params: markRuntimeApiOnAwait(
+        keys.every(key => key in concrete) ? settledPromise(params) : Promise.resolve(params),
+        true,
+      ),
+      searchParams: hangingSearchParams(),
       request: options.request ? pageRequest(options.request) : undefined,
     }
   }
@@ -1388,8 +1487,8 @@ function createPageProps(options: RenderRequestOptions): PageProps {
   // shell), while a top-level await blocks the prerender (no fallback shell).
   if (options.fallbackParams) {
     return {
-      params: hangingPromise('params'),
-      searchParams: hangingPromise('searchParams'),
+      searchParams: hangingSearchParams(),
+      params: hangingPromise('params', RUNTIME_PARAMS),
       request: options.request ? pageRequest(options.request) : undefined,
     }
   }
@@ -1401,7 +1500,7 @@ function createPageProps(options: RenderRequestOptions): PageProps {
     if (!isRuntimePrefetchPrerender()) {
       return {
         params: settledPromise(trackedParams(options)),
-        searchParams: hangingPromise('searchParams'),
+        searchParams: hangingSearchParams(),
         request: options.request ? pageRequest(options.request) : undefined,
       }
     }
@@ -1475,35 +1574,40 @@ function childrenSourceSearchParams(options: RenderRequestOptions): URLSearchPar
 function subShellParamsProxy(
   concrete: Record<string, RouteParamValue>,
   keys: string[],
+  segment?: 'layout',
 ): Record<string, RouteParamValue> {
   const keySet = new Set(keys)
-  return new Proxy(
+  // Concrete reads still record the sub-shell's vary set.
+  const tracked = getRenderExtensions().trackVaryParams(
     { ...concrete },
-    {
-      get(target, prop: string | symbol): unknown {
-        if (typeof prop === 'string' && keySet.has(prop) && !(prop in concrete)) {
-          // An unfilled route param: postpone the boundary reading it.
-          throw new PostponeError(`params.${prop}`)
-        }
-        return (target as Record<string | symbol, unknown>)[prop]
-      },
-      has(target, prop: string | symbol): boolean {
-        if (typeof prop === 'string' && keySet.has(prop) && !(prop in concrete)) {
-          throw new PostponeError(`params.${prop}`)
-        }
-        return prop in target
-      },
-      ownKeys(target): ArrayLike<string | symbol> {
-        if (keySet.size > Object.keys(concrete).length) {
-          throw new PostponeError('params')
-        }
-        return Reflect.ownKeys(target)
-      },
-    },
+    { kind: 'params', segment },
   )
+  return new Proxy(tracked, {
+    get(target, prop: string | symbol): unknown {
+      if (typeof prop === 'string' && keySet.has(prop)) {
+        // An unfilled route param: postpone the boundary reading it.
+        if (!(prop in concrete)) throw new PostponeError(`params.${prop}`, RUNTIME_PARAMS)
+        // URL data is never App Shell content: what follows belongs to the prefetch stage.
+        markStageResolved(1)
+      }
+      return (target as Record<string | symbol, unknown>)[prop]
+    },
+    has(target, prop: string | symbol): boolean {
+      if (typeof prop === 'string' && keySet.has(prop) && !(prop in concrete)) {
+        throw new PostponeError(`params.${prop}`, RUNTIME_PARAMS)
+      }
+      return prop in target
+    },
+    ownKeys(target): ArrayLike<string | symbol> {
+      if (keySet.size > Object.keys(concrete).length) {
+        throw new PostponeError('params', RUNTIME_PARAMS)
+      }
+      return Reflect.ownKeys(target)
+    },
+  })
 }
 
-function pageSearchParams(params: URLSearchParams): PageSearchParams {
+export function pageSearchParams(params: URLSearchParams): PageSearchParams {
   const result: PageSearchParams = {}
   params.forEach((value, key) => {
     // Next's RSC union query (`?_rsc=<hash>`) is a CDN cache key on router
@@ -1525,7 +1629,7 @@ function pageRequest(request: Request): NextRequest {
   return toNextRequest(request)
 }
 
-function renderScopeRequest(options: RenderRequestOptions): NextRequest {
+export function renderScopeRequest(options: RenderRequestOptions): NextRequest {
   return pageRequest(options.request ?? new Request(options.url))
 }
 
@@ -1538,18 +1642,31 @@ async function serializablePageProps(props: PageProps, omitSearchParams = false)
   }
 }
 
+/** Segment modules (layouts, pages) evaluated as the build does, in the given order. */
+export async function loadSegmentModules(config: ResolvedConfig, files: string[]) {
+  const modules: { file: string; module: Record<string, unknown> }[] = []
+  for (const file of files) {
+    const href = await moduleHref(file, { config })
+    await drainPreplanBuilds()
+    modules.push({ file, module: (await import(href)) as Record<string, unknown> })
+  }
+  return modules
+}
+
+/** The route's layout chain and page, root first. */
+export function routeSegmentFiles(config: ResolvedConfig, route: RouteManifestEntry) {
+  return [...findLayouts(config.appPath, route.file).filter(conventionFileExists), route.file]
+}
+
 export async function staticParamsFor(config: ResolvedConfig, route: RouteManifestEntry) {
-  const moduleFiles = [
-    ...findLayouts(config.appPath, route.file).filter(conventionFileExists),
-    route.file,
-  ]
   let paramSets: Record<string, RouteParamValue>[] = [{}]
   const allSets: Record<string, RouteParamValue>[] = []
-  for (const file of moduleFiles) {
-    const staticHref = await moduleHref(file, { config })
-    await drainPreplanBuilds()
-    const imported = (await import(staticHref)) as Record<string, unknown>
-    const module = getStaticParamsExtensions().normalizeModule(imported) as StaticParamsModule
+  const modules = await loadSegmentModules(config, routeSegmentFiles(config, route))
+  for (const { file, module: imported } of modules) {
+    const module = getStaticParamsExtensions().normalizeModule(
+      imported,
+      route,
+    ) as StaticParamsModule
     const generate = module.params
     if (typeof generate !== 'function') continue
     const next: Record<string, RouteParamValue>[] = []
@@ -1559,20 +1676,26 @@ export async function staticParamsFor(config: ResolvedConfig, route: RouteManife
       // parent segment (e.g. `params.lang === 'fr' ? [...] : [...]`). The
       // top-level layout receives `{}`.
       const results = await generate({ params: parent })
-      if (!Array.isArray(results)) continue
-      for (const params of results) {
+      await getStaticParamsExtensions().validateResult?.(config, route, file, results, false)
+      for (const params of results as Record<string, RouteParamValue>[]) {
         const combined = { ...parent, ...params }
         allSets.push(combined)
         next.push(combined)
       }
     }
-    if (next.length > 0) paramSets = next
+    paramSets = next
   }
-  const fullKeys = new Set(route.params)
-  if (route.catchAll) fullKeys.add(route.catchAll)
+  await getStaticParamsExtensions().validateResult?.(config, route, route.file, paramSets, true)
+  const fullKeys = routeParamKeys(route)
   return {
-    paths: paramSets.filter(params => [...fullKeys].every(key => params[key] !== undefined)),
+    paths: paramSets.filter(params => fullKeys.every(key => params[key] !== undefined)),
     allSets,
+    paramMatching: await getStaticParamsExtensions().resolveParamMatching(
+      config,
+      route,
+      modules,
+      paramSets,
+    ),
   }
 }
 
@@ -1634,15 +1757,29 @@ export async function renderPageWithStatus(
       runWithFontScope(() =>
         runWithCacheScope(async () => {
           const render = async () => {
-            const page = await pageRender(options, false)
+            const scope: PrerenderOutcomeScope = {
+              outcomes: [],
+              compat: nextCompatEnabled(options.config),
+              nextId: 0,
+            }
+            const page = await prerenderOutcomeScope.run(scope, () => pageRender(options, false))
             const location =
               page.headers && !(page.headers instanceof Headers) && !Array.isArray(page.headers)
                 ? page.headers.location
                 : undefined
+            const status = page.status ?? 200
+            // Render order decides: the first redirect wins, else the first access fallback.
+            const outcomes =
+              status < 500 && status !== 200
+                ? [...scope.outcomes, { status, location }]
+                : scope.outcomes
+            const outcome =
+              status >= 500 ? undefined : (outcomes.find(item => item.location) ?? outcomes[0])
+            const finalLocation = outcome ? outcome.location : location
             return {
               html: renderDocument(page),
-              status: page.status ?? 200,
-              ...(location ? { location } : {}),
+              status: outcome?.status ?? status,
+              ...(finalLocation ? { location: finalLocation } : {}),
             }
           }
           const staticGeneration =
@@ -1703,38 +1840,19 @@ export async function renderPageResponse(options: RenderOptions) {
   // route.ppr stays false) is still upgrade-eligible: its prerendered params let a request's
   // concrete param prefix be promoted into a route shell. Enter the PPR path when EITHER holds so
   // the shell-miss branch below can schedule that upgrade.
-  const pprUpgrade = pprShellUpgradeFor(options.config, options.route, options.url)
-  if (
+  const pprUpgrade = pprShellUpgradeFor(options.route, routeTargetUrl(options))
+  const draft = /(?:^|;\s*)__prerender_bypass=/.test(options.request?.headers.get('cookie') ?? '')
+  const pprEligible =
     (options.route.ppr || pprUpgrade !== undefined) &&
     !options.dev &&
     method === 'GET' &&
     !skipPprForSoftNav &&
-    !isHtmlLimitedBotRequest(options) &&
-    // A DOM bot (Googlebot) bypasses static-shell-only serving: it blocks on and
-    // receives the fully resolved dynamic stream instead of a shell it would have
-    // to resume, so dynamic APIs (Math.random) never trip an SSG bailout for it.
-    !isDomBotRequest(options) &&
-    !/(?:^|;\s*)__prerender_bypass=/.test(options.request?.headers.get('cookie') ?? '')
-  ) {
-    const prebuilt = await loadPprShell(options.config, options.route, options.url)
-    if (prebuilt) {
-      // Soft tag staleness (revalidateTag with a profile): Next's SWR
-      // semantics — this response still serves the stale shell, while a
-      // background regeneration refreshes the shell + sidecar for the next one.
-      if (prebuilt.softStale) void regenerateStalePprShell(options)
-      return renderPprResponse(options, prebuilt)
-    }
-    // The route HAS a prebuilt shell but it went stale. Serving the baked bytes would launder
-    // stale cached data; falling through to a plain dynamic render would cut the cached,
-    // resolvable content out of shell-only prefetch responses. Regenerate instead: a fresh
-    // partial prerender re-produces the cached fills against the just-invalidated registries
-    // and persists the new shell plus sidecar.
-    const regenerated = await regenerateStalePprShell(options)
-    if (regenerated) return renderPprResponse(options, regenerated)
-    // Shell miss on an upgrade-eligible route: warm the more-specific route shell in the background
-    // so a subsequent request serves the promoted shell. This response still falls through to the
-    // plain dynamic render below.
-    if (pprUpgrade !== undefined) schedulePprShellUpgrade(options)
+    !isHtmlLimitedBotRequest(options)
+  if (pprEligible) {
+    const shell = await (
+      await import('./ppr-shell')
+    ).pprShellResponse(options, pprUpgrade, draft, softPprResume)
+    if (shell) return shell
   }
 
   await seedPrerenderSidecar(options)
@@ -1745,13 +1863,8 @@ export async function renderPageResponse(options: RenderOptions) {
     () =>
       runWithFontScope(() =>
         runWithCacheScope(async () => {
-          // A DOM bot (Googlebot) blocks on the full dynamic tree instead of
-          // streaming holes, so the resolved page (and its flight payload) is
-          // complete inline — a JS-executing crawler never has to resume a shell.
-          const page = await pageRender(
-            options,
-            canStreamRoute(options) && !isDomBotRequest(options),
-          )
+          // A DOM bot reads resolved values out of the flight script, so its render settles first.
+          const page = await pageRender(options, canStreamRoute(options) && !domBotFlight(options))
           if (page.headers) {
             const location = readLocationHeader(page.headers)
             return new Response(method === 'HEAD' ? null : (location ?? null), {
@@ -1801,6 +1914,15 @@ function isDomBotRequest(options: RenderOptions): boolean {
   return DOM_BOT_UA_RE.test(ua)
 }
 
+/** A DOM bot on a PPR/cacheComponents route gets the resolved page as a flight script. */
+function domBotFlight(options: RenderOptions): boolean {
+  return (
+    (options.route.ppr || cacheComponents()) &&
+    isDomBotRequest(options) &&
+    !isHtmlLimitedBotRequest(options)
+  )
+}
+
 // Minimal React-flight element serialization of a resolved server tree, so resolved dynamic values
 // appear in flight rows the way React's own RSC payload encodes them. Non-serializable props are
 // dropped - this is a read-only projection of already-rendered output, never re-hydrated.
@@ -1848,263 +1970,18 @@ function domBotFlightScript(resolved: unknown): string {
   return `<script>self.__next_f=self.__next_f||[]</script><script>self.__next_f.push([1,${payload}])</script>`
 }
 
-interface PrebuiltShell {
+export interface PrebuiltShell {
   shell: string
   holes: number[]
   metadataDynamic: boolean
+  /** RUNTIME_* bits of the runtime data the holes wait on (partial-shell renders). */
+  runtimeData?: number
   concreteParams?: Record<string, RouteParamValue>
   /** Stale via a soft tag revalidation: servable once, regenerate in background. */
   softStale?: boolean
+  /** Rendered on demand for a request's params: a live prefix, never a complete prerender. */
+  promoted?: true
 }
-
-interface PromotedShell {
-  shell: PrebuiltShell
-  /**
-   * Wall-clock of the promotion. A promoted shell lives in memory, so it has no file mtime for
-   * revalidatePath/revalidateTag staleness to age against - this stands in for one.
-   */
-  promotedAt: number
-}
-
-const pprShellUpgrades = new Map<string, PromotedShell>()
-const pendingPprShellUpgrades = new Set<string>()
-// Upgrade keys whose promoted region resolves NON-DETERMINISTIC (request-time) bytes into the
-// static shell - a fallback route that reads its concrete param inside the postponed boundary
-// and also produces per-render content there (a fresh OTEL span id, Math.random, Date). Caching
-// such a shell would freeze that content, so the base shell must resume it live each time.
-// Recorded so the confirmation double-render runs once per key rather than on every shell miss.
-const rejectedPprShellUpgrades = new Set<string>()
-
-/**
- * Build-time partial prerender. Renders the route in prerender scope (no request) so request
- * APIs postpone at their Suspense boundary. Returns the static shell plus the hole ids, or null
- * when dynamic data escapes every boundary - the route must then be served fully dynamically.
- */
-export async function renderPartialShell(options: RenderOptions): Promise<PrebuiltShell | null> {
-  await registerServerRuntime(options.config, options.route.sourceFiles)
-  const sidecar = getRenderExtensions().prerenderSidecar
-  const sidecarContext = prerenderSidecarContext(options)
-  await sidecar.begin(sidecarContext)
-  // A BUILD shell render under cacheComponents ends at the first task boundary. A runtime
-  // regeneration renders against a live server where task-settled work is expected to complete, so
-  // it keeps the unbounded behavior - UNLESS it is a bounded shell upgrade, which must postpone
-  // uncached request-time I/O exactly as the build-time base shell did.
-  const taskBoundary = cacheComponents() && (!options.runtimeRegen || options.boundedRegen === true)
-  const renderShellDocument = async (partial: PartialState, bounded: boolean) =>
-    runInPrerender(
-      async () => {
-        // Capture the scope up front so completePrerender runs on EVERY exit path in the finally
-        // below, including the throw / `return null` path. Leaving the scope un-aborted there keeps
-        // an armed React.cacheSignal() poll timer alive and the build never exits.
-        const scope = currentPrerenderScope()
-        try {
-          const renderTree = () =>
-            runWithFontScope(() =>
-              runWithCacheScope(() => pageRender({ ...options, partial }, false)),
-            )
-          const renderShell = () =>
-            options.fallbackParams && options.params
-              ? runInParamsScope(options.params, renderTree)
-              : renderTree()
-          return await (options.runtimeRegen
-            ? renderShell()
-            : runWithPrerenderDeterminism(renderShell))
-        } finally {
-          // Abandon any hanging request/param promises that were passed out but
-          // never awaited inside a boundary — no HANGING_PROMISE_REJECTION in
-          // build logs. Runs inside the prerender scope so the AbortController is
-          // live.
-          completePrerender(scope)
-        }
-      },
-      { taskBoundary: bounded, ...(options.prefetchShell ? { prefetchShell: true } : {}) },
-    )
-  const freshPartial = (): BuildPartialState => ({
-    mode: 'build',
-    nextId: 0,
-    holes: [],
-    metadataDynamic: false,
-  })
-  let partial = freshPartial()
-  try {
-    let page: Awaited<ReturnType<typeof renderShellDocument>>
-    try {
-      page = await renderShellDocument(partial, taskBoundary)
-    } catch (error) {
-      // Task-boundary work that escaped EVERY <Suspense> would leave the route
-      // with no shell at all. Upstream that is a blocking-prerender build error,
-      // but pnext cannot yet tell a genuine one from an artifact of its own
-      // renderer (a module-level `'use cache'` page is not cache-transformed on
-      // this path, so its cached IO reads as uncached here). Redo the shell
-      // unbounded so such a route keeps exactly the shell it had before.
-      if (!taskBoundary || !isTaskPostpone(error)) throw error
-      partial = freshPartial()
-      page = await renderShellDocument(partial, false)
-    }
-    const prebuilt = {
-      shell: renderDocumentStart(page),
-      holes: partial.holes,
-      metadataDynamic: partial.metadataDynamic,
-    }
-    // The prefetch-shell pass is a SECOND render of a route whose document shell
-    // was already baked: persisting its sidecar would overwrite the document's
-    // resume data with a copy missing the fills this pass deliberately omitted.
-    if (!options.prefetchShell && !options.probeShell) {
-      const artifact = await sidecar.collect(sidecarContext)
-      if (artifact !== undefined) await sidecar.persist(sidecarContext, artifact)
-    }
-    return prebuilt
-  } catch (error) {
-    if (isPostpone(error)) return null
-    if (isRedirectError(error) || isNotFoundError(error)) return null
-    throw error
-  }
-}
-
-/**
- * RUNTIME-PREFETCH prerender (`unstable_instant`): render the route against the REAL sampled
- * request, so request APIs resolve and their content lands in the response while
- * connection()-gated content hangs and keeps its Suspense fallback. Served directly as a
- * prefetch body and NEVER persisted into build artifacts or sidecars - it is sampled data.
- */
-export async function renderRuntimePrefetchDocument(
-  options: RenderOptions,
-): Promise<{ html: string; postponed: boolean } | null> {
-  await registerServerRuntime(options.config, options.route.sourceFiles)
-  // Seed (read-only) the resume-data sidecar so 'use cache' scopes resolve
-  // their build-time fills; unlike renderPartialShell nothing is collected or
-  // persisted back.
-  await seedPrerenderSidecar(options)
-  const partial: PartialState = {
-    mode: 'build',
-    nextId: 0,
-    holes: [],
-    metadataDynamic: false,
-  }
-  const nextRequest = renderScopeRequest(options)
-  try {
-    const page = await runWithRequest(
-      nextRequest,
-      () =>
-        runInPrerender(
-          async () => {
-            // Capture the scope up front so completePrerender runs on every exit
-            // path in the finally — a throw / null-return that skipped the abort
-            // would leave an armed React.cacheSignal() poll timer alive.
-            const scope = currentPrerenderScope()
-            try {
-              // Sync IO reached AFTER a runtime API resolved is content only the
-              // navigation may render: the shims turn it into a postpone for the
-              // nearest boundary (silently — nothing is logged).
-              return await runWithRuntimePrefetchSyncIoAbort(() =>
-                runWithFontScope(() =>
-                  runWithCacheScope(() => pageRender({ ...options, partial }, false)),
-                ),
-              )
-            } finally {
-              // Abandon hanging connection() promises that were never awaited
-              // inside a boundary (no HANGING_PROMISE_REJECTION noise).
-              completePrerender(scope)
-            }
-          },
-          { runtimePrefetch: true },
-        ),
-      options.params ?? {},
-    )
-    return {
-      html: `${renderDocumentStart(page)}${renderDocumentEnd()}`,
-      postponed: partial.holes.length > 0 || partial.metadataDynamic,
-    }
-  } catch (error) {
-    if (isPostpone(error)) return null
-    if (isRedirectError(error) || isNotFoundError(error)) return null
-    throw error
-  }
-}
-
-/**
- * Stamp the serving request's params into a prebuilt shell's `__PNEXT_ROUTE__` and into every
- * island param scope that carried the baked placeholder.
- *
- * A FALLBACK shell is baked with every param HANGING, so its embedded route state carries the
- * placeholder. Serving those bytes verbatim hands the client placeholder params for a concrete
- * URL: `useParams()` reads exactly this state, and optimistic routing learns a pattern's param
- * SHAPE from it. The island scopes move with it because `data-pnext-params` OVERRIDES the
- * window route state for the island carrying it.
- *
- * Exported for the segment-prefetch path, which answers a default prefetch from the same baked
- * bytes without going through renderPprResponse.
- */
-export function withRequestRouteParams(
-  shell: string,
-  params: Record<string, RouteParamValue> | undefined,
-  search?: string,
-): string {
-  let html = shell
-  const match = /(<script>window\.__PNEXT_ROUTE__=)(\{.*?\})(;<\/script>)/.exec(shell)
-  let merged = params ?? {}
-  if (match && params && Object.keys(params).length > 0) {
-    let state: Record<string, unknown> | undefined
-    try {
-      state = JSON.parse(match[2]!) as Record<string, unknown>
-    } catch {
-      // A route script we cannot parse is left exactly as baked.
-      state = undefined
-    }
-    if (state) {
-      const baked = (state.params ?? {}) as Record<string, RouteParamValue>
-      merged = { ...baked, ...params }
-      const bakedScope = serializeProps(baked)
-      const mergedScope = serializeProps(merged)
-      if (bakedScope !== mergedScope) {
-        html =
-          html.slice(0, match.index) +
-          `${match[1]}${serializeProps({ ...state, params: merged })}${match[3]}` +
-          html.slice(match.index + match[0].length)
-        html = rewriteIslandMarkup(html, text =>
-          text.split(islandParamsAttribute(bakedScope)).join(islandParamsAttribute(mergedScope)),
-        )
-      }
-    }
-  }
-  return withIslandPromiseProps(html, merged, search)
-}
-
-const islandParamsAttribute = (json: string) =>
-  `${ISLAND_PARAMS_ATTRIBUTE}="${json.replaceAll('"', '&quot;')}"`
-
-/**
- * Re-stamp the `data-pnext-props` placeholders a partial prerender baked for hanging
- * `params`/`searchParams` island props. Without this the shell - deliberately shared across
- * params - hands every request the same `null`, so a client component that destructures
- * `params` instead of calling useParams() reads nothing.
- */
-function withIslandPromiseProps(
-  html: string,
-  params: Record<string, RouteParamValue>,
-  search: string | undefined,
-): string {
-  const replacements: [string, string][] = []
-  if (Object.keys(params).length > 0) {
-    replacements.push([promisePlaceholderJson('params'), serializeProps(promiseMarker(params))])
-  }
-  if (search !== undefined) {
-    replacements.push([
-      promisePlaceholderJson('searchParams'),
-      serializeProps(promiseMarker(pageSearchParams(new URLSearchParams(search)))),
-    ])
-  }
-  if (replacements.length === 0) return html
-  return rewriteIslandMarkup(html, text => {
-    let next = text
-    for (const [from, to] of replacements) {
-      next = next.split(from).join(to).split(escapeAttribute(from)).join(escapeAttribute(to))
-    }
-    return next
-  })
-}
-
-const escapeAttribute = (json: string) => json.replaceAll('"', '&quot;')
 
 // The island marker payload is the element's attribute text, carried inside an
 // HTML comment. Only `<`/`>` are unsafe there (a `-->` would close the comment
@@ -2116,138 +1993,12 @@ export function encodeIslandMarker(attributes: string): string {
   return attributes.replaceAll('<', '&lt;').replaceAll('>', '&gt;')
 }
 
-function decodeIslandMarker(payload: string): string {
-  return payload.replaceAll('&lt;', '<').replaceAll('&gt;', '>')
+/** The static reuse window of a route's shell: its declared cacheLife stale, else the static default. */
+export function shellStaleSeconds(route: RouteManifestEntry): number {
+  return route.cacheLife?.staleSeconds ?? getRenderExtensions().defaultStaticStaleTimeSeconds()
 }
 
-/**
- * Apply `rewrite` to the markup AND to the client-island markers the renderer
- * emits for neutral islands (`<!--pnext-client:ATTRIBUTES-->`).
- */
-function rewriteIslandMarkup(html: string, rewrite: (text: string) => string): string {
-  return rewrite(html).replace(
-    /<!--pnext-(client|client-after|page):([^>]*)-->/g,
-    (marker, kind: string, encoded: string) => {
-      const decoded = decodeIslandMarker(encoded)
-      const next = rewrite(decoded)
-      return next === decoded ? marker : `<!--pnext-${kind}:${encodeIslandMarker(next)}-->`
-    },
-  )
-}
-
-const ISLAND_PARAMS_ATTRIBUTE = 'data-pnext-params'
-
-/**
- * Request-time resume for a PPR route. Serves the prebuilt static shell immediately, then
- * re-runs the tree with the real request and streams only the dynamic holes into their
- * placeholders. Re-running renders the static parts again and discards them - the cost of not
- * needing React-style resumable state.
- */
-export function renderPprResponse(options: RenderOptions, prebuilt: PrebuiltShell) {
-  const postponed = prebuilt.holes.length > 0 || prebuilt.metadataDynamic
-  const shell = withRequestRouteParams(
-    prebuilt.shell,
-    options.params,
-    options.request ? new URL(options.request.url).search : undefined,
-  )
-  // Partial prefetch of a PPR route: the prebuilt static shell IS the answer —
-  // never run the dynamic resume for a prefetch (its holes stay fallbacks).
-  if (
-    postponed &&
-    options.request !== undefined &&
-    getRouterProtocolExtensions().shellOnlyRequest(options.request, options.route)
-  ) {
-    schedulePprShellUpgrade(options)
-    return new Response(`${shell}${renderDocumentEnd()}`, {
-      status: options.status ?? 200,
-      headers: {
-        'content-type': 'text/html; charset=utf-8',
-        'x-nextjs-postponed': '1',
-      },
-    })
-  }
-  // No holes: the shell IS the complete document — serve it buffered. There is
-  // nothing to resume, and a buffered body (content-length, not chunked) lets
-  // response-inspecting clients (test harnesses, intermediaries) read it.
-  if (!postponed) {
-    schedulePprShellUpgrade(options)
-    return new Response(`${shell}${renderDocumentEnd()}`, {
-      status: options.status ?? 200,
-      headers: { 'content-type': 'text/html; charset=utf-8' },
-    })
-  }
-  const request = renderScopeRequest(options)
-  const partial: PartialState = {
-    mode: 'request',
-    nextId: 0,
-    known: new Set(prebuilt.holes),
-    chunks: [],
-    metadataDynamic: prebuilt.metadataDynamic,
-    staticSlots: parseStaticSlots(shell),
-  }
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const encoder = new TextEncoder()
-      controller.enqueue(encoder.encode(shell))
-      // Next's test builds emit a sentinel between the static shell and the
-      // dynamic resume so PPR tests can split the response into its parts
-      // (splitResponseWithPPRSentinel). Mirror it under the same env gate.
-      // eslint-disable-next-line turbo/no-undeclared-env-vars
-      if (process.env.__NEXT_TEST_MODE) {
-        controller.enqueue(encoder.encode('<!-- PPR_BOUNDARY_SENTINEL -->'))
-      }
-      if (!routerPayload(options)) {
-        const nonce = documentNonce(options.request)
-        const stamp = `<script${nonce ? ` nonce="${escapeHtml(nonce)}"` : ''}>${SHELL_TIME_SCRIPT}</script>`
-        controller.enqueue(encoder.encode(stamp))
-      }
-      schedulePprShellUpgrade(options)
-      void (async () => {
-        try {
-          await seedPrerenderSidecar(options)
-          await runWithRequest(
-            request,
-            () =>
-              runWithFontScope(() =>
-                runWithCacheScope(() => pageRender({ ...options, partial }, false)),
-              ),
-            options.params ?? {},
-          )
-          for (const chunk of partial.chunks) controller.enqueue(encoder.encode(chunk))
-        } catch (error) {
-          if (options.dev)
-            console.error(error instanceof Error ? (error.stack ?? error.message) : error)
-          controller.enqueue(
-            encoder.encode(
-              renderToString(
-                hStreamError(
-                  error,
-                  Boolean(options.dev),
-                  nextCompatEnabled(options.config),
-                  needsClientEntry(options.route),
-                ),
-              ),
-            ),
-          )
-        }
-        controller.enqueue(encoder.encode(renderDocumentEnd()))
-        controller.close()
-      })()
-    },
-  })
-  return new Response(stream, {
-    status: options.status ?? 200,
-    headers: {
-      'content-type': 'text/html; charset=utf-8',
-      // A PPR response that served a shell with dynamic holes was postponed;
-      // Next stamps this so intermediaries/segment-cache treat it as partial.
-      // isNextStart-gated behavior (never dev): loadPprShell is prod+GET only.
-      ...(postponed ? { 'x-nextjs-postponed': '1' } : {}),
-    },
-  })
-}
-
-function prerenderSidecarContext(options: Pick<RenderOptions, 'config' | 'route'>) {
+export function prerenderSidecarContext(options: Pick<RenderOptions, 'config' | 'route'>) {
   return {
     outPath: options.config.outPath,
     routeId: options.route.id,
@@ -2255,316 +2006,61 @@ function prerenderSidecarContext(options: Pick<RenderOptions, 'config' | 'route'
   }
 }
 
-async function seedPrerenderSidecar(options: RenderOptions): Promise<void> {
+export async function seedPrerenderSidecar(options: RenderOptions): Promise<void> {
   if (!options.route.ppr || options.dev || !options.request) return
   await getRenderExtensions().prerenderSidecar.seed(prerenderSidecarContext(options))
 }
 
-/**
- * Build a param-independent fallback shell for a dynamic route with no prerendered param.
- * `params`/`searchParams` are hanging promises: a page that awaits them inside a <Suspense>
- * postpones that boundary; a page that reads them at the top level blocks the prerender and
- * returns null (must be served fully dynamically).
- */
-export async function renderFallbackShell(options: RenderOptions): Promise<PrebuiltShell | null> {
-  const params =
-    options.params ??
-    (options.route.catchAll && !options.route.catchAllOptional
-      ? { [options.route.catchAll]: [] }
-      : undefined)
-  return renderPartialShell({ ...options, ...(params ? { params } : {}), fallbackParams: true })
-}
-
-/**
- * Build a SUB-SHELL at a given param specificity: the `concreteParams` prefix is prerendered at
- * buildtime while the remaining route params hang. `/es/[slug]` and `/[lang]/[slug]` are two
- * sub-shells of descending specificity; the request path serves the deepest matching one.
- */
-export async function renderSubShell(
-  options: RenderOptions & {
-    concreteParams: Record<string, RouteParamValue>
-    paramKeys: string[]
-  },
-): Promise<PrebuiltShell | null> {
-  return renderPartialShell({
-    ...options,
-    fallbackConcreteParams: options.concreteParams,
-    fallbackParamKeys: options.paramKeys,
-  })
-}
-
-// In-flight stale-shell regenerations, so concurrent requests to a stale route
-// share one partial prerender instead of stampeding.
-const pendingShellRegens = new Map<string, Promise<PrebuiltShell | null>>()
-
-/**
- * Re-run the partial prerender for a PPR route whose prebuilt shell went stale. Persists the new
- * bytes back over the stale file - updating its mtime past the revalidation marks, so the
- * staleness self-heals - but only when the regenerated holes match the manifest's; a divergent
- * regen is served for this request only.
- */
-async function regenerateStalePprShell(options: RenderOptions): Promise<PrebuiltShell | null> {
-  const file = pprShellPath(options.config.outPath, options.route.id)
-  if (!existsSync(file)) return null
-  let pending = pendingShellRegens.get(options.route.id)
-  if (!pending) {
-    pending = (async () => {
-      // Seed the resume-data sidecar first: a hole-less shell serves via the fast path that never
-      // seeds, so this process's fetch/use-cache stores may be empty and the regen would refetch
-      // entries the revalidation did NOT invalidate. Invalidated records are ignored at read
-      // time, so seeding never resurrects revalidated data.
-      await getRenderExtensions().prerenderSidecar.seed(prerenderSidecarContext(options))
-      // Like ISR's scheduleRegen: a regeneration render must refetch stale-
-      // tagged data-cache entries inline (SWR would bake the stale values into
-      // the regenerated shell, and the self-healed mtime then hides the
-      // staleness forever).
-      const { value: prebuilt } = await getRenderExtensions().collectRenderMeta(
-        () => renderPartialShell({ ...options, runtimeRegen: true }),
-        { blockingStaleFetches: true, route: options.url?.pathname },
-      )
-      if (prebuilt) {
-        const manifestHoles = [...(options.route.pprHoles ?? [])].sort((a, b) => a - b)
-        const freshHoles = [...prebuilt.holes].sort((a, b) => a - b)
-        if (JSON.stringify(manifestHoles) === JSON.stringify(freshHoles)) {
-          await writeFile(file, prebuilt.shell).catch(() => undefined)
-        }
-      }
-      return prebuilt
-    })().finally(() => pendingShellRegens.delete(options.route.id))
-    pendingShellRegens.set(options.route.id, pending)
-  }
-  return pending
-}
-
-/**
- * The shell bytes a PPR route currently serves for `url` (fresh prebuilt file,
- * else the single-flight stale regeneration). Segment-prefetch artifacts adopt
- * this instead of prerendering independently, so document and `/__PAGE__`
- * payload always carry one regeneration's resume data.
- */
-export async function currentPprShellHtml(options: RenderOptions): Promise<string | null> {
-  const shell =
-    (await loadPprShell(options.config, options.route, options.url)) ??
-    (await regenerateStalePprShell(options))
-  return shell?.shell ?? null
-}
-
-async function loadPprShell(
-  config: ResolvedConfig,
-  route: RouteManifestEntry,
-  url?: URL,
-): Promise<PrebuiltShell | null> {
-  const revalidateSeconds = route.cacheLife?.revalidateSeconds
-  if (revalidateSeconds !== undefined) {
-    try {
-      const shell = await stat(pprShellPath(config.outPath, route.id))
-      if (Date.now() - shell.mtimeMs >= revalidateSeconds * 1000) return null
-    } catch {
-      return null
-    }
-  }
-  const pprStale = await getRenderExtensions().prerenderSidecar.isStale(
-    prerenderSidecarContext({ config, route }),
+/** The shell served for `url` still hangs one of the route's params, so its document is never this URL's static page. */
+export function pprShellLeavesParamHoles(route: RouteManifestEntry, url: URL): boolean {
+  const upgrade = pprShellUpgradeFor(route, url)
+  // Neither a base shell nor a promotion: the whole document renders per request.
+  if (route.ppr !== true && upgrade === undefined) return false
+  const paramKeys = upgrade?.paramKeys ?? routeParamKeys(route)
+  if (paramKeys.length === 0) return false
+  const actual = matchRouteParams(route, url.pathname)
+  if (!actual) return false
+  return (
+    !paramsPrerendered(route, actual, paramKeys) &&
+    Object.keys(upgrade?.concreteParams ?? {}).length < paramKeys.length
   )
-  if (pprStale === true) return null
-  // Tag/path revalidation staleness: a shell baked with cache tags must stop serving once one of
-  // those tags - or the route's path - is revalidated. The serving file's mtime is the freshness
-  // mark; regeneration rewrites the base shell, self-healing it, and a stale sub-shell file is
-  // dropped so the base shell (whose param holes resume per-request) takes over.
-  const bakedAtIsStale = (bakedAtMs: number): boolean =>
-    getRequestExtensions().staticStaleness(
-      url?.pathname ?? (route.route || '/'),
-      bakedAtMs,
-      route.cacheTags ?? [],
-    )
-  const shellIsStale = async (file: string): Promise<boolean> => {
-    try {
-      const stats = await stat(file)
-      return bakedAtIsStale(stats.mtimeMs)
-    } catch {
-      return true
-    }
-  }
-  const softStale = pprStale === 'soft'
-  const upgrade = pprShellUpgradeFor(config, route, url)
-  if (upgrade) {
-    const upgraded = pprShellUpgrades.get(upgrade.key)
-    // A runtime-promoted shell is memoized in memory, not on disk, so it needs the same path/tag
-    // revalidation check the shell FILES get above, with its promotion time standing in for the
-    // file mtime. Without it the memo outlives every invalidation and the page freezes on stale
-    // bytes forever. Dropping the stale entry also re-opens promotion (schedulePprShellUpgrade
-    // skips any key already in this map), so the fallthrough render warms a fresh shell.
-    if (upgraded) {
-      if (bakedAtIsStale(upgraded.promotedAt)) pprShellUpgrades.delete(upgrade.key)
-      else return upgraded.shell
-    }
-  }
-  // Sub-shell selection (Stage C.2): pick the deepest prebuilt sub-shell whose
-  // concrete-param prefix matches the request. subShells are recorded on the
-  // route at build in descending specificity; the base shell (route.id) is the
-  // least-specific fallback (all params hang).
-  const subShells = route.pprSubShells
-  if (subShells && subShells.length > 0) {
-    const match = url ? selectSubShell(route, subShells, url) : undefined
-    if (match) {
-      const file = pprSubShellPath(config.outPath, route.id, match.key)
-      if (existsSync(file)) {
-        if (await shellIsStale(file)) {
-          // Self-heal: drop the stale sub-shell so later requests serve the
-          // base shell, whose param holes resume with fresh data per request.
-          await unlink(file).catch(() => undefined)
-        } else {
-          return {
-            shell: await readText(file),
-            holes: match.holes,
-            metadataDynamic: Boolean(route.pprMetadata),
-            concreteParams: match.concreteParams,
-            ...(softStale ? { softStale } : {}),
-          }
-        }
-      }
-    }
-  }
-  const file = pprShellPath(config.outPath, route.id)
-  if (!existsSync(file)) return null
-  if (await shellIsStale(file)) return null
-  return {
-    shell: await readText(file),
-    holes: route.pprHoles ?? [],
-    metadataDynamic: Boolean(route.pprMetadata),
-    concreteParams: {},
-    ...(softStale ? { softStale } : {}),
-  }
 }
 
-/**
- * Warm the next more-specific shell without delaying the fallback response.
- * Only parameter prefixes with a generateStaticParams owner are promoted; a
- * remaining fully dynamic suffix stays a hole forever.
- */
-export function schedulePprShellUpgrade(
-  options: Pick<RenderOptions, 'config' | 'route' | 'url'>,
-): void {
-  const upgrade = pprShellUpgradeFor(options.config, options.route, options.url)
-  if (
-    !upgrade ||
-    pprShellUpgrades.has(upgrade.key) ||
-    pendingPprShellUpgrades.has(upgrade.key) ||
-    rejectedPprShellUpgrades.has(upgrade.key)
-  )
-    return
-  pendingPprShellUpgrades.add(upgrade.key)
-  void (async () => {
-    // A runtime shell upgrade renders against the live server without the build-time resume sidecar
-    // seeded in this process. Seed it first, so cache-backed fills resolve from the captured
-    // snapshots instead of refetching.
-    try {
-      await getRenderExtensions().prerenderSidecar.seed(prerenderSidecarContext(options))
-    } catch {
-      // A missing/failed sidecar seed only forces the upgrade render to refetch;
-      // it never blocks the promotion.
-    }
-    const prebuilt = await renderSubShell({
-      ...options,
-      concreteParams: upgrade.concreteParams,
-      paramKeys: upgrade.paramKeys,
-      runtimeRegen: true,
-      // Keep the build-time task-boundary postpone discipline: promote the
-      // concrete params into the shell, but leave any boundary that depends on
-      // uncached request-time I/O a hole (resumed live per request) instead of
-      // freezing a request-specific result in pprShellUpgrades.
-      boundedRegen: true,
-    })
-    if (prebuilt) {
-      // A PPR route already has a base shell that RESUMES its holes live on every request.
-      // Promoting a concrete param must only add param-derived static content on top of that - it
-      // must never bake request-time content (a fresh OTEL span id, Math.random, Date) into the
-      // static shell in place of the resume. Confirm the promoted shell is reproducible before
-      // caching it: re-render once more (no sidecar persist) and diff the bytes; on a mismatch
-      // drop the promotion and remember the rejection so the double render is not retried.
-      // A NON-PPR route has no base shell to fall back to - its runtime prerender IS the cache
-      // entry, so it is cached as-is with no determinism gate.
-      let cacheable = true
-      if (options.route.ppr) {
-        const confirm = await renderSubShell({
-          ...options,
-          concreteParams: upgrade.concreteParams,
-          paramKeys: upgrade.paramKeys,
-          runtimeRegen: true,
-          boundedRegen: true,
-          probeShell: true,
-        })
-        cacheable = confirm?.shell === prebuilt.shell
-      }
-      if (cacheable) {
-        pprShellUpgrades.set(upgrade.key, {
-          shell: { ...prebuilt, concreteParams: upgrade.concreteParams },
-          promotedAt: Date.now(),
-        })
-      } else {
-        rejectedPprShellUpgrades.add(upgrade.key)
-      }
-    }
-  })()
-    .catch(() => undefined)
-    .finally(() => pendingPprShellUpgrades.delete(upgrade.key))
+/** The URL the route matched: a rewrite's destination, not the address the client requested. */
+export function routeTargetUrl(options: Pick<RenderOptions, 'url' | 'nav'>): URL {
+  const target = options.nav?.targetPath
+  return target && target !== options.url.pathname ? new URL(target, options.url) : options.url
 }
 
-const paramFreeRootLayoutCache = new Map<string, boolean>()
-
-/**
- * True when the app's document layout is `app/layout.*` - param-free, so every route branch
- * shares one document. When the root layout lives under a dynamic param instead
- * (`app/[lang]/layout.tsx`), an unknown branch has no shareable shell and must never reuse
- * another branch's promoted shell.
- */
-function hasParamFreeRootLayout(config: ResolvedConfig): boolean {
-  const cached = paramFreeRootLayoutCache.get(config.appPath)
-  if (cached !== undefined) return cached
-  const found = ['tsx', 'jsx', 'ts', 'js'].some(ext =>
-    conventionFileExists(join(config.appPath, `layout.${ext}`)),
-  )
-  paramFreeRootLayoutCache.set(config.appPath, found)
-  return found
-}
-
-/**
- * True when this request could promote a prebuilt fallback shell into a more specific route
- * shell. Such a render must never be persisted as a lazy-static HTML file: later requests would
- * be served straight off disk and never reach the renderer, so the upgraded shell would never
- * reach the client.
- */
-export function isPprShellUpgradeEligible(
-  config: ResolvedConfig,
-  route: RouteManifestEntry,
-  url?: URL,
-): boolean {
-  // Shell upgrades only exist for a route that HAS a PPR base shell. Any other
-  // route (a plain ISR route with generateStaticParams, or a non-PPR route under
-  // cacheComponents) also has prerenderedParams, but has no shell to upgrade.
-  // Treating it as upgrade-eligible only vetoes its lazy-static persistence, so
-  // every request re-renders and re-samples request-time content
-  // (next-after-app-deploy's "sanity check that it's static";
-  // cache-components-allow-otel-spans' cached span ids on /novel/{cache,server}).
-  if (!route.ppr) return false
-  return pprShellUpgradeFor(config, route, url) !== undefined
-}
-
-function pprShellUpgradeFor(config: ResolvedConfig, route: RouteManifestEntry, url?: URL) {
-  if (!url || !route.prerenderedParams?.length) return undefined
-  if (!hasParamFreeRootLayout(config)) return undefined
+export function pprShellUpgradeFor(route: RouteManifestEntry, url?: URL) {
+  // An explicit promotion policy names the concrete prefix and whether the request waits for it;
+  // otherwise the longest generated prefix is promoted in the background under partial prefetching.
+  const policy = getRenderExtensions().paramPromotion(route)
+  const partial = compatNextConfig().partialPrefetching === true
+  // Without partial prefetching, a route with no servable base shell blocks on its generated prefix.
+  const foreground =
+    policy?.foreground === true ||
+    (!partial && cacheComponents() && !route.pprHoles && (route.prerenderedParams?.length ?? 0) > 0)
+  if (!foreground && !partial && !policy) return undefined
+  if (!url || (!policy && !route.prerenderedParams?.length)) return undefined
   const actual = matchRouteParams(route, url.pathname)
   if (!actual) return undefined
-  const paramKeys = [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
-  const length = Math.max(
-    0,
-    ...route.prerenderedParams.map(params => {
-      let count = 0
-      while (count < paramKeys.length && params[paramKeys[count]!] !== undefined) count++
-      return count
-    }),
-  )
+  const paramKeys = routeParamKeys(route)
+  const length =
+    policy?.length ??
+    Math.max(
+      0,
+      ...(route.prerenderedParams ?? []).map(params => {
+        let count = 0
+        while (count < paramKeys.length && params[paramKeys[count]!] !== undefined) count++
+        return count
+      }),
+    )
   if (length === 0) return undefined
+  // A generated URL of a non-PPR route is its own static page: nothing to promote.
+  if (route.ppr !== true && length === paramKeys.length && paramsPrerendered(route, actual)) {
+    return undefined
+  }
   const concreteParams: Record<string, RouteParamValue> = {}
   for (let index = 0; index < length; index++) {
     const key = paramKeys[index]!
@@ -2576,31 +2072,8 @@ function pprShellUpgradeFor(config: ResolvedConfig, route: RouteManifestEntry, u
     concreteParams,
     paramKeys,
     key: `${route.id}:${JSON.stringify(concreteParams)}`,
+    foreground,
   }
-}
-
-/**
- * Pick the deepest (most concrete params) prebuilt sub-shell whose param prefix
- * is consistent with the request URL's path segments. Sub-shells are ordered
- * most-specific first, so the first match wins.
- */
-function selectSubShell(
-  route: RouteManifestEntry,
-  subShells: NonNullable<RouteManifestEntry['pprSubShells']>,
-  url: URL,
-): NonNullable<RouteManifestEntry['pprSubShells']>[number] | undefined {
-  const actual = matchRouteParams(route, url.pathname)
-  if (!actual) return undefined
-  for (const shell of subShells) {
-    const ok = Object.entries(shell.concreteParams).every(([key, value]) => {
-      const a = actual[key]
-      return Array.isArray(value)
-        ? Array.isArray(a) && a.join('/') === value.join('/')
-        : a === value
-    })
-    if (ok) return shell
-  }
-  return undefined
 }
 
 /**
@@ -2608,14 +2081,14 @@ function selectSubShell(
  * match a request against prebuilt sub-shell prefixes). Returns undefined when
  * the pathname does not match the route pattern.
  */
-function matchRouteParams(
+export function matchRouteParams(
   route: RouteManifestEntry,
   pathname: string,
 ): Record<string, RouteParamValue> | undefined {
   const pattern = new RegExp(`^${route.pattern}$`)
   const match = pattern.exec(pathname)
   if (!match) return undefined
-  const keys = [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
+  const keys = routeParamKeys(route)
   const params: Record<string, RouteParamValue> = {}
   keys.forEach((key, index) => {
     const raw = match[index + 1]
@@ -2633,6 +2106,12 @@ export function pprShellPath(outPath: string, routeId: string) {
 /** Path for a prebuilt sub-shell keyed by its concrete-param prefix signature. */
 export function pprSubShellPath(outPath: string, routeId: string, key: string) {
   return `${outPath}/ppr/${routeId}.${key}.html`
+}
+
+export function subShellKey(concrete: Record<string, RouteParamValue>): string {
+  return Object.entries(concrete)
+    .map(([k, v]) => `${k}-${(Array.isArray(v) ? v.join('_') : v).replace(/[^a-zA-Z0-9_]/g, '_')}`)
+    .join('.')
 }
 
 /**
@@ -2837,8 +2316,16 @@ function pageStream(page: PageRender, shellOnly = false, profile?: RenderProfile
         if (shellOnly && page.streamChunks.length > 0) {
           for (const chunk of page.streamChunks) void chunk.catch(() => undefined)
         } else {
-          for await (const chunk of completed(page.streamChunks)) {
-            controller.enqueue(encoder.encode(chunk))
+          const live = (chunk: Promise<string>) => !inertChunks.has(chunk)
+          for await (const [html, chunk] of completed(page.streamChunks, live)) {
+            if (live(chunk)) {
+              controller.enqueue(encoder.encode(html))
+              continue
+            }
+            // Boundaries nested in a dropped chunk are never placed either.
+            const nested = new Set(Array.from(html.matchAll(SUSPENSE_MARKER_ID), match => match[1]))
+            for (const other of page.streamChunks)
+              if (nested.has(boundaryChunkIds.get(other))) inertChunks.add(other)
           }
         }
         controller.enqueue(encoder.encode(renderDocumentEnd()))
@@ -2854,7 +2341,7 @@ function pageStream(page: PageRender, shellOnly = false, profile?: RenderProfile
           // it is what tells the reader the document is complete, so it must
           // not wait for the work it introduces.
           controller.enqueue(encoder.encode(LATE_METADATA_MARKER))
-          for await (const chunk of completed(lateChunks)) {
+          for await (const [chunk] of completed(lateChunks)) {
             if (chunk) controller.enqueue(encoder.encode(chunk))
           }
         }
@@ -2868,29 +2355,7 @@ function pageStream(page: PageRender, shellOnly = false, profile?: RenderProfile
   })
 }
 
-// Read + regex per request became a read per root-layout EDIT: the answer only
-// changes when the file does, and mtime is one syscall against a whole file read.
-const documentLayoutDefaults = new Map<string, { mtimeMs: number; hasDefault: boolean }>()
-
-async function routeHasDocumentLayout(layoutFiles: string[]) {
-  const rootLayout = layoutFiles[0]
-  if (!rootLayout) return false
-  const served = servedConventions()
-  if (served) return served.documentLayouts.has(rootLayout)
-  let mtimeMs: number
-  try {
-    mtimeMs = statSync(rootLayout).mtimeMs
-  } catch {
-    return false
-  }
-  const cached = documentLayoutDefaults.get(rootLayout)
-  if (cached?.mtimeMs === mtimeMs) return cached.hasDefault
-  const hasDefault = /\bexport\s+default\b/.test(await readText(rootLayout))
-  documentLayoutDefaults.set(rootLayout, { mtimeMs, hasDefault })
-  return hasDefault
-}
-
-async function pageRender(options: RenderOptions, stream: boolean): Promise<PageRender> {
+export async function pageRender(options: RenderOptions, stream: boolean): Promise<PageRender> {
   options = normalizeRenderOptions(options)
   await getSuspenseExtensions().ensureCompatSuspense(options.config)
   // One-time render-module init: raw <style>/<script> text handling.
@@ -2916,7 +2381,14 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
     // children tree may still match it (e.g. a sibling catch-all): resolve
     // dynamically, falling back to the nearest `default.*`, else nothing.
     let pageFile: string | undefined = options.route.file
-    if (options.route.synthetic) {
+    let implicitChildren = false
+    if (options.route.namedSlotsOnly) {
+      pageFile = undefined
+      // The pre-explicit-children model hands the layout a children branch after all.
+      implicitChildren = getRenderExtensions().implicitSlotChildren()
+      if (implicitChildren)
+        options = { ...options, route: { ...options.route, namedSlotsOnly: false } }
+    } else if (options.route.synthetic) {
       if (options.route.childrenDefault) {
         pageFile = options.route.childrenDefault
       } else {
@@ -2947,17 +2419,12 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
       profileRenderSyncStep(profile, 'find layouts', () =>
         findLayouts(options.config.appPath, options.route.file),
       )
-    await profileRenderStep(profile, 'detect document layout', () =>
-      routeHasDocumentLayout(layoutFiles),
-    )
-    const renderClientPageOnServer = true
-    const pageModule =
-      renderClientPageOnServer && pageFile
-        ? ((await getRenderSpanExtensions().withFindPageComponentsSpan(options.route.route, () =>
-            profileRenderStep(profile, 'import page module', () => importModule(pageFile, options)),
-          )) as PageModule)
-        : undefined
-    let Page = pageModule?.default
+    const pageModule = pageFile
+      ? ((await getRenderSpanExtensions().withFindPageComponentsSpan(options.route.route, () =>
+          profileRenderStep(profile, 'import page module', () => importModule(pageFile, options)),
+        )) as PageModule)
+      : undefined
+    let Page = implicitChildren ? ImplicitNotFoundChildren : pageModule?.default
     // A client-by-re-export page imported through the SERVER graph can come back as a
     // client-reference STUB: the chain crosses a server module whose client import the server
     // layer stubbed, and the stub renders `children ?? null`, so the no-JS document would ship an
@@ -2972,7 +2439,7 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
       const clientPageModule = (await importClientModule(pageFile, options)) as PageModule
       if (typeof clientPageModule.default === 'function') Page = clientPageModule.default
     }
-    if (renderClientPageOnServer && !Page && pageFile) {
+    if (!Page && pageFile) {
       throw new Error(`${pageFile} must export a default page component`)
     }
     // Whether the ORIGINAL page export is an async component - captured before the compat
@@ -2992,6 +2459,7 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
       Boolean(Page && (Page as unknown as ClientComponent)[clientReferenceSymbol]) ||
       Boolean(pageFile && options.route.clientReferences.some(ref => ref.file === pageFile))
     if (Page && pageIsClientReference) {
+      if (pageFile) getRenderSpanExtensions().onClientComponent?.(pageFile)
       // A `route.client` page carries no client reference (it hydrates directly at `#pnext-page`,
       // not as an island). Tag it so the server tree resolver SSRs it through the preact renderer
       // instead of server-invoking it, which has no hooks dispatcher. Leave its identity intact -
@@ -3088,6 +2556,7 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
     // PPR/fallback passes (a use() on a hanging promise must not mark it read).
     if (
       Page &&
+      !implicitChildren &&
       !pageIsClientReference &&
       !pageIsAsyncComponent &&
       !options.partial &&
@@ -3103,15 +2572,11 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
       profileRenderSince(profile, 'speculative page warm', speculativeStart)
     }
     const page = h('div', pageSlotProps, pageNode)
-    // loading.js Suspense boundaries are applied per-segment during layout
-    // composition (applyLayouts), so a slow LAYOUT — not just a slow leaf page —
-    // shows its nearest loading fallback. See buildLoadingBoundaries.
-    const loadedPage = page
     const metadataExtensions = getActiveMetadataExtensions(options.config)
     const pageModuleRecord = pageModule as Record<string, unknown> | undefined
     const prebuiltPageMetadata = pageFile ? options.staticModuleMetadata?.[pageFile] : undefined
     const pageMetadata = pageModule
-      ? (parent: Metadata) =>
+      ? (parent: Promise<Metadata>) =>
           trackMetadataRedirect(
             metadataExtensions.readModuleMetadata
               ? metadataExtensions.readModuleMetadata(pageModuleRecord!, props, parent, pageFile)
@@ -3139,7 +2604,7 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
             clientComponents,
             clientComponentsPreload,
           },
-          loadedPage,
+          page,
           stream,
           pageMetadata,
           {
@@ -3156,12 +2621,15 @@ async function pageRender(options: RenderOptions, stream: boolean): Promise<Page
               ? Boolean(metadataExtensions.hasRuntimeMetadata?.(pageModuleRecord))
               : false,
             preferSlotMetadata: true,
+            pageDefinesHead: Boolean(pageModuleRecord && definesHead(pageModuleRecord)),
           },
         ),
       ),
     )
     return rendered
   } catch (error) {
+    const outletSlot = error && typeof error === 'object' ? slotOutletErrors.get(error) : undefined
+    if (outletSlot) options = { ...options, boundarySlot: outletSlot }
     // A partial prerender (PPR shell / runtime shell upgrade) must never bake a
     // control-flow outcome into a shell: notFound()/redirect() are per-request
     // results, and a promoted shell replays them with the shell's own 200 status
@@ -3264,16 +2732,16 @@ async function renderAuthInterruptPage(
   stream: boolean,
   kind: 'forbidden' | 'unauthorized',
 ) {
-  const { status, title, message } = authInterruptDefaults[kind]
-  const fallbackTree = httpAccessFallbackTree(status, message)
-  const file = nearestConventionFile(options, `${kind}.tsx`)
+  const { status: errorStatus, title, message } = authInterruptDefaults[kind]
+  const status = slotErrorAfterCommit(options) ? 200 : errorStatus
+  const fallbackTree = httpAccessFallbackTree(errorStatus, message)
+  const file = nearestAccessBoundary(options, `${kind}.tsx`)
   const boundaryOptions = optionsForNotFoundBoundary(options, file)
   if (!file || !conventionFileExists(file)) {
     return renderTreeOrFallback(
-      boundaryOptions,
-      fallbackTree,
+      ...placeBoundary(boundaryOptions, file, fallbackTree),
       stream,
-      { title: `${status}: ${message}` },
+      { title: `${errorStatus}: ${message}` },
       { status },
     )
   }
@@ -3281,16 +2749,18 @@ async function renderAuthInterruptPage(
   const Component = markServerReference(module.default)
   if (!Component) {
     return renderTreeOrFallback(
-      boundaryOptions,
-      fallbackTree,
+      ...placeBoundary(boundaryOptions, file, fallbackTree),
       stream,
-      { title: `${status}: ${message}` },
+      { title: `${errorStatus}: ${message}` },
       { status },
     )
   }
   return renderTreeOrFallback(
-    boundaryOptions,
-    h('div', pageRootProps, h(Component as unknown as ComponentType<Record<string, never>>, {})),
+    ...placeBoundary(
+      boundaryOptions,
+      file,
+      h('div', pageRootProps, h(Component as unknown as ComponentType<Record<string, never>>, {})),
+    ),
     stream,
     (await readModuleMetadata(module)) ?? { title },
     { status },
@@ -3446,7 +2916,7 @@ function normalizeRenderOptions(options: RenderOptions): RenderOptions {
 // from ancestor layouts. Compat can narrow this through the streamRoute hook;
 // core routes stream by default.
 /** A response the client router fetched, not a document load. */
-function routerPayload(options: RenderOptions) {
+export function routerPayload(options: RenderOptions) {
   return Boolean(options.nav?.soft) || options.request?.headers.get('rsc') === '1'
 }
 
@@ -3547,44 +3017,293 @@ async function renderDocumentRedirect(
   }
 }
 
-async function resolveSelectedSlotMetadata(
+// A missing children branch's built-in default: not found, but only where the layout renders it.
+const ImplicitNotFoundChildren = (): never => notFound()
+
+function definesHead(module: Record<string, unknown>) {
+  return ['metadata', 'generateMetadata', 'viewport', 'generateViewport'].some(
+    key => module[key] !== undefined,
+  )
+}
+
+interface SlotLayer {
+  file: string
+  kind: 'layout' | 'page'
+  module: Record<string, unknown>
+}
+
+async function slotLayers(options: RenderOptions, match: ResolvedSlotMatch): Promise<SlotLayer[]> {
+  const layers: SlotLayer[] = []
+  for (const file of match.layoutFiles) {
+    layers.push({ file, kind: 'layout', module: await importModule(file, options) })
+  }
+  if (match.pageFile) {
+    layers.push({
+      file: match.pageFile,
+      kind: 'page',
+      module: await importModule(match.pageFile, options),
+    })
+  }
+  return layers
+}
+
+function slotProps(options: RenderOptions, match: ResolvedSlotMatch): PageProps {
+  return {
+    ...createPageProps(options),
+    params: Promise.resolve({ ...(options.params ?? {}), ...match.params }),
+  }
+}
+
+async function readSlotMetadata(
+  options: RenderOptions,
+  layers: SlotLayer[],
+  props: PageProps,
+  parentEntries: Promise<MetadataEntry[]>,
+): Promise<MetadataEntry[]> {
+  const entries: MetadataEntry[] = []
+  for (const { file, kind, module } of layers) {
+    const own = [...entries]
+    const resolved = await readRenderModuleMetadata(
+      options,
+      module,
+      props,
+      parentEntries.then(parent => mergeMetadataEntries(parent, own)),
+      file,
+      options.staticModuleMetadata?.[file]?.metadata,
+    )
+    if (resolved) entries.push({ metadata: resolved, dir: dirname(file), kind })
+  }
+  return entries
+}
+
+interface SlotHeadStart {
+  layers: Promise<SlotLayer[]>
+  metadata: Promise<MetadataEntry[]>
+  viewport: Promise<Viewport[]>
+}
+
+const slotHeads = new WeakMap<ResolvedSlotMatch, SlotHeadStart>()
+
+/** Start a slot branch's metadata and viewport generators alongside its ancestors'. */
+function startSlotHead(
+  options: RenderOptions,
+  match: ResolvedSlotMatch,
+  parentEntries: Promise<MetadataEntry[]>,
+): void {
+  const props = slotProps(options, match)
+  const extensions = getActiveMetadataExtensions(options.config)
+  const layers = started(slotLayers(options, match))
+  slotHeads.set(match, {
+    layers,
+    metadata: started(layers.then(all => readSlotMetadata(options, all, props, parentEntries))),
+    viewport: started(
+      layers.then(async all => {
+        const viewports: Viewport[] = []
+        for (const { file, module } of all) {
+          const viewport = await (extensions.readModuleViewport
+            ? extensions.readModuleViewport(module, props, file)
+            : readModuleViewport(module))
+          if (viewport) viewports.push(viewport)
+        }
+        return viewports
+      }),
+    ),
+  })
+}
+
+/** Inspect a slot branch's head definitions; its generators already started (startSlotHead). */
+async function readSlotBranch(
+  options: RenderOptions,
+  match: ResolvedSlotMatch,
+  childrenDefinesHead: (fork: string) => boolean,
+): Promise<SlotHeadBranch> {
+  const head = slotHeads.get(match)!
+  const extensions = getActiveMetadataExtensions(options.config)
+  const depthOf = (dir: string) => relative(match.slotDir, dir).split(sep).filter(Boolean).length
+  const layers = await head.layers
+  let hasSource = false
+  let runtime = false
+  let definitionDepth = -1
+  for (const { file, kind, module } of layers) {
+    const moduleRuntime = Boolean(extensions.hasRuntimeMetadata?.(module))
+    runtime ||= moduleRuntime
+    hasSource ||= moduleRuntime || module.metadata !== undefined
+    if (definesHead(module)) {
+      definitionDepth = Math.max(
+        definitionDepth,
+        depthOf(dirname(file)) + (kind === 'page' ? 1 : 0),
+      )
+    }
+  }
+  const pageDir = match.pageFile ? dirname(match.pageFile) : match.slotDir
+  for (let dir = pageDir; ; dir = dirname(dir)) {
+    if (hasHeadMetadataFiles(dir)) definitionDepth = Math.max(definitionDepth, depthOf(dir))
+    if (dir === match.slotDir) break
+  }
+  return {
+    slotDir: match.slotDir,
+    hasSource,
+    runtime,
+    definitionDepth,
+    pageDepth: depthOf(pageDir),
+    childrenDefinesHead: childrenDefinesHead(dirname(match.slotDir)),
+    metadata: () => head.metadata,
+    viewport: () => head.viewport,
+  }
+}
+
+/** Core's slot head: the first branch defining metadata, read in order; its errors propagate. */
+async function firstSlotHead(
   options: RenderOptions,
   matches: ResolvedSlotMatch[],
-  parentEntries: MetadataEntry[],
-): Promise<{ entries: MetadataEntry[]; runtime: boolean }> {
+): Promise<SlotHead> {
+  const extensions = getActiveMetadataExtensions(options.config)
   for (const match of matches) {
-    const entries: MetadataEntry[] = []
-    let runtime = false
-    let hasSource = false
-    const props = {
-      ...createPageProps(options),
-      params: Promise.resolve({ ...(options.params ?? {}), ...match.params }),
-    }
-    const files = [
-      ...match.layoutFiles.map(file => ({ file, kind: 'layout' as const })),
-      ...(match.pageFile ? [{ file: match.pageFile, kind: 'page' as const }] : []),
-    ]
-    for (const { file, kind } of files) {
-      const module = await importModule(file, options)
-      const extensions = getActiveMetadataExtensions(options.config)
-      const moduleRuntime = Boolean(extensions.hasRuntimeMetadata?.(module))
-      runtime ||= moduleRuntime
-      hasSource ||= moduleRuntime || module.metadata !== undefined
-      const metadata = await readRenderModuleMetadata(
-        options,
-        module,
-        props,
-        mergeMetadataEntries(parentEntries, entries),
-        file,
-        options.staticModuleMetadata?.[file]?.metadata,
-      )
-      if (metadata) {
-        entries.push({ metadata, dir: dirname(file), kind })
-      }
-    }
-    if (hasSource) return { entries, runtime }
+    const head = slotHeads.get(match)!
+    const layers = await head.layers
+    const runtime = layers.some(layer => Boolean(extensions.hasRuntimeMetadata?.(layer.module)))
+    const hasSource = runtime || layers.some(layer => layer.module.metadata !== undefined)
+    const entries = await head.metadata
+    if (hasSource) return { entries, viewport: [], runtime }
   }
-  return { entries: [], runtime: false }
+  return { entries: [], viewport: [], runtime: false }
+}
+
+// Whether the children branch defines head tags below a slot's owner layout: a layout or page export,
+// or a metadata image file, on its path past the fork.
+function childrenHeadBelow(
+  options: RenderOptions,
+  layoutRender: LayoutRender,
+  extra: RenderTreeExtra,
+): (fork: string) => boolean {
+  if (options.route.namedSlotsOnly) return () => false
+  const leaf = extra.pageMetadataDir ?? dirname(options.route.file)
+  return fork => {
+    const below = (dir: string) =>
+      dir.startsWith(`${fork}${sep}`) && !relative(fork, dir).split(sep).some(isSlotSegment)
+    // The page sits under its own dir's layout, so a page at the fork is still below it.
+    if (extra.pageDefinesHead && (leaf === fork || below(leaf))) return true
+    if (layoutRender.headDirs.some(below)) return true
+    for (let dir = leaf; below(dir); dir = dirname(dir)) {
+      if (hasHeadMetadataFiles(dir)) return true
+    }
+    return false
+  }
+}
+
+async function planSlotHead(
+  options: RenderOptions,
+  layoutRender: LayoutRender,
+  extra: RenderTreeExtra,
+): Promise<SlotHeadPolicy> {
+  const fallback = () => firstSlotHead(options, layoutRender.slotMatches)
+  const policy = await getActiveMetadataExtensions(options.config).slotHead?.({
+    namedSlotsOnly: Boolean(options.route.namedSlotsOnly),
+    routerPayload: routerPayload(options),
+    fallback,
+    analyze: async () => {
+      const childrenDefinesHead = childrenHeadBelow(options, layoutRender, extra)
+      const branches: SlotHeadBranch[] = []
+      for (const match of layoutRender.slotMatches) {
+        branches.push(await readSlotBranch(options, match, childrenDefinesHead))
+      }
+      return branches
+    },
+    logError: error => logUnrenderedSlotError(options, error),
+  })
+  return policy ?? { outlets: new Map(), head: fallback }
+}
+
+/** Where an escaped error came from: a slot dir and the file its boundaries are found from. */
+interface ErrorSlot {
+  dir: string
+  file: string
+}
+
+const slotOutletErrors = new WeakMap<object, ErrorSlot>()
+
+function logUnrenderedSlotError(options: RenderOptions, error: unknown) {
+  if (isRenderControlFlowError(error)) return
+  logDevError(options, resolveThrownError(error, nextCompatEnabled(options.config)))
+}
+
+// A rendered slot's metadata outlet, holding the slot's content. A blocking document lets a rejection
+// take the normal error/status path; once the response committed, the slot's own boundary (HTTP-access
+// or error.*) replaces the content, and one with no boundary throws on, attributed to the slot.
+const SlotOutlet = async (props: {
+  outlet: Promise<unknown>
+  options: RenderOptions
+  slot: ErrorSlot
+  /** The response has committed (streamed shell or navigation): the slot's boundary takes it. */
+  committed: boolean
+  children?: ComponentChildren
+}): Promise<ComponentChildren> => {
+  try {
+    await props.outlet
+    return props.children ?? null
+  } catch (error) {
+    if (!props.committed) {
+      if (error && typeof error === 'object') slotOutletErrors.set(error, props.slot)
+      throw error
+    }
+    const kind = isNotFoundError(error)
+      ? 'not-found'
+      : isForbiddenError(error)
+        ? 'forbidden'
+        : isUnauthorizedError(error)
+          ? 'unauthorized'
+          : undefined
+    const options = { ...props.options, boundarySlot: props.slot }
+    if (kind) return slotAccessBoundary(options, kind)
+    const file = isRedirectError(error) ? undefined : nearestConventionFile(options, 'error.tsx')
+    const resolved = resolveThrownError(error, nextCompatEnabled(options.config))
+    const boundary = file ? await errorBoundaryElement(options, file, resolved) : undefined
+    if (boundary) {
+      logDevError(options, resolved)
+      return boundary
+    }
+    if (error && typeof error === 'object') slotOutletErrors.set(error, props.slot)
+    throw error
+  }
+}
+
+async function slotAccessBoundary(
+  options: RenderOptions,
+  kind: 'not-found' | 'forbidden' | 'unauthorized',
+): Promise<ComponentChildren> {
+  const file = nearestAccessBoundary(options, `${kind}.tsx`)
+  if (file) {
+    const reference = conventionDefaultReference(options, file)
+    const Component = reference
+      ? clientReferenceStub(reference)
+      : markServerReference(((await importModule(file, options)) as PageModule).default)
+    if (Component) return h(Component as ComponentType<Record<string, never>>, {})
+  }
+  if (kind === 'not-found') return defaultNotFoundTree()
+  const { status, message } = authInterruptDefaults[kind]
+  return httpAccessFallbackTree(status, message)
+}
+
+/**
+ * Each rendered slot's outlet wraps its content. Where metadata streams it suspends (fallback-free) so
+ * the shell commits first; where metadata blocks it holds the shell.
+ */
+function slotOutletWrappers(
+  options: RenderOptions,
+  matches: ResolvedSlotMatch[],
+  outlets: Map<string, Promise<unknown>>,
+): Map<string, (content: ComponentChildren) => ComponentChildren> {
+  const committed = routerPayload(options) || shouldRenderRuntimeMetadataInBody(options, true)
+  const Outlet = markServerReference(SlotOutlet) as ComponentType<Record<string, unknown>>
+  const wrappers = new Map<string, (content: ComponentChildren) => ComponentChildren>()
+  for (const [dir, outlet] of outlets) {
+    const slot = { dir, file: matches.find(match => match.slotDir === dir)?.pageFile ?? dir }
+    wrappers.set(dir, content => {
+      const node = h(Outlet, { outlet, options, slot, committed }, content)
+      return committed ? h(Suspense, { fallback: null }, node) : node
+    })
+  }
+  return wrappers
 }
 
 /**
@@ -3602,7 +3321,7 @@ async function renderTreeInFrame(
   stream: boolean,
   // Compat resolvers may use the merged ancestor metadata; core static
   // generation ignores it and treats metadata as build-time route data.
-  pageMetadata: Metadata | ((parent: Metadata) => Promise<Metadata>) = {},
+  pageMetadata: Metadata | ((parent: Promise<Metadata>) => Promise<Metadata>) = {},
   extra: RenderTreeExtra = {},
 ): Promise<PageRender> {
   clearResourceHints()
@@ -3610,10 +3329,31 @@ async function renderTreeInFrame(
   clearDeferredScripts()
   const profile = renderProfile(options)
   const slotStateOut: Record<string, string> = options.slotStateOut ?? {}
-  options = { ...options, slotStateOut }
-  const layoutRender = await profileRenderStep(profile, 'apply layouts', () =>
-    applyLayouts(options, tree),
+  options = {
+    ...options,
+    slotStateOut,
+    renderedSlots: new Set<string>(),
+  }
+  let pageHead: Promise<Metadata> | undefined
+  const layoutRender = await getRenderSpanExtensions().withComponentTreeSpan(() =>
+    profileRenderStep(profile, 'apply layouts', () =>
+      applyLayouts(options, tree, (parent, slotMatches) => {
+        if (typeof pageMetadata === 'function')
+          pageHead = started(pageMetadata(parent.then(entries => mergeMetadataEntries(entries))))
+        if (extra.preferSlotMetadata)
+          for (const match of slotMatches) startSlotHead(options, match, parent)
+      }),
+    ),
   )
+  const slotHead =
+    extra.preferSlotMetadata && layoutRender.slotMatches.length > 0
+      ? await profileRenderStep(profile, 'slot branches', () =>
+          planSlotHead(options, layoutRender, extra),
+        )
+      : undefined
+  if (slotHead) {
+    options.slotOutlets = slotOutletWrappers(options, layoutRender.slotMatches, slotHead.outlets)
+  }
   const clientComponents: ClientComponentMap =
     options.clientComponents ?? new Map<string, ComponentType<Record<string, unknown>>>()
   if (options.clientComponentsPreload) {
@@ -3643,6 +3383,11 @@ async function renderTreeInFrame(
   await profileRenderStep(profile, 'discover client references', () =>
     addDiscoveredClientReferences(layoutRender.tree, clientComponents, clientReferences, options),
   )
+  // An HTML-limited bot's head blocks on its metadata, so it starts with the body; a boundary
+  // whose content settles before it is inlined rather than streamed (Next holds the shell for it).
+  const oneTask = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+  const blockingPageMetadata =
+    stream && !options.partial && isHtmlLimitedBotRequest(options) ? pageHead : undefined
   const streamState: StreamState = {
     nextId: 0,
     deferred: [],
@@ -3652,6 +3397,7 @@ async function renderTreeInFrame(
     clientReferences,
     shellPending: Boolean(layoutRender.documentLayoutFile),
     inlineSuspense: stream && !options.partial && inlineSuspenseRoute(options),
+    shellGate: blockingPageMetadata?.then(oneTask, oneTask),
   }
   // A root layout that wraps its `<html>` in a Suspense must resolve that
   // boundary through in the partial (PPR) path too — never hole the shell.
@@ -3670,7 +3416,7 @@ async function renderTreeInFrame(
       ? options.partial
         ? await resolveServerTree(layoutRender.tree, resolveState)
         : stream
-          ? await settleRoot(resolveServerTreeForStream(layoutRender.tree, streamState))
+          ? await resolveServerTreeForStream(layoutRender.tree, streamState)
           : await resolveServerTree(layoutRender.tree, resolveState)
       : layoutRender.tree,
   )
@@ -3717,11 +3463,11 @@ async function renderTreeInFrame(
   if ((extra.status ?? 200) >= 500) {
     document.htmlProps = { ...document.htmlProps, 'data-pnext-ssr-error': '' }
   }
-  const slotMetadata = extra.preferSlotMetadata
+  const slotMetadata = slotHead
     ? await profileRenderStep(profile, 'slot metadata', () =>
-        resolveSelectedSlotMetadata(options, layoutRender.slotMatches, layoutRender.metadata),
+        slotHead.head(options.renderedSlots ?? new Set()),
       )
-    : { entries: [], runtime: false }
+    : { entries: [], viewport: [], runtime: false }
   const runtimeMetadata =
     layoutRender.runtimeMetadata || Boolean(extra.runtimePageMetadata) || slotMetadata.runtime
   const metadataMayStream = shouldRenderRuntimeMetadataInBody(options, runtimeMetadata)
@@ -3735,9 +3481,6 @@ async function renderTreeInFrame(
   // is body-streamed anyway, resolve it as a deferred stream chunk instead.
   // Only on an RSC navigation render: a hard document load keeps blocking, so a
   // metadata notFound()/redirect() still owns the whole document.
-  // Captured explicitly: the page body already populated the render's cache() scope, and a deferred
-  // generateMetadata must reuse it or its cache()-wrapped values drift from what the body rendered.
-  const runInCacheScope = captureCacheScope()
   // WHERE the tags land. Next renders metadata inside a Suspense in the body and React hoists
   // whatever resolved before the shell flushed into the head - so FAST metadata reads as a head
   // render and only metadata that misses the flush stays below it (conformance "metadata body
@@ -3745,29 +3488,22 @@ async function renderTreeInFrame(
   // A router payload has no head to hoist into, so it always rides the body.
   const navMetadataRender = routerPayload(options)
   const startedPageMetadata =
-    metadataMayStream && !navMetadataRender && typeof pageMetadata === 'function'
-      ? runInCacheScope(() => pageMetadata(mergeMetadataEntries(layoutRender.metadata)))
-      : undefined
+    blockingPageMetadata ?? (metadataMayStream && !navMetadataRender ? pageHead : undefined)
   const runtimeMetadataInBody =
     metadataMayStream &&
     (navMetadataRender ||
       layoutRender.metadataMissedFlush ||
       (startedPageMetadata ? !(await settlesBeforeFlush(startedPageMetadata)) : false))
   const pendingPageMetadata =
-    typeof pageMetadata === 'function' &&
-    deferrableNavigationMetadata(options, runtimeMetadataInBody, stream)
-      ? Promise.resolve().then(() =>
-          runInCacheScope(() => pageMetadata(mergeMetadataEntries(layoutRender.metadata))),
-        )
+    pageHead && deferrableNavigationMetadata(options, runtimeMetadataInBody, stream)
+      ? pageHead
       : undefined
   try {
     resolvedPageMetadata = pendingPageMetadata
       ? {}
-      : startedPageMetadata
-        ? await startedPageMetadata
-        : typeof pageMetadata === 'function'
-          ? await pageMetadata(mergeMetadataEntries(layoutRender.metadata))
-          : pageMetadata
+      : pageHead
+        ? await pageHead
+        : (pageMetadata as Metadata)
   } catch (error) {
     if (options.partial?.mode === 'build' && isPostpone(error)) {
       options.partial.metadataDynamic = true
@@ -3851,8 +3587,15 @@ async function renderTreeInFrame(
         options.route.file,
         options.url.pathname,
         file => importModule(file, options),
+        slotHead?.onSlotFileError,
       ),
     ))
+  // A head asset waiting on a hanging param is URL data: only a runtime request brings it, and
+  // the head resumes per request.
+  if (staticMetadata.hangingParams && options.partial?.mode === 'build') {
+    options.partial.runtimeData |= RUNTIME_URL
+    options.partial.metadataDynamic = true
+  }
   const composeMetadata = (pageMeta: Metadata) => {
     const merged = supersededSlotPage
       ? mergeMetadataEntries(layoutRender.metadata, slotMetadata.entries)
@@ -3926,9 +3669,13 @@ async function renderTreeInFrame(
       ),
     )
   }
-  const viewport = mergeViewport(...layoutRender.viewport, extra.viewport ?? {})
+  const viewport = mergeViewport(
+    ...layoutRender.viewport,
+    ...slotMetadata.viewport,
+    extra.viewport ?? {},
+  )
   if (options.partial?.mode === 'request' && options.partial.metadataDynamic) {
-    options.partial.chunks.push(
+    options.partial.onChunk(
       [
         metadataBodyHtml(bodyMetadataPage),
         // metadataBodyHtml carries no viewport and theme-color is head-only, so
@@ -3940,6 +3687,20 @@ async function renderTreeInFrame(
         .filter(Boolean)
         .join('\n    '),
     )
+  } else if (options.partial?.mode === 'request' && options.partial.shellHead !== undefined) {
+    const { shellHead } = options.partial
+    const fresh = [
+      `<meta name="viewport" content="${escapeHtml(viewportContent(viewport))}"/>`,
+      ...metadataBodyHtml(bodyMetadataPage).split('\n'),
+    ]
+      .map(tag => tag.trim())
+      .filter(tag => tag && !shellHead.includes(tag))
+    if (fresh.length) {
+      const nonce = documentNonce(options.request)
+      options.partial.onChunk(
+        `<template>${fresh.join('')}</template><script${nonce ? ` nonce="${escapeHtml(nonce)}"` : ''}>${HEAD_PATCH_SCRIPT}</script>`,
+      )
+    }
   }
   const fonts = await profileRenderStep(profile, 'font assets', () =>
     getFontExtensions().collectFontAssets(options.config, { dev: options.dev }),
@@ -3951,10 +3712,12 @@ async function renderTreeInFrame(
   // Dynamic-import chunks ship as Next does: `preload as=script` at low
   // fetchpriority, emitted after the render-blocking stylesheet so they stay
   // off the critical path.
+  // The framework runtime chunks load on demand; only a route with links preloads them.
+  const runtimeImports = new Set(options.route.softLinks ? [] : options.route.clientRuntimeImports)
   const dynamicModulePreloads = profileRenderSyncStep(profile, 'dynamic preloads', () =>
-    (options.route.clientDynamicImports ?? []).map(asset =>
-      withAssetPrefix(options.config, clientAssetPath(options.config, asset)),
-    ),
+    (options.route.clientDynamicImports ?? [])
+      .filter(asset => !runtimeImports.has(asset))
+      .map(asset => withAssetPrefix(options.config, clientAssetPath(options.config, asset))),
   )
   const deferredScripts = profileRenderSyncStep(profile, 'deferred scripts', () =>
     renderDeferredScriptRuntime(takeDeferredScripts()),
@@ -4038,7 +3801,7 @@ async function renderTreeInFrame(
     .join('\n')
   const compatBuildManifestScript =
     nextCompatEnabled(options.config) && !options.dev
-      ? `<script src="${escapeHtml(withAssetPrefix(options.config, '/_next/static/pnext/_buildManifest.js'))}"></script>`
+      ? `<script async src="${escapeHtml(withAssetPrefix(options.config, '/_next/static/pnext/_buildManifest.js'))}"></script>`
       : ''
   // Inlined CSS is a stylesheet, not a script: it belongs at the stylesheet slot so the cascade
   // (and the emitted order) matches the linked path.
@@ -4063,13 +3826,8 @@ async function renderTreeInFrame(
   const routeScriptStart = profileRenderMark(profile)
   // Param routes always embed the route state, even with no client entry: the optimistic-routing
   // trie learns a route pattern + prefetch kind from a served shell's `__PNEXT_ROUTE__`, and a
-  // fully server-rendered `[param]` page would otherwise never teach it. A DOM bot hitting a PPR
-  // route also bypasses static-shell-only serving and receives the fully resolved dynamic stream,
-  // so a JS-executing crawler observes the streamed dynamic values.
-  const domBotScript =
-    (options.route.ppr || cacheComponents()) && isDomBotRequest(options)
-      ? domBotFlightScript(resolved)
-      : ''
+  // fully server-rendered `[param]` page would otherwise never teach it.
+  const domBotScript = domBotFlight(options) ? domBotFlightScript(resolved) : ''
   const pageVary = bakedShellPageVary(options)
   const routeScript =
     navStateScript +
@@ -4173,6 +3931,12 @@ function deferrableNavigationMetadata(
   return !getRouterProtocolExtensions().shellOnlyRequest(request, options.route)
 }
 
+/** A promise started ahead of its reader: its rejection surfaces where it is awaited, never unhandled. */
+function started<T>(promise: Promise<T>): Promise<T> {
+  promise.catch(() => undefined)
+  return promise
+}
+
 /**
  * True when `promise` settles without waiting on I/O - a streaming server would still be building
  * the shell, so React would hoist the resolved tags into the head. A timer/network await loses the
@@ -4238,12 +4002,20 @@ function navigationStateScript(options: RenderOptions, slots: Record<string, str
   // A `generateStaticParams` route is dynamic-MODE yet the document served for a PRERENDERED param
   // set is a complete static artifact - classify it as static too, or its hard load seeds the
   // dynamic window and every later navigation refetches it.
-  const isStatic = options.route.mode === 'static' || rendersPrerenderedParams(options)
+  // Under PPR/cacheComponents a params-only route's document is a pure function of its URL.
+  const isStatic =
+    options.route.mode === 'static' ||
+    rendersPrerenderedParams(options) ||
+    ((options.route.ppr === true || cacheComponents()) &&
+      options.route.hasStaticParams === true &&
+      options.route.usesRequest !== true)
   // `route.cacheLife` is captured FROM a render and persisted onto the manifest only afterwards, so
   // it is empty during the build prerender that produces this very document. Prefer the manifest
   // value (serve-time renders), fall back to the live render scope (build prerenders).
   const staleTime =
-    options.route.cacheLife?.staleSeconds ?? getRenderExtensions().currentCacheStaleSeconds()
+    options.route.cacheLife?.staleSeconds ??
+    getRenderExtensions().currentCacheStaleSeconds() ??
+    (options.staticStage ? shellStaleSeconds(options.route) : undefined)
   const state: NavState = {
     children,
     ...(childrenSearch ? { childrenSearch } : {}),
@@ -4254,12 +4026,15 @@ function navigationStateScript(options: RenderOptions, slots: Record<string, str
     // request), but the bytes above the holes ARE a prerender. Published
     // separately from `isStatic` so the client can file the hard load's static
     // STAGE as reusable without widening the whole document's reuse window.
-    ...(bakedShellPageVary(options) ? { staticStage: true } : {}),
+    ...(options.staticStage ? { staticStage: true } : {}),
     ...(typeof staleTime === 'number' ? { staleTime } : {}),
     // Mark interception host renders so the client keeps them host-bound (never
     // reused for a navigation from another host, nor as the direct target).
     ...(hostRender ? { hostRender: true } : {}),
   }
+  const routes = hostRender ? getRequestRuntime()?.routes : undefined
+  const intercepted = routes && matchInterception(routes, options.url.pathname, children)
+  if (intercepted) state.interceptedRoute = intercepted.route.route
   const json = JSON.stringify(state).replace(/</g, '\\u003c')
   return `<script id="__PNEXT_NAV_STATE__" type="application/json">${json}</script>`
 }
@@ -4275,15 +4050,20 @@ function trimPathname(pathname: string) {
  */
 function rendersPrerenderedParams(options: RenderOptions): boolean {
   if (options.partial || options.fallbackParams || options.fallbackConcreteParams) return false
-  const sets = options.route.prerenderedParams
-  if (!sets?.length) return false
-  const paramKeys = [
-    ...options.route.params,
-    ...(options.route.catchAll ? [options.route.catchAll] : []),
-  ]
-  const rendered = options.params ?? {}
-  return sets.some(
-    set => paramKeys.length > 0 && paramKeys.every(key => sameParamValue(set[key], rendered[key])),
+  return paramsPrerendered(options.route, options.params ?? {})
+}
+
+/** Whether `params` is one of the route's build-prerendered param sets (every key in `paramKeys` matches). */
+export function paramsPrerendered(
+  route: RouteManifestEntry,
+  params: Record<string, RouteParamValue | undefined>,
+  paramKeys: string[] = routeParamKeys(route),
+): boolean {
+  if (paramKeys.length === 0) return false
+  return (
+    route.prerenderedParams?.some(set =>
+      paramKeys.every(key => sameParamValue(set[key], params[key])),
+    ) ?? false
   )
 }
 
@@ -4292,7 +4072,9 @@ function sameParamValue(
   expected: RouteParamValue | undefined,
   actual: RouteParamValue | undefined,
 ) {
-  if (expected === undefined || actual === undefined) return false
+  if (expected === undefined) return false
+  // An empty optional catch-all is absent from the matched params.
+  if (actual === undefined) return Array.isArray(expected) && expected.length === 0
   const normalize = (value: RouteParamValue) => {
     const text = Array.isArray(value) ? value.join('/') : String(value)
     try {
@@ -4482,17 +4264,17 @@ async function renderNotFoundPage(
     skipNoindex?: boolean
   } = {},
 ) {
-  const status = extra.status ?? 404
+  // A slot's error lands after the shell commits.
+  const status = extra.status ?? (slotErrorAfterCommit(options) ? 200 : 404)
   // Server-action 404s carry no fallback robots (Next's NonIndex skip).
   const fallbackRobots = extra.skipNoindex ? {} : { robots: 'noindex' }
   // forceDefault: globalNotFound is enabled but no global-not-found.* exists —
   // skip the app's not-found.* boundary and render the built-in default 404.
-  const file = extra.forceDefault ? undefined : nearestConventionFile(options, 'not-found.tsx')
+  const file = extra.forceDefault ? undefined : nearestAccessBoundary(options, 'not-found.tsx')
   const notFoundOptions = optionsForNotFoundBoundary(options, file)
   if (!file) {
     const page = await renderTreeOrFallback(
-      notFoundOptions,
-      defaultNotFoundTree(),
+      ...placeBoundary(notFoundOptions, file, defaultNotFoundTree()),
       stream,
       { title: '404: This page could not be found.', ...fallbackRobots },
       { status },
@@ -4519,8 +4301,7 @@ async function renderNotFoundPage(
   }
   if (!NotFound) {
     const page = await renderTreeOrFallback(
-      notFoundOptions,
-      defaultNotFoundTree(),
+      ...placeBoundary(notFoundOptions, file, defaultNotFoundTree()),
       stream,
       { title: '404: This page could not be found.', ...fallbackRobots },
       { status },
@@ -4555,8 +4336,11 @@ async function renderNotFoundPage(
       ? await metaExt.readModuleViewport(moduleRecord, metaProps)
       : await readModuleViewport(module)
   const page = await renderTreeOrFallback(
-    notFoundOptions,
-    h('div', pageRootProps, h(NotFound as unknown as ComponentType<Record<string, never>>, {})),
+    ...placeBoundary(
+      notFoundOptions,
+      file,
+      h('div', pageRootProps, h(NotFound as unknown as ComponentType<Record<string, never>>, {})),
+    ),
     stream,
     // On the skip path a baked `<title>Not found</title>` would precede the
     // streamed metadata chunk in document order and win `document.title`.
@@ -4601,11 +4385,16 @@ function optionsForNotFoundBoundary(
 }
 
 function withNextFlightText(page: PageRender) {
-  const payload = JSON.stringify(page.body).replace(/</g, '\\u003c')
-  return {
-    ...page,
-    routeScript: `${page.routeScript}<script>self.__next_f=self.__next_f||[]</script><script>self.__next_f.push([1,${payload}])</script>`,
+  const flight = (body: string) =>
+    `<script>self.__next_f=self.__next_f||[]</script><script>self.__next_f.push([1,${JSON.stringify(body).replace(/</g, '\\u003c')}])</script>`
+  if (page.streamChunks.length === 0) {
+    return { ...page, routeScript: `${page.routeScript}${flight(page.body)}` }
   }
+  // A boundary under a loading fallback streams in after the shell: its flight text follows it.
+  page.streamChunks.push(
+    Promise.all([...page.streamChunks]).then(chunks => flight(chunks.join(''))),
+  )
+  return page
 }
 
 async function renderErrorPage(options: RenderOptions, error: unknown, stream: boolean) {
@@ -4615,40 +4404,13 @@ async function renderErrorPage(options: RenderOptions, error: unknown, stream: b
   if (!file) return renderGenericErrorPage(options, resolvedError, stream)
 
   try {
-    const clientDirective = await conventionUsesClient(file)
-    const module = (
-      clientDirective ? await importClientModule(file, options) : await importModule(file, options)
-    ) as ErrorModule
-    interface ErrorComponentProps {
-      error: Error
-      reset?: () => void
-      unstable_retry?: () => void
-    }
-    const ErrorPage = module.default
-    if (!ErrorPage) return renderGenericErrorPage(options, resolvedError, stream)
-    const ErrorComponent = clientDirective
-      ? errorClientComponent(options, file, ErrorPage as ComponentType<ErrorComponentProps>)
-      : (markServerReference(ErrorPage) as unknown as ComponentType<ErrorComponentProps>)
-    const errorProps = serializableError(
-      resolvedError,
-      Boolean(options.dev),
-      nextCompatEnabled(options.config),
-    )
-    const reset = errorResetCallback()
+    const boundary = await errorBoundaryElement(options, file, resolvedError)
+    if (!boundary) return renderGenericErrorPage(options, resolvedError, stream)
     // Awaited inside the try on purpose: a bare `return` hands the rejection to
     // the caller, and an error boundary that fails to render answered with a
     // bodiless 500 instead of the generic error document.
     return await renderTree(
-      options,
-      h(
-        'div',
-        pageRootProps,
-        h(ErrorComponent, {
-          error: errorProps,
-          reset,
-          unstable_retry: reset,
-        }),
-      ),
+      ...placeBoundary(options, file, h('div', pageRootProps, boundary)),
       stream,
       { title: 'Error' },
       { status: 500 },
@@ -4656,6 +4418,30 @@ async function renderErrorPage(options: RenderOptions, error: unknown, stream: b
   } catch {
     return renderGenericErrorPage(options, resolvedError, stream)
   }
+}
+
+/** The error.* boundary component rendered for `error`, or undefined when the file exports none. */
+async function errorBoundaryElement(options: RenderOptions, file: string, error: Error) {
+  const clientDirective = await conventionUsesClient(file)
+  const module = (
+    clientDirective ? await importClientModule(file, options) : await importModule(file, options)
+  ) as ErrorModule
+  interface ErrorComponentProps {
+    error: Error
+    reset?: () => void
+    unstable_retry?: () => void
+  }
+  const ErrorPage = module.default
+  if (!ErrorPage) return undefined
+  const ErrorComponent = clientDirective
+    ? errorClientComponent(options, file, ErrorPage as ComponentType<ErrorComponentProps>)
+    : (markServerReference(ErrorPage) as unknown as ComponentType<ErrorComponentProps>)
+  const reset = errorResetCallback()
+  return h(ErrorComponent, {
+    error: serializableError(error, Boolean(options.dev), nextCompatEnabled(options.config)),
+    reset,
+    unstable_retry: reset,
+  })
 }
 
 function errorResetCallback() {
@@ -4890,8 +4676,49 @@ async function conventionUsesClient(file: string) {
   return served ? served.client.has(file) : hasUseClientDirective(await readText(file))
 }
 
+// A named-slot-only route's own render error lands after its shell commits; an outlet's reaching here
+// came from a blocking document and keeps the normal status.
+function slotErrorAfterCommit(options: RenderOptions) {
+  return Boolean(options.route.namedSlotsOnly && !options.boundarySlot)
+}
+
+// The slot an error escaped from: one whose outlet threw it, or a named-slot-only route's own.
+function errorSlot(options: RenderOptions): ErrorSlot | undefined {
+  if (options.boundarySlot) return options.boundarySlot
+  const dir = options.route.namedSlotsOnly ? options.route.syntheticSlotDir : undefined
+  return dir ? { dir, file: options.route.file } : undefined
+}
+
+// A not-found/forbidden/unauthorized boundary wraps only its layout's children branch, so an error from
+// a slot reaches the nearest one inside the slot or above the slot's owner layout.
+function nearestAccessBoundary(options: RenderOptions, name: string) {
+  const slot = errorSlot(options)
+  if (!slot) return nearestConventionFile(options, name)
+  const owner = `${dirname(slot.dir)}${sep}`
+  return [...findConventionFiles(options.config.appPath, slot.file, name)].reverse().find(file => {
+    const dir = `${dirname(file)}${sep}`
+    return (
+      (dir.startsWith(`${slot.dir}${sep}`) || !dir.startsWith(owner)) && conventionFileExists(file)
+    )
+  })
+}
+
+// The slot's layout has no children to replace: a boundary at or below the owner renders in the slot.
+function placeBoundary(
+  options: RenderOptions,
+  file: string | undefined,
+  tree: ComponentChildren,
+): [RenderOptions, ComponentChildren] {
+  const slot = errorSlot(options)
+  if (!slot || (file && !`${dirname(file)}${sep}`.startsWith(`${dirname(slot.dir)}${sep}`))) {
+    return [options, tree]
+  }
+  return [{ ...options, slotFallback: { dir: slot.dir, tree } }, h('div', pageRootProps)]
+}
+
 function nearestConventionFile(options: RenderOptions, name: string) {
-  return [...findConventionFiles(options.config.appPath, options.route.file, name)]
+  const from = options.boundarySlot?.file ?? options.route.file
+  return [...findConventionFiles(options.config.appPath, from, name)]
     .reverse()
     .find(conventionFileExists)
 }
@@ -4985,6 +4812,23 @@ function preloadClientReferences(options: RenderOptions, profile: RenderProfile 
 
 function mergeClientComponents(target: ClientComponentMap, source: ClientComponentMap) {
   for (const [id, component] of source) target.set(id, component)
+}
+
+/**
+ * Import a page route's layouts, page and SSR client references without rendering, so a fresh server
+ * instance's first request skips that import pass. Failures stay quiet: that request re-imports and
+ * reports them.
+ */
+export async function warmPageModules(config: ResolvedConfig, route: RouteManifestEntry) {
+  await registerServerRuntime(config, route.sourceFiles)
+  const options: ModuleLoadOptions = { config, route }
+  const files = [...findLayouts(config.appPath, route.file), route.file].filter(existsSync)
+  await Promise.allSettled([
+    ...route.clientReferences
+      .filter(ssrClientReference)
+      .map(reference => importClientModule(reference.file, options)),
+    ...files.map(file => importModule(file, options)),
+  ])
 }
 
 function markableClientReferences(options: RenderOptions) {
@@ -5207,6 +5051,7 @@ function FallbackStaticChildren(props: {
   children?: ComponentChildren
 }) {
   if (props.adoption.rendered) return null
+  markInertBoundaries(props.children)
   return h('template', { [ISLAND_STATIC_CHILDREN_ATTRIBUTE]: props.id }, props.children)
 }
 
@@ -5238,7 +5083,8 @@ class IslandBoundary extends Component<IslandBoundaryProps, { failed: boolean; e
 
   render(props: IslandBoundaryProps, state: { failed: boolean; error: unknown }) {
     if (state.failed) {
-      if (isPostpone(state.error) && props.csrFallback !== undefined) {
+      // Outside a prerender a postpone has no hole to record: the island renders client-only.
+      if (isPostpone(state.error) && (props.csrFallback !== undefined || !isPrerendering())) {
         return h(
           'pnext-client',
           { ...props.islandProps, 'data-pnext-ssr-failed': '' },
@@ -5416,18 +5262,34 @@ function withIslandBoundaryError(
   return { ...node, props: { ...node.props, [ISLAND_BOUNDARY_ERROR_PROP]: marker } }
 }
 
-async function resolveServerTree(node: unknown, state: ResolveState): Promise<ComponentChildren> {
-  if (node == null || typeof node !== 'object') return node as ComponentChildren
-  if (Array.isArray(node)) return Promise.all(node.map(child => resolveServerTree(child, state)))
-  if (!isVNode(node)) return node as ComponentChildren
+async function resolveServerTree(input: unknown, state: ResolveState): Promise<ComponentChildren> {
+  if (input == null || typeof input !== 'object') return input as ComponentChildren
+  if (Array.isArray(input)) return Promise.all(input.map(child => resolveServerTree(child, state)))
+  if (!isVNode(input)) return input as ComponentChildren
+  // An element argument of a `'use cache'` call renders outside the fill upstream.
+  if (cacheArgumentVNodes.has(input) && insideCachedSubtree()) {
+    return runInCachedSubtree(false, () => resolveServerTree(input, state)).catch(
+      (error: unknown) => {
+        if (isPostpone(error)) cacheArgumentPostpones.add(error)
+        throw error
+      },
+    )
+  }
+  let node = input
 
   if (isSuspenseVNode(node)) {
     if (state.partial) return resolvePartialSuspense(node, state, state.partial)
+    const scope = prerenderOutcomeScope.getStore()
     if (isCsrBailoutPrerender()) {
       const fallback = await resolveServerTree(node.props.fallback, state)
-      return resolveServerTree(node.props.children, { ...state, csrBailoutFallback: fallback })
+      const children = resolveServerTree(node.props.children, {
+        ...state,
+        csrBailoutFallback: fallback,
+      })
+      return scope ? catchPrerenderSuspense(scope, node, state, children, fallback) : children
     }
-    return resolveServerTree(node.props.children, state)
+    const children = resolveServerTree(node.props.children, state)
+    return scope ? catchPrerenderSuspense(scope, node, state, children) : children
   }
 
   if (typeof node.type !== 'function') {
@@ -5451,6 +5313,7 @@ async function resolveServerTree(node: unknown, state: ResolveState): Promise<Co
       resolveServerTree(node.props.children, state),
     )
   }
+  node = enterSlotMarker(node, state.options.renderedSlots, state.options.slotOutlets)
   // A parallel-route slot marker (render/slots.ts): arm the build task boundary
   // while resolving the slot subtree, so a slot that resolves in a task becomes
   // a hole (Next parity) without affecting any other <Suspense>.
@@ -5537,17 +5400,32 @@ async function resolveServerTree(node: unknown, state: ResolveState): Promise<Co
   // subtree, but ONLY under a task-boundary prerender: everywhere else this scope is inert, and
   // gating keeps the resolve path byte-identical off the shell render.
   if (isTaskBoundaryPrerender() && isCachedComponent(serverComponent)) {
+    const subtreeRoot = !insideCachedSubtree()
     return runWithTaskBoundarySuspended(() =>
-      resolveCachedServerComponent(node, serverComponent, state),
+      runInCachedSubtree(true, () =>
+        resolveCachedServerComponent(node, serverComponent, state, subtreeRoot),
+      ),
     )
   }
   return resolveCachedServerComponent(node, serverComponent, state)
+}
+
+const cacheArgumentPostpones = new WeakSet<PostponeError>()
+
+/** A fallback param read fails the whole `'use cache'` fill upstream, so it holes the boundary above it. */
+function escapesCachedSubtree(error: PostponeError): boolean {
+  return (
+    (error.runtime & RUNTIME_PARAMS) !== 0 &&
+    insideCachedSubtree() &&
+    !cacheArgumentPostpones.has(error)
+  )
 }
 
 async function resolveCachedServerComponent(
   node: ServerVNode,
   serverComponent: ServerComponent<ServerVNodeProps>,
   state: ResolveState,
+  cachedSubtreeRoot = false,
 ): Promise<ComponentChildren> {
   // Static-skeleton pass: a postponing component contributes nothing, but the
   // static markup around it still renders.
@@ -5558,7 +5436,7 @@ async function resolveCachedServerComponent(
         state,
       )
     } catch (error) {
-      if (isPostpone(error)) {
+      if (isPostpone(error) && (cachedSubtreeRoot || !escapesCachedSubtree(error))) {
         if (state.swallowedPostpones) state.swallowedPostpones.count++
         return null
       }
@@ -5578,6 +5456,95 @@ async function resolveCachedServerComponent(
   }
 }
 
+/** A control-flow outcome a prerender's Suspense boundary caught; see renderPageWithStatus. */
+interface PrerenderOutcome {
+  status: number
+  location?: string
+}
+
+interface PrerenderOutcomeScope {
+  outcomes: PrerenderOutcome[]
+  compat: boolean
+  nextId: number
+}
+
+const prerenderOutcomeScope = new AsyncLocalStorage<PrerenderOutcomeScope>()
+
+function prerenderOutcome(error: unknown, compat: boolean): PrerenderOutcome | undefined {
+  if (isRedirectError(error)) return { status: error.status, location: error.location }
+  if (isNotFoundError(error)) return { status: 404 }
+  if (!compat) return undefined
+  if (isForbiddenError(error)) return { status: 403 }
+  if (isUnauthorizedError(error)) return { status: 401 }
+  return undefined
+}
+
+// A prerender keeps its shell when a boundary catches control flow: record the outcome, show the
+// fallback, and for notFound swap in the not-found UI once the document loads.
+async function catchPrerenderSuspense(
+  scope: PrerenderOutcomeScope,
+  node: ServerVNode,
+  state: ResolveState,
+  children: Promise<ComponentChildren>,
+  resolvedFallback?: ComponentChildren,
+): Promise<ComponentChildren> {
+  try {
+    return await children
+  } catch (error) {
+    const outcome = prerenderOutcome(error, scope.compat)
+    if (!outcome) throw error
+    scope.outcomes.push(outcome)
+    const id = `prerender-${scope.nextId++}`
+    const fallback = resolvedFallback ?? (await resolveServerTree(node.props.fallback, state))
+    if (!isNotFoundError(error)) return fallback
+    const replacement = renderSuspenseReplacement(
+      id,
+      await renderStreamNotFoundBoundary(state),
+      state.options,
+      documentNonce(state.options.request),
+    )
+    return h(
+      Fragment,
+      null,
+      h('pnext-suspense', { 'data-pnext-suspense': id }, fallback),
+      h('div', {
+        style: { display: 'contents' },
+        dangerouslySetInnerHTML: { __html: replacement },
+      }),
+    )
+  }
+}
+
+// The island-side twin of catchPrerenderSuspense: wraps a client Suspense's children during a
+// prerender. Suspensions are re-thrown to the Suspense; caught control flow renders the fallback.
+class PrerenderSuspenseCatch extends Component<
+  { fallback?: ComponentChildren; children?: ComponentChildren },
+  { caught?: boolean }
+> {
+  static getDerivedStateFromError(error: unknown) {
+    return isPromise(error) ? null : { caught: true }
+  }
+
+  componentDidCatch(error: unknown) {
+    const scope = prerenderOutcomeScope.getStore()
+    const outcome = scope && !isPromise(error) && prerenderOutcome(error, scope.compat)
+    if (!outcome) throw error
+    scope.outcomes.push(outcome)
+  }
+
+  render(props: { fallback?: ComponentChildren; children?: ComponentChildren }) {
+    return this.state.caught ? props.fallback : props.children
+  }
+}
+
+function applyPrerenderSuspenseCatch(vnode: VNode): void {
+  if (!prerenderOutcomeScope.getStore()) return
+  if (typeof vnode.type !== 'function' || !isSuspenseVNode(vnode)) return
+  const props = vnode.props as { fallback?: ComponentChildren; children?: ComponentChildren }
+  if ((props.children as VNode | undefined)?.type === PrerenderSuspenseCatch) return
+  props.children = h(PrerenderSuspenseCatch, { fallback: props.fallback }, props.children)
+}
+
 /** Navigation control flow (redirect/notFound/forbidden/unauthorized) — never a failure. */
 function isRenderControlFlowError(error: unknown): boolean {
   return (
@@ -5586,6 +5553,101 @@ function isRenderControlFlowError(error: unknown): boolean {
     isForbiddenError(error) ||
     isUnauthorizedError(error)
   )
+}
+
+// The runtime-resolvable part of a hole, nested boundaries still pending showing their fallbacks.
+async function streamRuntimeSkeleton(
+  node: ServerVNode,
+  state: ResolveState,
+  partial: Extract<PartialState, { mode: 'request' }>,
+  id: number,
+  opaque: ResolveState,
+): Promise<void> {
+  const nested: PartialState = {
+    mode: 'build',
+    nextId: 0,
+    holes: [],
+    metadataDynamic: false,
+    runtimeData: 0,
+  }
+  const html = await resolveServerTree(node.props.children, { ...opaque, partial: nested })
+    .then(resolved => renderVNodeToString(h(Fragment, null, resolved), opaque))
+    .catch(() => null)
+  if (html === null || nested.holes.length === 0) return
+  partial.stage?.skeletons.push(
+    renderSuspenseReplacement(
+      String(id),
+      html.replaceAll('data-pnext-suspense="', `data-pnext-suspense="${id}-`),
+      state.options,
+      documentNonce(state.options.request),
+    ),
+  )
+}
+
+// A postponed boundary's request-time fill, streamed as its replacement chunk.
+async function resolveRequestHole(
+  node: ServerVNode,
+  state: ResolveState,
+  partial: Extract<PartialState, { mode: 'request' }>,
+  id: number,
+  opaque: ResolveState,
+): Promise<null> {
+  // Slot-granular resume: the served shell already carries this boundary's build-time bytes for
+  // every slot the build proved final. Re-rendering those here would ship a SECOND copy rendered
+  // at request time, so a build-time sentinel inside one would read "at runtime". Render only the
+  // dynamic slots, delimited so promotion can weave both halves back into slot order. Any
+  // mismatch in slot count falls back to the whole-boundary re-render below.
+  const slotInfo = partial.staticSlots?.get(id)
+  const slots = slotInfo ? toChildArray(node.props.children) : []
+  if (slotInfo?.count === slots.length && slotInfo.slots.size < slots.length) {
+    const parts: string[] = []
+    const dynamic: number[] = []
+    for (let index = 0; index < slots.length; index++) {
+      if (slotInfo.slots.has(index)) continue
+      const slotResolved = await resolveServerTree(slots[index], opaque)
+      const slotHtml = await renderVNodeToString(h(Fragment, null, slotResolved), opaque)
+      parts.push(`<!--${SLOT_MARKER}${index}-->${slotHtml}<!--/${SLOT_MARKER}${index}-->`)
+      dynamic.push(index)
+    }
+    partial.onChunk(
+      renderSuspenseReplacement(
+        String(id),
+        parts.join(''),
+        state.options,
+        documentNonce(state.options.request),
+        dynamic,
+      ),
+    )
+    return null
+  }
+  // The runtime stage fills a hole whole or not at all; the resume streams nested boundaries.
+  const stream: StreamState | undefined = partial.stage
+    ? undefined
+    : {
+        nextId: 0,
+        idPrefix: `${id}-`,
+        deferred: [],
+        dev: Boolean(state.options.dev),
+        options: state.options,
+        clientComponents: state.clientComponents,
+        clientReferences: state.clientReferences,
+      }
+  const resolved = await Promise.resolve(
+    stream
+      ? resolveServerTreeForStream(node.props.children, stream)
+      : resolveServerTree(node.props.children, opaque),
+  )
+  const html = await renderVNodeToString(h(Fragment, null, resolved), stream ?? opaque)
+  partial.onChunk(
+    renderSuspenseReplacement(
+      String(id),
+      html,
+      state.options,
+      documentNonce(state.options.request),
+    ) + (domBotFlight(state.options) ? domBotFlightScript(resolved) : ''),
+  )
+  for await (const [chunk] of completed(stream?.deferred ?? [])) partial.onChunk(chunk)
+  return null
 }
 
 // Partial-prerender handling for a <Suspense> boundary. Every boundary consumes
@@ -5603,12 +5665,7 @@ async function resolvePartialSuspense(
   // request numbering aligned. Mirrors the streaming path's shellPending branch.
   if (partial.shellPending) {
     const resolved = await resolveServerTree(node.props.children, state)
-    if (!partial.shellPending || documentHtmlVNode(resolved)) {
-      partial.shellPending = false
-      return resolved
-    }
-    // A pre-shell Suspense that does not wrap `<html>` (not expected in a valid
-    // root layout): degrade to a blocking resolve so the shell is never lost.
+    if (documentHtmlVNode(resolved)) partial.shellPending = false
     return resolved
   }
 
@@ -5622,45 +5679,15 @@ async function resolvePartialSuspense(
       await resolveServerTree(node.props.children, state)
       return null
     }
-    // Slot-granular resume: the served shell already carries this boundary's build-time bytes for
-    // every slot the build proved final. Re-rendering those here would ship a SECOND copy rendered
-    // at request time, so a build-time sentinel inside one would read "at runtime". Render only the
-    // dynamic slots, delimited so promotion can weave both halves back into slot order. Any
-    // mismatch in slot count falls back to the whole-boundary re-render below.
-    const slotInfo = partial.staticSlots?.get(id)
-    const slots = slotInfo ? toChildArray(node.props.children) : []
-    if (slotInfo?.count === slots.length && slotInfo.slots.size < slots.length) {
-      const parts: string[] = []
-      const dynamic: number[] = []
-      for (let index = 0; index < slots.length; index++) {
-        if (slotInfo.slots.has(index)) continue
-        const slotResolved = await resolveServerTree(slots[index], opaque)
-        const slotHtml = await renderVNodeToString(h(Fragment, null, slotResolved), opaque)
-        parts.push(`<!--${SLOT_MARKER}${index}-->${slotHtml}<!--/${SLOT_MARKER}${index}-->`)
-        dynamic.push(index)
-      }
-      partial.chunks.push(
-        renderSuspenseReplacement(
-          String(id),
-          parts.join(''),
-          state.options,
-          documentNonce(state.options.request),
-          dynamic,
-        ),
+    if (partial.stage) {
+      // A hole the runtime stage cannot finish is left to the resume, its runtime part streamed now.
+      await resolveRequestHole(node, state, partial, id, opaque).then(
+        () => partial.stage!.filled.add(id),
+        () => streamRuntimeSkeleton(node, state, partial, id, opaque),
       )
       return null
     }
-    const resolved = await resolveServerTree(node.props.children, opaque)
-    const html = await renderVNodeToString(h(Fragment, null, resolved), opaque)
-    partial.chunks.push(
-      renderSuspenseReplacement(
-        String(id),
-        html,
-        state.options,
-        documentNonce(state.options.request),
-      ),
-    )
-    return null
+    return resolveRequestHole(node, state, partial, id, opaque)
   }
 
   // Restore points for a task-boundary retry (see the catch): re-resolving the
@@ -5684,6 +5711,7 @@ async function resolvePartialSuspense(
     )
     if (tracked.dynamic) {
       if (!partial.clientOnly) partial.holes.push(id)
+      if (partial.mode === 'build') partial.runtimeData |= tracked.runtime
       const fallback = await resolveServerTree(node.props.fallback, opaque)
       return h(
         'pnext-suspense',
@@ -5708,6 +5736,7 @@ async function resolvePartialSuspense(
       )
     }
     if (!isPostpone(error)) throw error
+    if (escapesCachedSubtree(error)) throw error
     // The static skeleton re-resolves this boundary's children. A slot marker
     // inside re-arms the task boundary, so a slot that resolves entirely in a
     // task yields an EMPTY skeleton (its task work postpones and is swallowed to
@@ -5726,6 +5755,7 @@ async function resolvePartialSuspense(
       return runWithTaskBoundarySuspended(() => resolveServerTree(node.props.children, state))
     }
     if (!partial.clientOnly) partial.holes.push(id)
+    if (partial.mode === 'build') partial.runtimeData |= postponeRuntime(error)
     const fallback = await resolveServerTree(node.props.fallback, opaque)
     // Next's flight shell carries the boundary's STATIC wrapper markup even
     // though the UI shows the fallback (React postpones at the dynamic access,
@@ -5832,7 +5862,7 @@ const SLOT_MARKER = '$ps:'
  * confuse it; anything that fails to parse simply leaves the hole out of the map
  * and the resume re-renders that boundary whole, as before.
  */
-function parseStaticSlots(shell: string): Map<number, StaticSlotInfo> | undefined {
+export function parseStaticSlots(shell: string): Map<number, StaticSlotInfo> | undefined {
   const pattern =
     /<template data-pnext-static="(\d+)" data-pnext-slots="([\d,]+)" data-pnext-slot-count="(\d+)"/g
   let map: Map<number, StaticSlotInfo> | undefined
@@ -5961,6 +5991,12 @@ async function streamBoundaryErrorVNode(
   )
 }
 
+// Chunks whose marker sits only in an inert <template> never promote, so pageStream drops them.
+const inertChunks = new WeakSet<Promise<string>>()
+const markerChunks = new WeakMap<object, Promise<string>>()
+const boundaryChunkIds = new WeakMap<Promise<string>, string>()
+const SUSPENSE_MARKER_ID = /data-pnext-suspense="([^"]+)"/g
+
 // Emit a streaming Suspense boundary: flush its fallback wrapped in a
 // `<pnext-suspense>` marker now, and defer the resolved content as a
 // replacement chunk. `children` is the (possibly already-resolved) content.
@@ -5969,68 +6005,72 @@ function deferSuspenseBoundary(
   children: ComponentChildren | Promise<ComponentChildren>,
   state: StreamState,
 ): ComponentChildren | Promise<ComponentChildren> {
-  const id = String(state.nextId++)
+  const id = `${state.idPrefix ?? ''}${state.nextId++}`
   const nonce = documentNonce(state.options.request)
-  state.deferred.push(
-    Promise.resolve(children)
-      .then(async resolved =>
-        renderSuspenseReplacement(
-          id,
-          await renderVNodeToString(h(Fragment, null, resolved), state),
-          state.options,
-          nonce,
-        ),
-      )
-      .catch(async error => {
-        // notFound()/redirect() thrown deep inside a streamed Suspense boundary are navigation
-        // intents, not render errors: the shell (200 status, <head> already flushed) cannot change
-        // either at this point, so the outcome is patched into THIS boundary's replacement chunk -
-        // the nearest not-found UI plus a noindex meta, or the redirect meta-refresh and
-        // location.replace script. Both ride the chunk's own markup rather than the sent head.
-        if (isNotFoundError(error)) {
-          return renderSuspenseReplacement(
-            id,
-            await renderStreamNotFoundBoundary(state),
-            state.options,
-            nonce,
-          )
-        }
-        if (isRedirectError(error)) {
-          return renderSuspenseReplacement(
-            id,
-            metadataRedirectHtml(error.location, error.status),
-            state.options,
-            nonce,
-          )
-        }
-        reportStreamBoundaryError(error)
-        // The shell (200 status) has already flushed, so a real error inside this boundary cannot
-        // change the response status. But unlike a Suspense-caught promise it is an uncaught render
-        // error (Suspense never catches thrown errors, only suspensions), so it must still reach
-        // the server log with a digest and fire the onRequestError funnel exactly once. Control-flow
-        // signals are skipped. The streaming analogue of pageRender's render catch.
-        reportStreamRenderError(error, state)
+  const chunk = Promise.resolve(children)
+    .then(async resolved =>
+      renderSuspenseReplacement(
+        id,
+        await renderVNodeToString(h(Fragment, null, resolved), state),
+        state.options,
+        nonce,
+      ),
+    )
+    .catch(async error => {
+      // The shell's status and head are sent: notFound()/redirect() patch this boundary's chunk.
+      if (isNotFoundError(error)) {
         return renderSuspenseReplacement(
           id,
-          renderToString(
-            hStreamError(
-              error,
-              state.dev,
-              nextCompatEnabled(state.options.config),
-              needsClientEntry(state.options.route),
-            ),
-          ),
+          await renderStreamNotFoundBoundary(state),
           state.options,
           nonce,
         )
-      }),
-  )
+      }
+      if (isRedirectError(error)) {
+        return renderSuspenseReplacement(
+          id,
+          metadataRedirectHtml(error.location, error.status),
+          state.options,
+          nonce,
+        )
+      }
+      reportStreamBoundaryError(error)
+      // The status is sent, but an uncaught render error still gets its log line and onRequestError.
+      reportStreamRenderError(error, state)
+      return renderSuspenseReplacement(
+        id,
+        renderToString(
+          hStreamError(
+            error,
+            state.dev,
+            nextCompatEnabled(state.options.config),
+            needsClientEntry(state.options.route),
+          ),
+        ),
+        state.options,
+        nonce,
+      )
+    })
+  boundaryChunkIds.set(chunk, id)
+  state.deferred.push(chunk)
   const markerProps = { 'data-pnext-suspense': id, ...loadingDepthAttributes(node.props) }
-  const fallback = resolveServerTreeForStream(node.props.fallback, state)
-  if (isPromise(fallback)) {
-    return fallback.then(resolved => h('pnext-suspense', markerProps, resolved))
+  const marker = (fallback: ComponentChildren) => {
+    const vnode = h('pnext-suspense', markerProps, fallback)
+    markerChunks.set(vnode, chunk)
+    return vnode
   }
-  return h('pnext-suspense', markerProps, fallback)
+  const fallback = resolveServerTreeForStream(node.props.fallback, state)
+  return isPromise(fallback) ? fallback.then(marker) : marker(fallback)
+}
+
+function markInertBoundaries(node: ComponentChildren): void {
+  if (Array.isArray(node))
+    for (const child of node as ComponentChildren[]) markInertBoundaries(child)
+  else if (isVNode(node)) {
+    const chunk = markerChunks.get(node)
+    if (chunk) inertChunks.add(chunk)
+    markInertBoundaries(node.props.children)
+  }
 }
 
 // A real error that escaped a streaming Suspense boundary. Mirrors pageRender's render catch for
@@ -6070,13 +6110,14 @@ function reportStreamRenderError(error: unknown, state: StreamState): void {
 }
 
 function resolveServerTreeForStream(
-  node: unknown,
+  input: unknown,
   state: StreamState,
 ): ComponentChildren | Promise<ComponentChildren> {
-  if (node == null || typeof node !== 'object') return node as ComponentChildren
-  if (Array.isArray(node))
-    return settleChildren(node.map(child => resolveServerTreeForStream(child, state)))
-  if (!isVNode(node)) return node as ComponentChildren
+  if (input == null || typeof input !== 'object') return input as ComponentChildren
+  if (Array.isArray(input))
+    return settleChildren(input.map(child => resolveServerTreeForStream(child, state)))
+  if (!isVNode(input)) return input as ComponentChildren
+  let node = input
 
   if (isSuspenseVNode(node)) {
     // Snapshot BEFORE recursing: reaching the `<html>` element deeper in this same synchronous call
@@ -6106,7 +6147,15 @@ function resolveServerTreeForStream(
       return Promise.resolve(children)
     }
     if (!isPromise(children)) return children
-    if (isUseCacheJoinerPromise(children)) return children
+    if (getRenderExtensions().streamingPromise?.shouldAwait(children)) return children
+    if (state.shellGate) {
+      let settled = false
+      const settle = () => (settled = true)
+      children.then(settle, settle)
+      return state.shellGate.then(() =>
+        settled ? children : streamSuspenseBoundary(node, children, state),
+      )
+    }
     return streamSuspenseBoundary(node, children, state)
   }
 
@@ -6124,12 +6173,16 @@ function resolveServerTreeForStream(
       resolveServerTreeForStream(node.props.children, state),
     )
     if (isPromise(children)) {
-      return children.then(resolved => elementVNode(node, resolved, state))
+      return inheritStreamingPromise(
+        children,
+        children.then(resolved => elementVNode(node, resolved, state)),
+      )
     }
     return elementVNode(node, children, state)
   }
 
   const component = node.type
+  node = enterSlotMarker(node, state.options.renderedSlots, state.options.slotOutlets)
   // Per-slot params scope marker: re-establish the slot's params while resolving
   // its subtree so nested islands capture them (see resolveServerTree above).
   if ((component as { [paramsScopeSymbol]?: true })[paramsScopeSymbol]) {
@@ -6206,24 +6259,31 @@ function resolveServerTreeForStream(
   }
   if (isPromise(result)) {
     const resolved = result.then(value => resolveServerTreeForStream(value, state))
-    if (isUseCacheJoinerPromise(result)) {
-      ;(resolved as unknown as Record<symbol, unknown>)[useCacheJoinerPromiseSymbol] = true
-    }
-    return resolved
+    return inheritStreamingPromise(result, resolved)
   }
   return resolveServerTreeForStream(result, state)
 }
 
 function settleChildren(children: (ComponentChildren | Promise<ComponentChildren>)[]) {
-  const pending = children.filter(isPromise)
-  return pending.length > 0 ? Promise.all(children.map(child => Promise.resolve(child))) : children
+  if (!children.some(isPromise)) return children
+  const settled = Promise.all(children.map(child => Promise.resolve(child)))
+  const streaming = getRenderExtensions().streamingPromise
+  if (streaming) {
+    const pending = children.filter(isPromise)
+    if (pending.every(streaming.shouldAwait)) streaming.inherit(pending[0]!, settled)
+  }
+  return settled
 }
 
-async function settleRoot(node: ComponentChildren | Promise<ComponentChildren>) {
-  return node
+function inheritStreamingPromise<T>(source: Promise<unknown>, result: Promise<T>): Promise<T> {
+  getRenderExtensions().streamingPromise?.inherit(source, result)
+  return result
 }
 
-async function* completed<T>(promises: Promise<T>[]) {
+async function* completed<T>(
+  promises: Promise<T>[],
+  live: (promise: Promise<T>) => boolean = () => true,
+) {
   // The array is LIVE: a streamed Suspense replacement that itself contains a
   // pending nested boundary pushes that boundary's chunk into the same array
   // mid-drain (deferSuspenseBoundary during the outer chunk's render). Re-admit
@@ -6241,21 +6301,18 @@ async function* completed<T>(promises: Promise<T>[]) {
     }
   }
   admit()
-  while (pending.size > 0) {
+  while ([...pending.keys()].some(index => live(promises[index]!))) {
     const { index, value } = await Promise.race(pending.values())
     pending.delete(index)
     admit()
-    yield value
+    yield [value, promises[index]!] as const
     admit()
   }
+  for (const rest of pending.values()) void rest.catch(() => undefined)
 }
 
 function isPromise<T>(value: T | Promise<T>): value is Promise<T> {
   return typeof value === 'object' && value !== null && 'then' in value
-}
-
-function isUseCacheJoinerPromise(value: Promise<unknown>): boolean {
-  return Boolean((value as unknown as Record<symbol, unknown>)[useCacheJoinerPromiseSymbol])
 }
 
 function isVNode(value: unknown): value is ServerVNode {
@@ -6785,6 +6842,7 @@ async function ensureClientComponent(reference: ClientReference, state: ResolveS
   // Non-SSR references only need registration for the client entry; importing
   // the module would run client code (ssr: false may touch browser globals).
   if (!ssrClientReference(resolvedReference)) return
+  getRenderSpanExtensions().onClientComponent?.(resolvedReference.file)
   if (state.clientComponents.has(resolvedReference.id)) return
   const module = await importClientModule(resolvedReference.file, state.options)
   const component = clientComponentExport(
@@ -6953,7 +7011,7 @@ async function readRenderModuleMetadata(
   options: RenderOptions,
   module: Record<string, unknown>,
   props: PageProps,
-  parent: Metadata,
+  parent: Metadata | Promise<Metadata>,
   file: string,
   prebuilt?: Metadata,
 ): Promise<Metadata | undefined> {
@@ -6997,9 +7055,11 @@ function renderSuspenseReplacement(
 }
 
 async function renderVNodeToString(vnode: VNode, state?: ActionSerializeState) {
-  const html = !state
-    ? await renderToStringAsync(vnode)
-    : await actionSerializeScope.run(state, () => renderToStringAsync(vnode))
+  const html = await runInClientRender(() =>
+    state
+      ? actionSerializeScope.run(state, () => renderToStringAsync(vnode))
+      : renderToStringAsync(vnode),
+  )
   return serializeNeutralClientIslands(html)
 }
 
@@ -7335,20 +7395,16 @@ export function clientIslandMarkerBootstrapSource(mode: PageSlotMarkerMode = 'ma
 // notFound() thrown inside a streamed Suspense boundary: render the nearest not-found convention
 // file in place of the boundary's content, same as the top-level 404 path, but as a plain fragment
 // (the document shell already flushed) plus the noindex tag Next always emits.
-async function renderStreamNotFoundBoundary(state: StreamState): Promise<string> {
-  const body = await renderVNodeToString(
-    h(Fragment, null, await streamNotFoundBoundaryTree(state)),
-    state,
-  )
-  return body
+async function renderStreamNotFoundBoundary(state: ActionSerializeState): Promise<string> {
+  return renderVNodeToString(h(Fragment, null, await streamNotFoundBoundaryTree(state)), state)
 }
 
 // The not-found boundary's tree (convention file or built-in fallback) plus the
 // noindex tag Next always emits for it. Shared by the out-of-order chunk path
 // (stringified) and the in-place suspending path (rendered as vnodes).
-async function streamNotFoundBoundaryTree(state: StreamState): Promise<ComponentChildren> {
+async function streamNotFoundBoundaryTree(state: ActionSerializeState): Promise<ComponentChildren> {
   const options = state.options
-  const file = nearestConventionFile(options, 'not-found.tsx')
+  const file = nearestAccessBoundary(options, 'not-found.tsx')
   const module = file ? ((await importModule(file, options)) as PageModule) : undefined
   const NotFound = module?.default
   const tree = NotFound
@@ -7357,7 +7413,7 @@ async function streamNotFoundBoundaryTree(state: StreamState): Promise<Component
   return h(Fragment, null, tree, h('meta', { name: 'robots', content: 'noindex' }))
 }
 
-function hStreamError(
+export function hStreamError(
   error: unknown,
   dev: boolean,
   compatNext: boolean,
@@ -7482,10 +7538,7 @@ const PROMO_RUNTIME =
   'if(!t){delete P[i];return true;}' +
   'var e=B(i);' +
   'if(!e){P[i]=1;return false;}' +
-  // A boundary inside a client island: this promotion rewrites DOM the island's mounted
-  // preact tree adopted at hydration, which still names the fallback. Mark the root so the
-  // next graft rebuilds it instead of diffing against a node that has left the document.
-  'var ci=e.closest?e.closest("pnext-client[data-pnext-client]"):null;if(ci)ci.__pnextStreamGrafted=1;' +
+  'var ci=e.closest?e.closest("pnext-client[data-pnext-client]"):null;' +
   'var f=document.createDocumentFragment();' +
   // Slot-granular chunk: weave the shell template's build-time slots and the
   // chunk's request-time slots back into their original order, so a static
@@ -7500,6 +7553,10 @@ const PROMO_RUNTIME =
   'for(var k=0;k<n;k++){var g=fin.indexOf(","+k+",")>=0?st[k]:dy[k];' +
   'if(g)for(var q=0;q<g.length;q++)f.appendChild(g[q]);}' +
   '}else{while(t.firstChild)f.appendChild(t.firstChild);}' +
+  // A mounted island's tree still owns `e`: its next graft calls this to put `e` back before diffing.
+  'if(ci&&ci.__pnextLive){var a=new Text,z=new Text,r=ci.__pnextUnpromote;f.prepend(a);f.append(z);' +
+  'ci.__pnextUnpromote=function(){r&&r();if(a.isConnected&&a.parentNode==z.parentNode){' +
+  'var g=new Range;g.setStartBefore(a);g.setEndAfter(z);g.deleteContents();g.insertNode(e)}}}' +
   'e.replaceWith(f);t.remove();delete P[i];return true;' +
   '}' +
   'function drain(){var any,changed=true;while(changed){changed=false;var k=Object.keys(P);for(var j=0;j<k.length;j++){if(P[k[j]]&&tryPromote(k[j]))changed=any=true;}}return any}' +
@@ -7516,7 +7573,7 @@ const PROMO_RUNTIME =
   '}'
 
 // React Fizz's shell-time stamp: PROMO_RUNTIME reveals no sooner than 300 ms after this frame.
-const SHELL_TIME_SCRIPT = 'requestAnimationFrame(()=>$RT=performance.now())'
+export const SHELL_TIME_SCRIPT = 'requestAnimationFrame(()=>$RT=performance.now())'
 
 export function suspenseReplaceScript(id: string) {
   return `(function(){(window.__PNEXT_PROMO__=window.__PNEXT_PROMO__||(${PROMO_RUNTIME})())(${JSON.stringify(id)});var s=document.currentScript;if(s)s.remove();}())`
@@ -7529,6 +7586,8 @@ function iconInsertionScript() {
 async function applyLayouts(
   options: RenderOptions,
   children: ComponentChildren,
+  // Starts the page's and the slots' head generators once every layout's has started.
+  startHeads?: (parent: Promise<MetadataEntry[]>, slotMatches: ResolvedSlotMatch[]) => void,
 ): Promise<LayoutRender> {
   const profile = renderProfile(options)
   let tree = children
@@ -7538,6 +7597,10 @@ async function applyLayouts(
   const viewport: Viewport[] = []
   const layoutProps = createPageProps(options)
   const layouts: LoadedLayout[] = []
+  const headDirs: string[] = []
+  // Every generator starts at once with a promise of its merged ancestors (Next's eager resolution).
+  let parentEntries: Promise<MetadataEntry[]> = Promise.resolve([])
+  const heads: { metadata: Promise<unknown>; viewport: Promise<Viewport | undefined> }[] = []
   // Cheap leaf span for the page (leaf) segment-module resolution, nested under
   // the render-body span alongside the per-layout segment spans below.
   getRenderSpanExtensions().emitResolveSegmentSpan('__PAGE__')
@@ -7595,32 +7658,42 @@ async function applyLayouts(
     })
   }
 
+  // Next passes layouts no searchParams; a hanging one would postpone a cached layout's key.
+  const { searchParams: _searchParams, ...layoutBaseProps } = layoutProps
   // Each layout receives only the params introduced AT or ABOVE its directory
   // (Next scopes params per layout level). Gated on next-compat so pure-core
   // layouts keep receiving the full param set.
-  const layoutPropsFor = (layoutFile: string): PageProps => {
+  const layoutPropsFor = (layoutFile: string): LayoutProps => {
     if (!withSegments) return layoutProps
     // Sub-shell (Stage C.2): a layout at/above a CONCRETE param renders it
     // buildtime; a layout at/above an unfilled param must hang so its boundary
     // postpones. Slice the concrete-prefix params per the layout's dir depth and
     // wrap in the sub-shell proxy so an unfilled key read throws PostponeError.
     if (options.fallbackConcreteParams) {
-      const scoped = layoutParamsForDir(
-        options.config.appPath,
-        dirname(layoutFile),
-        options.fallbackConcreteParams,
-      )
+      const names = layoutParamNamesForDir(options.config.appPath, dirname(layoutFile))
+      const concrete = encodedParams(options.fallbackConcreteParams)
+      const scoped = layoutParamsForDir(options.config.appPath, dirname(layoutFile), concrete)
+      // Only keys at or above this layout can hang; deeper ones are not in its params at all.
+      const keys = (options.fallbackParamKeys ?? []).filter(key => names.includes(key))
+      const proxy = subShellParamsProxy(scoped, keys, 'layout')
+      const hanging = keys.some(key => !(key in scoped))
       return {
-        ...layoutProps,
-        params: Promise.resolve(
-          subShellParamsProxy(scoped, options.fallbackParamKeys ?? Object.keys(scoped)),
+        ...layoutBaseProps,
+        params: markRuntimeApiOnAwait(
+          hanging ? Promise.resolve(proxy) : settledPromise(proxy),
+          hanging,
         ),
       }
     }
     // Base fallback shell (all params hang): a layout that awaits params must
     // postpone its boundary too (not read an empty object). Reuse the page-level
     // hanging params promise so the whole shell is param-independent.
-    if (options.fallbackParams) return { ...layoutProps, params: hangingPromise('params') }
+    if (options.fallbackParams) {
+      // A layout above every dynamic segment has no params to hang on.
+      return layoutParamNamesForDir(options.config.appPath, dirname(layoutFile)).length
+        ? { ...layoutBaseProps, params: hangingPromise('params', RUNTIME_PARAMS) }
+        : { ...layoutBaseProps, params: Promise.resolve({}) }
+    }
     // The scoped params go through the vary-tracking extension under the LAYOUT
     // segment kind: compat keys the layout's cache frame on the params this
     // layout reads, independently of the page's own set. Outside a tracking
@@ -7631,7 +7704,7 @@ async function applyLayouts(
       { kind: 'params', segment: 'layout' },
     )
     return {
-      ...layoutProps,
+      ...layoutBaseProps,
       params: legacySyncProps(Promise.resolve(scopedParams), 'params', scopedParams),
     }
   }
@@ -7642,46 +7715,50 @@ async function applyLayouts(
       if (!options.moduleLoader && !conventionFileExists(layoutPath)) continue
       const layoutModule = (await importModule(layoutPath, options)) as LayoutModule
       markServerReference(layoutModule.default)
-      // Cheap leaf span for the segment-module resolution (nested under the
-      // render-body span). Root layout dir == appPath has no segment label.
       {
         const layoutDir = dirname(layoutPath)
-        if (layoutDir !== options.config.appPath) {
-          getRenderSpanExtensions().emitResolveSegmentSpan(basename(layoutDir))
-        }
+        getRenderSpanExtensions().emitResolveSegmentSpan(
+          layoutDir === options.config.appPath ? '' : basename(layoutDir),
+          layoutPath,
+        )
       }
       const metadataExtensions = getActiveMetadataExtensions(options.config)
       const layoutModuleRecord = layoutModule as Record<string, unknown>
       runtimeMetadata ||= Boolean(metadataExtensions.hasRuntimeMetadata?.(layoutModuleRecord))
       const prebuiltLayoutMetadata = options.staticModuleMetadata?.[layoutPath]
-      const layoutMetadataPromise = readRenderModuleMetadata(
-        options,
-        layoutModuleRecord,
-        layoutProps,
-        mergeMetadataEntries(metadata),
-        layoutPath,
-        prebuiltLayoutMetadata?.metadata,
+      const ancestors = parentEntries
+      const layoutMetadata = started(
+        readRenderModuleMetadata(
+          options,
+          layoutModuleRecord,
+          layoutProps,
+          ancestors.then(entries => mergeMetadataEntries(entries)),
+          layoutPath,
+          prebuiltLayoutMetadata?.metadata,
+        ),
       )
-      // Same head-vs-body race the page metadata runs (see renderTreeInFrame): a layout's slow
-      // generateMetadata streams into the body too (metadata-streaming-parallel-routes).
-      metadataMissedFlush ||= !(await settlesBeforeFlush(layoutMetadataPromise))
-      const layoutMetadata = await layoutMetadataPromise
-      if (layoutMetadata) {
-        const dir = dirname(layoutPath)
-        metadata.push({
-          metadata: layoutMetadata,
-          dir,
-          kind: 'layout',
-          root: dir === options.config.appPath,
-        })
-      }
-      const layoutViewport = metadataExtensions.readModuleViewport
-        ? await metadataExtensions.readModuleViewport(layoutModuleRecord, layoutProps)
-        : prebuiltLayoutMetadata?.viewport
-          ? prebuiltLayoutMetadata.viewport
-          : await readModuleViewport(layoutModule)
-      if (layoutViewport) viewport.push(layoutViewport)
+      const dir = dirname(layoutPath)
+      parentEntries = started(
+        ancestors.then(async entries => {
+          const resolved = await layoutMetadata
+          return resolved
+            ? [
+                ...entries,
+                { metadata: resolved, dir, kind: 'layout', root: dir === options.config.appPath },
+              ]
+            : entries
+        }),
+      )
+      heads.push({
+        metadata: layoutMetadata,
+        viewport: started(
+          metadataExtensions.readModuleViewport
+            ? metadataExtensions.readModuleViewport(layoutModuleRecord, layoutProps, layoutPath)
+            : Promise.resolve(prebuiltLayoutMetadata?.viewport ?? readModuleViewport(layoutModule)),
+        ),
+      })
       layouts.push({ file: layoutPath, module: layoutModule })
+      if (definesHead(layoutModuleRecord)) headDirs.push(dirname(layoutPath))
     }
   })
 
@@ -7862,6 +7939,24 @@ async function applyLayouts(
         applyLoadingBoundaries(dirname(rootFile), tree),
       )
       const { children, slots } = childrenFromSlots(slotProps, wrapped)
+      // A runtime prefetch from under this same param-free root layout: the client keeps its live one.
+      const rootId = relative(options.config.appPath, rootFile).split(sep).join('/')
+      if (
+        !rootIsClient &&
+        !rootId.includes('[') &&
+        Object.keys(slots).length === 0 &&
+        options.request?.headers.get('x-pnext-root-layout') === rootId
+      )
+        return h(
+          'html',
+          null,
+          h(
+            'body',
+            null,
+            // The skipped layout's boundaries still bound the children's holes.
+            h('pnext-layout', { 'data-pnext-skip': 'root' } as never, h(Suspense, null, children)),
+          ),
+        )
       const rootProps: ServerVNodeProps = {
         ...rootLayoutProps,
         ...(rootIsClient ? markClientRootSlots(slots) : slots),
@@ -7873,11 +7968,22 @@ async function applyLayouts(
           rootProps,
         )
       }
-      return componentChildren(
-        invokeServerComponentWithUse(rootComponent as ServerComponent<ServerVNodeProps>, rootProps),
-      )
+      return invokeServerComponentWithUse(
+        rootComponent as ServerComponent<ServerVNodeProps>,
+        rootProps,
+      ) as ComponentChildren
     })
   }
+
+  startHeads?.(parentEntries, slotContext.matches)
+  for (const head of heads) {
+    // Same head-vs-body race the page metadata runs (see renderTreeInFrame): a layout's slow
+    // generateMetadata streams into the body too (metadata-streaming-parallel-routes).
+    metadataMissedFlush ||= !(await settlesBeforeFlush(head.metadata))
+    const layoutViewport = await head.viewport
+    if (layoutViewport) viewport.push(layoutViewport)
+  }
+  metadata.push(...(await parentEntries))
 
   return {
     tree,
@@ -7886,6 +7992,7 @@ async function applyLayouts(
     metadataMissedFlush,
     slotMatches: slotContext.matches,
     viewport,
+    headDirs,
     documentLayoutFile,
   }
 }
@@ -7916,7 +8023,7 @@ async function wrapSegment(
   layoutFile: string,
   component: ServerComponent<{ children: ComponentChildren }> | undefined,
   tree: ComponentChildren,
-  layoutProps: PageProps,
+  layoutProps: LayoutProps,
   templateByDir: Map<string, string>,
   slotContext: SlotContext<RenderOptions>,
 ): Promise<ComponentChildren> {
@@ -8131,10 +8238,6 @@ function segmentScopeFor(options: RenderOptions, dir: string): string | undefine
   const target = options.nav?.childrenPath ?? options.url.pathname
   const segments = target.split('/').filter(Boolean)
   return segments.slice(0, Math.min(depth, segments.length)).join('/')
-}
-
-function componentChildren(value: ServerComponentResult): ComponentChildren {
-  return value === undefined ? undefined : value
 }
 
 // data-pnext-dev tells the soft-navigation runtime to skip this script on

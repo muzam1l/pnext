@@ -45,6 +45,7 @@ function restoreScrollWithReservedHeight(x: number, y: number, height: number | 
   window.scrollTo(x, y)
 }
 
+// Next's scroll handler leaves focus untouched.
 export const applyNextNavigationScroll: NavigationScrollAction = (url, options) => {
   releaseScrollHeightReservation()
   const segmentElements = changedSegmentElements()
@@ -60,21 +61,16 @@ export const applyNextNavigationScroll: NavigationScrollAction = (url, options) 
     restoreScrollWithReservedHeight(x, y, height)
     return
   }
-  // React hoists a rendered <style precedence>/<link rel=stylesheet>/metadata element out of the segment
-  // and into <head>. Next resolves its scroll target with findDOMNode() on the changed segment, so when
-  // the segment's FIRST host element is one of those the walk starts inside <head>, skips every
-  // zero-rect sibling there and runs out - the navigation scrolls nowhere and focuses nothing. pnext
-  // renders those elements in place, so recognize the leading hoisted element and reproduce the same
-  // no-op. Placed after `restore` so history traversal still restores its saved position.
-  if (segmentLeadsWithHoistedElement(segmentElements)) return
+  // React's new Fragment-based handler still owns a segment whose leading node was hoisted.
+  if (segmentLeadsWithHoistedElement(segmentElements) && plan !== 'hash') {
+    window.scrollTo(...topOnlyScrollPosition(window.scrollX))
+    return
+  }
   if (plan === 'hash') {
     scrollToHash(url.hash)
     return
   }
-  if (plan === 'preserve') {
-    if (target && options.scroll !== false) focusSegment(target)
-    return
-  }
+  if (plan === 'preserve') return
   if (plan === 'top') {
     window.scrollTo(...topOnlyScrollPosition(window.scrollX))
     return
@@ -82,7 +78,6 @@ export const applyNextNavigationScroll: NavigationScrollAction = (url, options) 
   if (!target) return
   window.scrollTo(...topOnlyScrollPosition(window.scrollX))
   if (!targetTopInViewport(target, document.documentElement.clientHeight)) target.scrollIntoView()
-  focusSegment(target)
 }
 
 function shouldSkipScrollElement(element: HTMLElement) {
@@ -97,7 +92,16 @@ function targetTopInViewport(element: HTMLElement, viewportHeight: number) {
   if (rects.length === 0) return false
   let top = Number.POSITIVE_INFINITY
   for (const rect of rects) top = Math.min(top, rect.top)
-  return top >= 0 && top <= viewportHeight
+  return top >= scrollPaddingTop(viewportHeight) && top <= viewportHeight
+}
+
+function scrollPaddingTop(viewportHeight: number): number {
+  const raw = getComputedStyle(document.documentElement).scrollPaddingTop
+  const value = Number.parseFloat(raw)
+  if (!Number.isFinite(value) || value < 0) return 0
+  if (raw.endsWith('px')) return value
+  if (raw.endsWith('%')) return (value / 100) * viewportHeight
+  return 0
 }
 
 function scrollFocusTarget(nodes: HTMLElement[]): HTMLElement | null {
@@ -165,12 +169,4 @@ function scrollToHash(hash: string) {
 function namedTarget(name: string): HTMLElement | null {
   const named = document.getElementsByName(name)[0]
   return named instanceof HTMLElement ? named : null
-}
-
-function focusSegment(target: HTMLElement) {
-  try {
-    target.focus({ preventScroll: true })
-  } catch {
-    // A swap can detach the target before focus runs.
-  }
 }

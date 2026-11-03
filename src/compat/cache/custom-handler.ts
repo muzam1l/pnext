@@ -10,8 +10,7 @@
 //   - a `require.resolve(...)` path (absolute)
 //   - a `file://` URL              (`import.meta.resolve('./x.js')`)
 // and the module exports the handler class as `module.exports`, `.default`, or
-// an ESM `export default`. On Bun, `require()` loads ESM synchronously, so a
-// single require covers every shape.
+// an ESM `export default`, including modules with top-level await.
 // ---------------------------------------------------------------------------
 
 import { createRequire } from 'node:module'
@@ -24,20 +23,20 @@ import { setCacheHandler, type CacheHandler } from './handler'
 type CacheHandlerCtor = new (options: { maxMemoryCacheSize?: number }) => CacheHandler
 
 let installedFor: string | undefined
-let installedRoot: string | undefined
+let installedCtor: CacheHandlerCtor | undefined
 
 /**
  * Load + instantiate the configured `cacheHandler` and install it into core.
  * Idempotent per resolved path; no-op when unconfigured. Instantiation logs
  * ("initialized custom cache-handler") are what the suites assert.
  */
-export function installCustomCacheHandler(root: string): void {
+export async function installCustomCacheHandler(root: string): Promise<void> {
   const configured = getNextConfig().cacheHandler
   if (typeof configured !== 'string' || configured.length === 0) {
     if (installedFor !== undefined) {
       setCacheHandler(undefined)
       installedFor = undefined
-      installedRoot = undefined
+      installedCtor = undefined
     }
     return
   }
@@ -53,36 +52,29 @@ export function installCustomCacheHandler(root: string): void {
         : resolved
   if (installedFor === filePath) return
 
-  const Ctor = loadHandlerCtor(filePath, root)
-  if (!Ctor) return
+  const Ctor = await loadHandlerCtor(filePath, root)
+  if (!Ctor) throw new TypeError(`Cache handler ${filePath} must export a handler class`)
   const instance = new Ctor({})
   setCacheHandler(instance)
   installedFor = filePath
-  installedRoot = root
+  installedCtor = Ctor
 }
 
 export function reinstallCustomCacheHandlerForEdge(): void {
-  if (!installedRoot) return
-  installedFor = undefined
-  installCustomCacheHandler(installedRoot)
+  if (installedCtor) setCacheHandler(new installedCtor({}))
 }
 
-function loadHandlerCtor(filePath: string, root: string): CacheHandlerCtor | undefined {
+async function loadHandlerCtor(
+  filePath: string,
+  root: string,
+): Promise<CacheHandlerCtor | undefined> {
+  const require = createRequire(pathToFileURL(`${root}/index.js`).href)
+  const resolved = path.isAbsolute(filePath) ? filePath : require.resolve(filePath)
   try {
-    const require = createRequire(pathToFileURL(`${root}/index.js`).href)
-    try {
-      return pickCtor(require(filePath))
-    } catch (error) {
-      // Handlers commonly extend Next internals (e.g. `require('next/dist/
-      // server/lib/incremental-cache/file-system-cache')`) that don't exist
-      // without a real `next` install. Re-evaluate the module with those
-      // requires stubbed to an inert base class so the subclass (whose own
-      // get/set overrides carry the observable behavior) still loads.
-      if (!isNextDistMissing(error)) return undefined
-      return loadCommonJsCtorWithNextStubs(filePath, require)
-    }
-  } catch {
-    return undefined
+    return pickCtor(await import(pathToFileURL(resolved).href))
+  } catch (error) {
+    if (resolved.endsWith('.mjs') || !isNextDistMissing(error)) throw error
+    return loadCommonJsCtorWithNextStubs(resolved, require)
   }
 }
 
@@ -90,36 +82,32 @@ function loadCommonJsCtorWithNextStubs(
   filePath: string,
   rootRequire: NodeRequire,
 ): CacheHandlerCtor | undefined {
-  try {
-    const module = { exports: {} as unknown }
-    const localRequire = (specifier: string): unknown => {
-      if (specifier.startsWith('next/dist/')) return nextDistStubModule()
-      if (specifier.startsWith('./') || specifier.startsWith('../')) {
-        return rootRequire(path.resolve(path.dirname(filePath), specifier))
-      }
-      return rootRequire(specifier)
+  const module = { exports: {} as unknown }
+  const localRequire = (specifier: string): unknown => {
+    if (specifier.startsWith('next/dist/')) return nextDistStubModule()
+    if (specifier.startsWith('./') || specifier.startsWith('../')) {
+      return rootRequire(path.resolve(path.dirname(filePath), specifier))
     }
-    const source = readFileSync(filePath, 'utf8')
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval
-    const evaluate = new Function(
-      'require',
-      'module',
-      'exports',
-      '__filename',
-      '__dirname',
-      source,
-    ) as (
-      require: (specifier: string) => unknown,
-      module: { exports: unknown },
-      exports: unknown,
-      filename: string,
-      dirname: string,
-    ) => void
-    evaluate(localRequire, module, module.exports, filePath, path.dirname(filePath))
-    return pickCtor(module.exports)
-  } catch {
-    return undefined
+    return rootRequire(specifier)
   }
+  const source = readFileSync(filePath, 'utf8')
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval
+  const evaluate = new Function(
+    'require',
+    'module',
+    'exports',
+    '__filename',
+    '__dirname',
+    source,
+  ) as (
+    require: (specifier: string) => unknown,
+    module: { exports: unknown },
+    exports: unknown,
+    filename: string,
+    dirname: string,
+  ) => void
+  evaluate(localRequire, module, module.exports, filePath, path.dirname(filePath))
+  return pickCtor(module.exports)
 }
 
 function isNextDistMissing(error: unknown): boolean {

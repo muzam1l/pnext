@@ -5,7 +5,7 @@
 import path from 'node:path'
 import { readDirListing, toPosixPath } from '../utils/fs'
 import { safeDecode } from '../utils/decode'
-import { extraPageExtensions } from '../extensions'
+import { extraPageExtensions, getRoutingExtensions } from '../extensions'
 import type { NavState, RouteManifestEntry, RouteParamValue } from '../types'
 
 const BASE_PAGE_EXTENSIONS = ['tsx', 'ts', 'jsx', 'js', 'mjs'] as const
@@ -61,7 +61,7 @@ export function findGlobalError(appPath: string) {
   return conventionFileName(appPath, globalErrorBase)
 }
 
-export function matchRoute(routes: RouteManifestEntry[], pathname: string) {
+export function matchRoute(routes: RouteManifestEntry[], pathname: string, headers?: Headers) {
   // Trailing-slash tolerance: '/route/' matches the same entry as '/route'
   // (Next redirects these away; static file serving already accepts both).
   const normalized = normalizePathname(pathname)
@@ -71,9 +71,18 @@ export function matchRoute(routes: RouteManifestEntry[], pathname: string) {
     if (route.interception) continue
     const match = routeRegex(route).exec(normalized)
     if (!match) continue
-    return { route, params: routeMatchParams(route, match) }
+    const params = routeMatchParams(route, match)
+    if (!getRoutingExtensions().admitRoute(route, params, headers)) continue
+    return { route, params }
   }
   return null
+}
+
+/** `/:lang/docs/:parts*` in Next's `/[lang]/docs/[...parts]` form. */
+export function nextRoutePattern(route: string, catchAllOptional = false): string {
+  return route.replace(/:([^/*]+)(\*?)/g, (_match, name: string, star: string) =>
+    !star ? `[${name}]` : catchAllOptional ? `[[...${name}]]` : `[...${name}]`,
+  )
 }
 
 export function normalizePathname(pathname: string) {
@@ -81,24 +90,17 @@ export function normalizePathname(pathname: string) {
 }
 
 function routeMatchParams(route: RouteManifestEntry, match: RegExpExecArray) {
+  // Handlers read decoded values; page params are the registered form (core decoded, compat encoded).
+  const value = route.kind === 'handler' ? safeDecode : getRoutingExtensions().paramValue
   const params: Record<string, RouteParamValue> = {}
   route.params.forEach((name, index) => {
-    const decoded = safeDecode(match[index + 1] ?? '')
-    // A runtime request whose segment IS the dynamic placeholder for its own
-    // param (`[slug]`, whether sent raw or as `%5Bslug%5D`) is Next's "params
-    // placeholder": it must surface the ENCODED placeholder (`%5Bslug%5D`), not
-    // a decoded `[slug]`. A decoded `[slug]` reads as a fallback param and would
-    // trigger a fallback-shell render (failing without a parent Suspense
-    // boundary); Next keeps it URL-encoded to render at runtime instead.
-    // Fallback-shell generation injects its placeholder params through a
-    // separate build path, so this only affects live requests.
-    params[name] = decoded === `[${name}]` ? encodeURIComponent(decoded) : decoded
+    params[name] = value(match[index + 1] ?? '')
   })
   if (route.catchAll) {
-    params[route.catchAll] = (match[route.params.length + 1] ?? '')
-      .split('/')
-      .filter(Boolean)
-      .map(safeDecode)
+    const values = (match[route.params.length + 1] ?? '').split('/').filter(Boolean)
+    if (values.length > 0 || !route.catchAllOptional) {
+      params[route.catchAll] = values.map(value)
+    }
   }
   return params
 }
@@ -119,6 +121,7 @@ export function matchInterception(
   routes: RouteManifestEntry[],
   pathname: string,
   fromPath: string | undefined,
+  headers?: Headers,
 ): InterceptionRouteMatch | null {
   if (!fromPath) return null
   const target = normalizePathname(pathname)
@@ -135,8 +138,10 @@ export function matchInterception(
     if (!new RegExp(`^${basePattern}(?:/.*)?$`).test(from)) continue
     const depth = interception.base.split('/').filter(Boolean).length
     if (depth <= bestDepth) continue
+    const params = routeMatchParams(route, match)
+    if (!getRoutingExtensions().admitRoute(route, params, headers)) continue
     bestDepth = depth
-    best = { route, params: routeMatchParams(route, match) }
+    best = { route, params }
   }
   return best
 }
@@ -160,10 +165,11 @@ export function selectRouteForRequest(
   routes: RouteManifestEntry[],
   pathname: string,
   nav?: import('../types').NavState,
+  headers?: Headers,
 ): RouteRenderSelection | null {
   const target = normalizePathname(pathname)
   if (nav) {
-    const intercepted = matchInterception(routes, target, nav.children)
+    const intercepted = matchInterception(routes, target, nav.children, headers)
     if (intercepted) {
       if (!intercepted.route.interception?.slotDir) {
         return {
@@ -177,12 +183,13 @@ export function selectRouteForRequest(
       if (host) return { ...host, targetPath: target }
     }
   }
-  const matched = matchRoute(routes, target)
+  const matched = matchRoute(routes, target, headers)
   if (!matched) return null
   if (nav && matched.route.synthetic && nav.children) {
     const primary = matchRoute(
       routes.filter(route => !route.synthetic),
       target,
+      headers,
     )
     const syntheticOwner = matched.route.syntheticSlotDir
       ? path.dirname(matched.route.syntheticSlotDir)
@@ -225,7 +232,7 @@ export function selectRouteForRequest(
  * marks the fetch and `x-pnext-nav-state` carries the current document's
  * parallel-route state (URI-encoded JSON).
  */
-export function parseNavState(request: Request): NavState | undefined {
+export function parseNavState(request: Pick<Request, 'headers'>): NavState | undefined {
   if (!request.headers.get('x-pnext-soft-nav')) return undefined
   const raw = request.headers.get('x-pnext-nav-state')
   if (!raw) return {}

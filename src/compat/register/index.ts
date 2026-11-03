@@ -28,7 +28,6 @@ import { registerUseCacheExtensions } from './use-cache'
 import { registerClientErrorExtensions } from './client-errors'
 import { registerPprExtensions } from './ppr'
 import { registerMdxExtensions } from './mdx'
-import { registerOtelExtensions, registerOtelRootInterceptor } from './otel'
 import { registerInstrumentationClientExtensions } from './instrumentation-client'
 import { registerMiscExtensions } from './taint'
 import { registerCssExtrasExtensions } from './css-extras'
@@ -36,6 +35,7 @@ import { registerSegmentExtensions } from './segment'
 import { registerBundlerExtensions } from './bundler'
 import { registerPagesApiExtensions } from './pages-api'
 import { registerEdgeRuntimeExtensions } from './edge-runtime'
+import { hasInstrumentation } from '../lifecycle/instrumentation'
 
 export interface RegisterCompatOptions {
   /**
@@ -54,6 +54,8 @@ export async function registerCompatExtensions(
   const build: typeof BuildTier | undefined = options.serve
     ? undefined
     : await import('./build-tier')
+  // The tracer graph loads only for an app whose instrumentation file can register a provider.
+  const otel = hasInstrumentation(config) ? await import('./otel') : undefined
   // Route conventions, page/CSS extensions, module aliases, proxy names and the
   // lifecycle init hooks — already done when the boot tier ran first.
   registerCompatBootExtensions(config)
@@ -62,7 +64,7 @@ export async function registerCompatExtensions(
   // The otel ROOT-span interceptor must run before every short-circuiting
   // interceptor (segment prefetch, RSC protocol, action dispatch) so those
   // responses are traced too; the rest of otel registers last (below).
-  registerOtelRootInterceptor(config)
+  otel?.registerOtelRootInterceptor(config)
   // Protocol validation next: an invalid next-router-state-tree must 500 before
   // the segment/action interceptors answer the request.
   registerProtocolRequestValidation(config)
@@ -74,6 +76,8 @@ export async function registerCompatExtensions(
   // Build validation fails fast before the remaining build steps run.
   build?.registerValidationExtensions(config)
   registerCacheExtensions(config)
+  // Before every answering interceptor: actions and segment requests also record their route for after().
+  registerLifecycleExtensions(config)
   // Before actions: the /_tree prefetch responder must intercept ahead of the
   // action dispatch interceptor.
   registerSegmentExtensions(config)
@@ -83,7 +87,6 @@ export async function registerCompatExtensions(
   registerRenderExtensions(config)
   registerProxyExtensions(config)
   registerProtocolExtensions(config)
-  registerLifecycleExtensions(config)
   registerImageExtensions(config)
   registerErrorExtensions(config)
   registerFontExtensions(config)
@@ -102,7 +105,7 @@ export async function registerCompatExtensions(
   registerMdxExtensions(config)
   // Otel after everything: its route re-stamp interceptor must observe the
   // post-rewrite request (the root span opens in the EARLY interceptor above).
-  registerOtelExtensions(config)
+  otel?.registerOtelExtensions(config)
   // After otel: composes (not clobbers) the documentHeadTags extension.
   registerInstrumentationClientExtensions(config)
 }

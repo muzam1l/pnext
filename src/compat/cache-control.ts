@@ -7,6 +7,7 @@ import type { ResponseFinalizer, ResponseFinalizerContext } from '../extensions'
 import { getNextConfig } from './next/config-loader'
 import { escapeRegex } from '../utils/code'
 import { canonicalUrlHref } from './next/canonical-url'
+import { pagesDirectory } from './pages/router'
 import {
   appPathname,
   loadCompatHeaders,
@@ -121,6 +122,8 @@ function applyDefaultIsrHeader(
     return
   }
   if (existing && (pagesRevalidateSeconds === undefined || existing !== 'no-store')) return
+  // A failed render is never cached; the document finalizer gives it the per-request value.
+  if (ctx.status >= 500) return
   const revalidateSeconds =
     pagesRevalidateSeconds ?? (ctx.routeMode === 'isr' ? ctx.hints?.revalidateSeconds : undefined)
   if (typeof revalidateSeconds !== 'number' || revalidateSeconds <= 0) return
@@ -151,7 +154,7 @@ function loadPagesRevalidateRules(config: ResolvedConfig): RevalidateRule[] {
 
 /** Pages with a `getStaticProps` revalidate window: `[pages-relative file, seconds]`. */
 export function pagesRevalidateFacts(root: string): [string, number][] {
-  const pagesDir = path.join(root, 'pages')
+  const pagesDir = pagesDirectory(root)
   if (!existsSync(pagesDir)) return []
   const facts: [string, number][] = []
   for (const file of walkFiles(pagesDir)) {
@@ -191,7 +194,7 @@ function pagesRouteRegex(relative: string): RegExp | undefined {
   return new RegExp(`^${pattern || '/'}\\/?$`)
 }
 
-function parseCookieHeader(header: string | null): Record<string, string> {
+export function parseCookieHeader(header: string | null): Record<string, string> {
   const cookies: Record<string, string> = {}
   if (!header) return cookies
   for (const part of header.split(';')) {

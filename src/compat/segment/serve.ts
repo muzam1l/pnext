@@ -1,46 +1,38 @@
-// Segment-prefetch responder implementation (COMPAT - may import core freely). Provides:
-//   - a request interceptor that answers `/_tree` segment-prefetch requests with the minimal
-//     RootTreePrefetch payload, Content-Type text/x-component, x-nextjs-stale-time and
-//     cache-control private,no-store; the router Vary is merged by the protocol finalizer.
-//   - a response finalizer that stamps x-nextjs-stale-time on ordinary prefetch responses that did
-//     not already carry one from `use cache`, so the client segment cache learns the reuse window.
-//
-// The interceptor short-circuits BEFORE route matching / static lookup: a segment prefetch never
-// renders a page, it only announces the route tree + staleness. It runs first among compat
-// interceptors so an action POST never mistakes a `/_tree` GET.
-//
-// `_rsc` cache-buster handling: an RSC/prefetch request carries a `?_rsc=<hash>` param the CDN keys
-// on. The interceptor accepts any value and never treats it as an app search param.
-//
-// No-op when compat is off. The `/_tree` sentinel only fires when the client segment-cache runtime
-// sends it; the HTML-swap navigation path is untouched.
-//
-// Registered by ../register/segment.ts, which wires the exports below into the extension registries.
+// Segment-prefetch responder (COMPAT): answers `/_tree` with the RootTreePrefetch payload and the body
+// segments (`/_index`, `/_layout`, `/_page`, `/_head`) with framed HTML payloads, and stamps
+// x-nextjs-stale-time on ordinary prefetch responses. Short-circuits BEFORE route matching / static
+// lookup. The `_rsc` cache-buster is a CDN key, never an app search param. Registered by ../register/segment.ts.
 
 import type { ResolvedConfig } from '../../config'
-import type { RouteManifestEntry } from '../../types'
+import { paramSetMatches } from '../static-params'
+import type { RouteManifestEntry, RouteParamValue } from '../../types'
 import { nextCompatEnabled } from '../../compat/aliases'
 import {
   getRenderExtensions,
-  getRequestExtensions,
   type RequestInterceptor,
   type ResponseFinalizer,
   type ResponseFinalizerContext,
   withRouteRuntime,
 } from '../../extensions'
 import { getRequestRuntime } from '../../routing/request-environment'
+import { redirectInterceptor } from '../actions/extensions'
 import { takeCacheLifeStash } from '../cache/use-cache'
 import { matchInterception, parseNavState, selectRouteForRequest } from '../../routing/match'
 import {
-  currentPprShellHtml,
+  paramsPrerendered,
+  routeParamKeys,
+  subShellKey,
   pprShellPath,
+  pprSubShellPath,
   renderPageResponse,
-  renderPartialShell,
-  renderRuntimePrefetchDocument,
-  schedulePprShellUpgrade,
-  withRequestRouteParams,
+  routeModuleTags,
+  shellStaleSeconds,
   LATE_METADATA_MARKER,
 } from '../../render/renderer'
+import { RUNTIME_SESSION, runtimeNeededBits } from '../../render/ppr'
+
+const pprShell = () => import('../../render/ppr-shell')
+import { RUNTIME_SHELL } from '../../render/postpone'
 import {
   NEXT_ROUTER_PREFETCH_HEADER,
   NEXT_ROUTER_SEGMENT_PREFETCH_HEADER,
@@ -54,16 +46,21 @@ import {
   DEFAULT_STATIC_STALE_TIME_SECONDS,
   segmentMetaFile,
   segmentBodyResponse,
+  SEGMENT_ROUTE_HEADER,
+  shellSegmentFile,
   ROUTE_SEGMENT_PATH,
   TREE_SEGMENT_PATH,
   treeSegmentFile,
   treePrefetchResponse,
+  PrefetchHint,
+  type RootTreePrefetch,
   type SegmentAppShell,
   type SegmentMeta,
   type SegmentVaryInfo,
 } from './tree'
 import {
   responseVaryParamsFromWire,
+  restrictVary,
   varyNamesFor,
   withVaryParamsTracking,
   type ResponseVaryParams,
@@ -71,69 +68,29 @@ import {
 import { pageHasInPageSuspense } from './loading-boundary'
 import { pageSlotFrame, stripPageSlotContent } from './page-slot'
 import { withoutInlineCss } from '../css/inline-css'
-import { getNextConfig } from '../next/config-loader'
-import { CACHE_BUSTING_REDIRECT_HEADER } from '../protocol'
-import { staticSiblingNames } from '../next/route-state'
+import { nextExperimental } from '../next/config-loader'
+import { CACHE_BUSTING_REDIRECT_HEADER, mergeRouterVary } from '../protocol'
+import { parseCookieHeader } from '../cache-control'
+import { nextRoutePattern } from '../../routing/match'
+import { routeRuntimePrefetch, staticSiblingNames } from '../next/route-state'
+import { appRootParams } from '../ppr/root-params-scan'
 import { loadCompatRewrites, resolveCompatRewrite, type CompatRewrite } from '../next/rewrites'
-import { existsSync, readFileSync, statSync } from 'node:fs'
-import { join } from 'node:path'
-import { writeFile } from 'node:fs/promises'
+import { existsSync, readFileSync } from 'node:fs'
+import { readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { writeFileAtomic } from '../../utils/fs'
 
 /** experimental.staleTimes.{static,dynamic} from next.config (seconds). */
 function configuredStaleTimes(): { static?: number; dynamic?: number } {
-  const experimental = getNextConfig().experimental
-  if (!experimental || typeof experimental !== 'object') return {}
-  const staleTimes = (experimental as { staleTimes?: unknown }).staleTimes
-  if (!staleTimes || typeof staleTimes !== 'object') return {}
-  const value = staleTimes as { static?: unknown; dynamic?: unknown }
+  const { staleTimes } = nextExperimental<{ staleTimes: { static?: unknown; dynamic?: unknown } }>()
   return {
-    ...(typeof value.static === 'number' ? { static: value.static } : {}),
-    ...(typeof value.dynamic === 'number' ? { dynamic: value.dynamic } : {}),
+    ...(typeof staleTimes?.static === 'number' ? { static: staleTimes.static } : {}),
+    ...(typeof staleTimes?.dynamic === 'number' ? { dynamic: staleTimes.dynamic } : {}),
   }
 }
 
-/**
- * Partial Prefetching: a FULL (`<Link prefetch={true}>`) prefetch is downgraded to a partial/PPR
- * prefetch - the static shell only, never the dynamic data - when the app opts in globally
- * (`partialPrefetching`) or the target route opts in per segment (`export const prefetch =
- * 'partial'`, resolved through the route's whole segment chain so a nested leaf's opt-in reaches
- * the route the scheduler asks about). `'unstable_eager'` is the opposite policy and never downgrades.
- */
-function routePartialPrefetch(route: RouteManifestEntry): boolean {
-  // ...EXCEPT under App Shells, where `prefetch = 'partial'` means "rely on the shared shell for the
-  // DEFAULT prefetch". An explicit `prefetch={true}` link opts back into per-link prefetching there, so
-  // its full prefetch must carry this param's own content.
-  if (route.segmentConfig?.prefetch === 'partial') return !appShellsEnabled()
-  return (getNextConfig() as { partialPrefetching?: unknown }).partialPrefetching === true
-}
-
-/** `experimental.appShells` from next.config. */
-function appShellsEnabled(): boolean {
-  const experimental = getNextConfig().experimental
-  if (!experimental || typeof experimental !== 'object') return false
-  return (experimental as { appShells?: unknown }).appShells === true
-}
-
-/**
- * App Shells: the body prefetch of a runtime-prefetch route serves the SHARED (param-independent)
- * shell, so the render must leave `params` HANGING - the params-dependent subtree stays behind its
- * <Suspense> fallback and the client caches the response at the fallback vary path, reusable for
- * every param. Request data (cookies/headers) still resolves: it is not URL-derived.
- *
- * Strictly opt-in. WITHOUT `appShells` a runtime prefetch is per-URL and its params MUST resolve.
- * An `unstable_eager` segment is excluded even under App Shells: eager routes keep their per-link
- * Speculative prefetch, which carries that param's own content.
- */
-function appShellFallbackParams(route: RouteManifestEntry): boolean {
-  if (!appShellsEnabled()) return false
-  return route.segmentConfig?.prefetch !== 'unstable_eager'
-}
-
 function validateRscRequestHeaders(): boolean {
-  const experimental = getNextConfig().experimental
-  if (!experimental || typeof experimental !== 'object') return false
   return (
-    (experimental as { validateRSCRequestHeaders?: unknown }).validateRSCRequestHeaders === true
+    nextExperimental<{ validateRSCRequestHeaders: unknown }>().validateRSCRequestHeaders === true
   )
 }
 
@@ -143,7 +100,7 @@ function deploymentId(): string {
 }
 
 /** Effective staleTime (seconds) for a route of the given disposition. */
-function staleTimeSecondsFor(isStatic: boolean): number {
+export function staleTimeSecondsFor(isStatic: boolean): number {
   const configured = configuredStaleTimes()
   if (isStatic) return configured.static ?? DEFAULT_STATIC_STALE_TIME_SECONDS
   return configured.dynamic ?? DEFAULT_DYNAMIC_STALE_TIME_SECONDS
@@ -152,24 +109,31 @@ function staleTimeSecondsFor(isStatic: boolean): number {
 /** The segment-prefetch header value, or null when this isn't a segment prefetch. */
 function segmentPrefetchTarget(request: Request): string | null {
   if (request.headers.get(RSC_HEADER) !== '1') return null
+  // A runtime prefetch (`next-router-prefetch: 2`) asks for the whole route body.
+  if (runtimePrefetchRequest(request)) return '/_index'
   return request.headers.get(NEXT_ROUTER_SEGMENT_PREFETCH_HEADER)
 }
 
-let segmentRevalidationVersion = 0
-
-/** Bumps the segment-prefetch revalidation epoch; called by the registrar's revalidation invalidator hook. */
-export function bumpSegmentRevalidationVersion(): void {
-  segmentRevalidationVersion += 1
+/** A runtime prefetch: `2` (this URL's own) or `3` (the route's runtime App Shell). */
+function runtimePrefetchRequest(request: Request): boolean {
+  return (
+    /^[23]$/.test(request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) ?? '') &&
+    !request.headers.has(NEXT_ROUTER_SEGMENT_PREFETCH_HEADER)
+  )
 }
-const segmentArtifactVersions = new Map<string, number>()
 
-// NOTE: there is deliberately NO server-side "the client's `_rsc` predates the last revalidation,
-// bounce it to a fresh CDN key" redirect. Next never issues one: `_rsc` is derived from the
-// request's negotiation headers, and freshness after a revalidation comes from the server
-// re-rendering the stale artifact, not from rotating the URL. A version bounce here would leak
-// server state ACROSS browser sessions, so every page load after a revalidation replays a hash the
-// server has already seen at an older version and its first prefetch answers 302 instead of the
-// payload - which router-act cannot intercept.
+/** The route's root params (at or above a root layout): a runtime App Shell keeps them concrete. */
+function rootParamNames(config: ResolvedConfig, route: RouteManifestEntry): string[] {
+  const names = appRootParams(config)
+  return route.params.filter(name => names.has(name))
+}
+
+const TREE_WARM_MS = 1000
+/** Tree prefetches whose shell warm still waits for the body prefetch that follows. */
+const pendingTreeWarms = new Map<string, ReturnType<typeof setTimeout>>()
+
+// No server-side "`_rsc` predates the last revalidation" bounce: Next never issues one, and it would
+// leak server state across browser sessions (a replayed hash answering 302 instead of the payload).
 
 /**
  * A cache-busting redirect to a per-variant `_rsc` URL, byte-for-byte Next's wire form (307 + a
@@ -208,6 +172,9 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
   const method = request.method.toUpperCase()
   if (method !== 'GET' && method !== 'HEAD') return undefined
   if (segment === null && request.headers.has('x-pnext-soft-nav')) return undefined
+  // next.config redirects precede every RSC response, as on the full-render path.
+  const redirect = await redirectInterceptor(request, ctx)
+  if (redirect) return redirect
 
   const runtime = getRequestRuntime()
   if (!runtime) return undefined
@@ -233,7 +200,7 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
 
   // The `_rsc` cache-buster is a CDN key, not an app param: it never reaches
   // route matching.
-  const selection = selectRouteForRequest(runtime.routes, matchPathname, undefined)
+  const selection = selectRouteForRequest(runtime.routes, matchPathname, undefined, request.headers)
 
   // A pnext-router prefetch carries the origin's nav state. When an
   // interception entry targets this URL from that origin, the segment/RSC
@@ -245,7 +212,7 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
   if (
     prefetchNav &&
     ((prefetchNav.children &&
-      matchInterception(runtime.routes, matchPathname, prefetchNav.children)) ||
+      matchInterception(runtime.routes, matchPathname, prefetchNav.children, request.headers)) ||
       (selection?.route.kind === 'page' &&
         (selection.route.slotDirs?.length || selection.route.synthetic)))
   ) {
@@ -253,8 +220,21 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
   }
   const isStatic = selection?.route.kind === 'page' && selection.route.mode === 'static'
 
+  // A tree prefetch warms the URL's shell, but its body prefetch (served first, so the client learns
+  // it was a fallback and retries) takes the scheduling over when it arrives in time.
   if (segment === TREE_SEGMENT_PATH && selection?.route.kind === 'page' && selection.route.ppr) {
-    schedulePprShellUpgrade({ config, route: selection.route, url: new URL(request.url) })
+    const route = selection.route
+    if (!pendingTreeWarms.has(matchPathname)) {
+      pendingTreeWarms.set(
+        matchPathname,
+        setTimeout(() => {
+          pendingTreeWarms.delete(matchPathname)
+          void pprShell().then(shell =>
+            shell.schedulePprShellUpgrade({ config, route, url: new URL(request.url) }),
+          )
+        }, TREE_WARM_MS).unref(),
+      )
+    }
   }
 
   if (segment === null) {
@@ -316,159 +296,95 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
     )
   }
 
-  // Beyond `/_tree`: serve a framed segment payload. A segment request must
-  // never fall through to the document/static-file path, which would pair
-  // text/x-component headers with a full HTML document.
+  // Beyond `/_tree`: a framed segment payload. A segment request never falls through to the
+  // document/static path, which would pair text/x-component headers with a full HTML document.
   if (segment !== TREE_SEGMENT_PATH) {
-    if (selection?.route.kind !== 'page') {
-      return withRewriteHeaders(segmentMissResponse(), rewriteHeaders)
-    }
-    const routeId = selection.route.id
-    const file = bodySegmentFile(config.outPath, routeId)
-    const meta = readSegmentMeta(config.outPath, routeId)
-    // `/_layout`: w9-segment-split. The client holds a cached PAGE frame for
-    // this URL (its vary set does not contain the param that changed) but its
-    // LAYOUT frame missed, so it asks for the layout alone. Render the route and
-    // cut the page's markup out of the document: the response carries the layout
-    // chain only, keyed on the LAYOUT vary set, and the client splices its
-    // cached page frame back in (compat/segment/page-slot.ts).
-    if (segment === LAYOUT_SEGMENT_PATH) {
-      const rendered = await renderRuntimeSegment({
+    const miss = () => withRewriteHeaders(segmentMissResponse(), rewriteHeaders)
+    if (selection?.route.kind !== 'page') return miss()
+    const route = selection.route
+    const meta = readSegmentMeta(config.outPath, route.id)
+    const isBodySegment = segment === ROUTE_SEGMENT_PATH || segment === '/_index'
+    const renderSegment = () =>
+      renderRuntimeSegment({
         config,
         selection,
         pathname: matchPathname,
         url,
         request,
-        // NOT truncated at the loading boundary. A truncated render serves the route's baked fallback
-        // shell, whose params HANG - the layout never reads them, so the response would publish an
-        // EMPTY vary set and the client would share one layout frame across every param value. The
-        // page's markup is cut out of the finished document instead, which costs a full render but
-        // keeps the layout's vary set honest.
         nav: prefetchNav,
       })
-      if (!rendered) return withRewriteHeaders(segmentMissResponse(), rewriteHeaders)
+    // `/_layout`: the document with the page's markup cut out, keyed on the LAYOUT vary set. Not
+    // truncated at the loading boundary: a baked fallback shell never read the params and would
+    // publish an empty set, sharing one layout frame across every param value.
+    if (segment === LAYOUT_SEGMENT_PATH) {
+      const rendered = await renderSegment()
+      if (!rendered) return miss()
       return withRewriteHeaders(
-        segmentBodyResponse(
-          stripPageSlotContent(rendered.body),
-          effectiveStaleTime(meta, true),
-          // A layout frame is never the whole page: the navigation still needs
-          // the page frame (from cache, or from its own dynamic request).
-          true,
-          isStatic,
-          deploymentId(),
+        segmentBodyResponse({
+          body: stripPageSlotContent(rendered.body),
+          staleTime: effectiveStaleTime(meta, true),
+          postponed: true,
+          prerendered: isStatic,
+          deploymentId: deploymentId(),
           segment,
-          // An EMPTY tracked set on a route that HAS params means the render read none of them -
-          // either true (a param-independent layout) or an artifact of the document coming back from
-          // a prerender cache. The two are indistinguishable here and the failure modes are not
-          // symmetric: over-varying costs a cache hit, under-varying serves one param's layout for
-          // another. So publish NO vary set and let the client key the frame on its exact URL.
-          varyTrusted(rendered.vary, selection, 'layout')
+          // An empty tracked set on a params route is indistinguishable from an untracked prerender
+          // cache hit; under-varying serves one param's layout for another, so publish none.
+          vary: varyTrusted(rendered.vary, selection, 'layout')
             ? segmentVaryInfo(rendered.vary, 'layout', selection)
             : undefined,
-        ),
+        }),
         rewriteHeaders,
       )
     }
-    // `/_page`: the inverse frame of `/_layout`. The client already renders this route's layout chain
-    // - it is navigating WITHIN it, or holds a valid cached layout frame - so it asks for the page
-    // slot alone. The response carries the slot markers plus the page's own markup and NOTHING above
-    // them. Rendered like `/_layout`: NOT truncated at the loading boundary, so the tracked vary set
-    // is the page's honest param access.
+    // `/_page`: the page slot alone (the client owns the layout chain), tracked honestly like `/_layout`.
     if (segment === PAGE_SEGMENT_PATH) {
-      const rendered = await renderRuntimeSegment({
-        config,
-        selection,
-        pathname: matchPathname,
-        url,
-        request,
-        nav: prefetchNav,
-      })
-      if (!rendered) return withRewriteHeaders(segmentMissResponse(), rewriteHeaders)
+      const rendered = await renderSegment()
+      if (!rendered) return miss()
       const frame = pageSlotFrame(rendered.body)
-      // No page slot (a document whose renderer dropped the markers, a global
-      // error page): the frame cannot be proven to line up, so answer a MISS and
-      // let the client hard-fall-back to the whole document.
-      if (frame === null) return withRewriteHeaders(segmentMissResponse(), rewriteHeaders)
+      // No page slot (markers dropped, a global error page): the frame cannot line up, so MISS.
+      if (frame === null) return miss()
       return withRewriteHeaders(
-        segmentBodyResponse(
-          frame,
-          // Rendered for the NAVIGATION: a dynamic route's frame carries
-          // request data, so it reuses for the dynamic window only.
-          effectiveStaleTime(meta, isStatic),
-          // A page frame is never the whole document: whatever consumes it still
-          // owns the layout chain around it.
-          true,
-          isStatic,
-          deploymentId(),
+        segmentBodyResponse({
+          body: frame,
+          // A postponed frame's static stage is the shell: it reuses for the shell's window.
+          staleTime: rendered.postponed
+            ? shellStaleSeconds(route)
+            : effectiveStaleTime(meta, isStatic),
+          postponed: true,
+          prerendered: isStatic,
+          deploymentId: deploymentId(),
           segment,
-          varyTrusted(rendered.vary, selection, 'page')
+          vary: varyTrusted(rendered.vary, selection, 'page')
             ? segmentVaryInfo(rendered.vary, 'page', selection)
             : undefined,
-        ),
+        }),
         rewriteHeaders,
       )
     }
-    // App Shells, second request: the client asks for the route's SHARED shell explicitly. Unlike the
-    // runtime-prefetch branch below - which only fires for `allow-runtime`/`unstable_instant` routes -
-    // this serves a FULLY STATIC route's param-independent shell too: `params` hang, so the
-    // params-dependent subtree stays behind its fallback and the response's empty vary set files it at
-    // the fallback vary path. Strictly opt-in: without `experimental.appShells` the marker is ignored.
-    if (
-      (segment === ROUTE_SEGMENT_PATH || segment === '/_index') &&
-      appShellsEnabled() &&
-      request.headers.get(APP_SHELL_PREFETCH_HEADER) === '1'
-    ) {
-      const shell = await renderInstantPrefetchShell({
-        config,
-        selection,
-        pathname: matchPathname,
-        url,
-        request,
-        fallbackParams: true,
-      })
-      if (!shell) return withRewriteHeaders(segmentMissResponse(), rewriteHeaders)
+    // `/_head`: the outlined dynamic head of a full prefetch, fetched as its own response.
+    if (segment === HEAD_SEGMENT_PATH) {
+      const rendered = await renderSegment()
+      const title = rendered ? extractDocumentTitle(rendered.body) : null
+      if (title === null) return miss()
       return withRewriteHeaders(
-        segmentBodyResponse(
-          shell.html,
-          effectiveStaleTime(meta, true),
-          true,
-          // A shared shell is a pure function of the ROUTE (its params hung),
-          // so the client may serve it for any URL of that route — which its
-          // reuse policy allows only for static payloads.
-          isStatic ||
-            (selection.route.hasStaticParams === true && selection.route.usesRequest !== true),
-          deploymentId(),
+        segmentBodyResponse({
+          body: title,
+          staleTime: effectiveStaleTime(meta, false),
+          deploymentId: deploymentId(),
           segment,
-          segmentVaryInfo(shell.vary, 'body', selection),
-        ),
+          vary: segmentVaryInfo(rendered!.vary, 'head', selection),
+        }),
         rewriteHeaders,
       )
     }
-    // A FULL prefetch of a Partial-Prefetching route is served exactly like a
-    // default (partial) one — static shell, dynamic boundaries left as holes —
-    // and marked so the requesting client still treats it as a shell (the
-    // navigation fetches the dynamic continuation).
+    // A FULL prefetch of a Partial Prefetching route is served like a default one (static shell,
+    // dynamic boundaries left as holes) and marked so the client still treats it as a shell.
     const partialPrefetchDowngrade =
-      request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) !== '1' &&
-      routePartialPrefetch(selection.route)
+      !request.headers.has(NEXT_ROUTER_PREFETCH_HEADER) && routeRuntimePrefetch(route)
     const partialPrefetch =
       request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) === '1' || partialPrefetchDowngrade
-    const runtimePrefetch = routeUsesRuntimePrefetch(selection.route)
-    // Partial Prefetching under App Shells: a route declaring `export const prefetch = 'partial'`
-    // relies on its SHARED app shell, so the per-link Speculative prefetch must not additionally fetch
-    // that param's own content. Answering the per-link default prefetch with the shared shell (params
-    // hang, empty vary set) collapses two requests into the one that carries the shell, and the empty
-    // vary set files the entry at the fallback vary path so revealing another param needs nothing from
-    // the server.
-    //
-    // Strictly scoped: `experimental.appShells` plus the segment's OWN `prefetch = 'partial'` opt-in.
-    // The global `partialPrefetching` config and `unstable_eager` are deliberately excluded.
-    if (
-      (segment === ROUTE_SEGMENT_PATH || segment === '/_index') &&
-      request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) === '1' &&
-      appShellsEnabled() &&
-      selection.route.segmentConfig?.prefetch === 'partial'
-    ) {
+    const runtimePrefetch = routeUsesRuntimePrefetch(route)
+    const serveSharedShell = async (prerendered: boolean) => {
       const shell = await renderInstantPrefetchShell({
         config,
         selection,
@@ -477,44 +393,38 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
         request,
         fallbackParams: true,
       })
-      if (shell) {
-        return withRewriteHeaders(
-          segmentBodyResponse(
-            shell.html,
-            effectiveStaleTime(meta, true),
-            // A shell, not the whole page: the navigation still fetches the
-            // param-specific continuation behind the boundary.
-            true,
-            // A pure function of the ROUTE (its params hung), so the client may
-            // paint it for any URL of that route — which its reuse policy allows
-            // only for payloads marked static.
-            true,
-            deploymentId(),
-            segment,
-            segmentVaryInfo(shell.vary, 'body', selection),
-          ),
-          rewriteHeaders,
-        )
-      }
+      return shell
+        ? withRewriteHeaders(
+            segmentBodyResponse({
+              body: shell.html,
+              staleTime: effectiveStaleTime(meta, true),
+              // A shell, not the page: the navigation still fetches the continuation.
+              postponed: true,
+              // A pure function of the ROUTE (its params hung): paintable for any URL of the route.
+              prerendered,
+              deploymentId: deploymentId(),
+              segment,
+              vary: segmentVaryInfo(shell.vary, 'body', selection),
+            }),
+            rewriteHeaders,
+          )
+        : null
     }
-    // A route that opts into runtime prefetching (`unstable_instant` or `export const prefetch =
-    // 'allow-runtime'`) renders its BODY prefetch as a RUNTIME-PREFETCH prerender: the response
-    // samples request data while connection()-gated content is omitted, and nothing from this
-    // request-sampled render is persisted. The client caches it as a shell, so the navigation still
-    // fetches the dynamic continuation.
-    //
-    // The selection is the ROUTE's opt-in, NOT the prefetch header: the client ALWAYS sends
-    // `next-router-prefetch: 1`, so gating on the header would never let the shell render. It stays
-    // scoped to the body segment and yields to an explicit partial-prefetch (static) downgrade.
+    // A runtime prefetch (`2`/`3`), or a route opting into runtime-prefetch rendering (`unstable_instant`,
+    // `allow-runtime`): the body is a request-sampled prerender, never persisted. The route's opt-in, not
+    // the header, selects it: the client always sends `next-router-prefetch: 1`.
     if (
-      // The client sends '/_index' as the body-segment key (router.ts
-      // SEGMENT_PREFETCH_HEADER); ROUTE_SEGMENT_PATH ('/') covers direct/legacy
-      // callers. Both mean the whole-route body.
-      (segment === ROUTE_SEGMENT_PATH || segment === '/_index') &&
+      isBodySegment &&
       !partialPrefetchDowngrade &&
-      routeRuntimePrefetchRender(selection.route)
+      (runtimePrefetchRequest(request) || routeRuntimePrefetchRender(route))
     ) {
-      const fallbackParams = appShellFallbackParams(selection.route)
+      // A `2` is this URL's own: params resolve. The default prefetch of an App Shell route hangs them.
+      const fallbackParams = !runtimePrefetchRequest(request) && routeRuntimePrefetch(route)
+      // `3` is the runtime App Shell: only root params stay concrete.
+      const appShell =
+        request.headers.get(NEXT_ROUTER_PREFETCH_HEADER) === '3'
+          ? rootParamNames(config, route)
+          : undefined
       const instant = await renderInstantPrefetchShell({
         config,
         selection,
@@ -522,214 +432,104 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
         url,
         request,
         fallbackParams,
+        appShell,
+        nav: prefetchNav,
       })
       if (instant) {
-        // A `pprMetadata` route's <title> is DYNAMIC (generateMetadata reads a param) while this shared
-        // shell body legitimately varies on nothing: leaving the title inside it would under-vary the body
-        // on its own head and serve one slug's title for another. Outline it here too - the client
-        // re-fetches `/_head` per URL - exactly as the baked/full prefetch path below does.
+        // A `pprMetadata` route's <title> is dynamic while this shared body varies on nothing: outline
+        // it so the client fetches `/_head` per URL, as the baked path below does.
         let instantHtml = instant.html
         let instantHeadOutlined = false
-        if (selection.route.pprMetadata === true) {
+        if (route.pprMetadata === true) {
           const outlined = outlineDocumentTitle(instantHtml)
           if (outlined) {
             instantHtml = outlined
             instantHeadOutlined = true
           }
         }
-        // This response owns its window (computed just below from what the
-        // sampled render really resolved). Drop the request-level `use cache`
-        // aggregate so the header finalizer does not overwrite it with the
-        // route's longer public-cache window.
+        // This response owns its window: drop the request-level `use cache` aggregate so the header
+        // finalizer does not overwrite it with the route's longer public-cache window.
         takeCacheLifeStash()
-        const response = segmentBodyResponse(
-          instantHtml,
-          // A request-sampled payload reuses for the SHORTEST window it sampled,
-          // never the route's baked (public-cache) one: the private caches whose
-          // values ride in this response go stale first.
-          instant.staleSeconds !== undefined
-            ? Math.min(instant.staleSeconds, effectiveStaleTime(meta, true))
-            : effectiveStaleTime(meta, true),
-          true,
-          isStatic,
-          deploymentId(),
+        const response = segmentBodyResponse({
+          body: instantHtml,
+          // Request-sampled: reuses for the SHORTEST window it sampled (private caches included).
+          staleTime:
+            instant.staleSeconds !== undefined
+              ? Math.min(instant.staleSeconds, effectiveStaleTime(meta, true))
+              : effectiveStaleTime(meta, true),
+          postponed: true,
+          prerendered: isStatic,
+          deploymentId: deploymentId(),
           segment,
-          varyTrusted(
+          vary: varyTrusted(
             instant.vary,
             selection,
             'body',
             fallbackParams,
-            // This render always happened LIVE, so an explicit `allow-runtime`
-            // route's empty set is the truth: nothing was read before the
-            // render postponed, and every param shares one loading shell.
-            routeExplicitRuntimePrefetch(selection.route),
+            // A live render: an explicit `allow-runtime` route's empty set is the truth.
+            appShell !== undefined || routeExplicitRuntimePrefetch(route),
           )
             ? segmentVaryInfo(instant.vary, 'body', selection)
             : undefined,
-        )
-        // Dedicated marker for the client: ONLY a runtime-prefetch (instant)
-        // shell downgrades a full prefetch to shell semantics. The generic
-        // postponed flag also rides ordinary PPR full renders, which stream
-        // their resumed content and MUST keep committing without a refetch
-        // (app-client-cache full-prefetch contract).
+        })
+        // Only a runtime-prefetch shell downgrades a full prefetch to shell semantics (ordinary PPR
+        // full renders also carry the postponed flag while streaming complete content).
         response.headers.set('x-pnext-runtime-prefetch', '1')
         if (instantHeadOutlined) {
           response.headers.set('x-pnext-head-outlined', headFetchedFirst(selection) ? 'first' : '1')
         }
-        // A COMPLETE runtime prefetch (the render never postponed - the page reads only cookies/params and
-        // does no uncached IO) lets the client commit the following navigation network-free. The response
-        // itself stays `postponed` on the wire: it is request-sampled, so it must never become
-        // CDN-cacheable nor commit through the whole-document caches.
-        if (!instant.postponed) response.headers.set('x-pnext-runtime-complete', '1')
+        // A COMPLETE runtime prefetch (never postponed) lets the navigation commit network-free; it
+        // stays `postponed` on the wire so a request-sampled payload never becomes CDN-cacheable.
+        // Next: the runtime shell of a page that prerendered whole is runtime-complete.
+        if (!instant.postponed || (appShell && (route.builtStatic ?? route.pprHoles?.length === 0)))
+          response.headers.set('x-pnext-runtime-complete', '1')
+        if (runtimePrefetchRequest(request)) response.headers.set('cache-control', 'no-store')
         return withRewriteHeaders(response, rewriteHeaders)
       }
     }
-    let body =
-      partialPrefetch && (meta?.postponed !== true || !runtimePrefetch)
-        ? await readBakedSegment({ config, selection, pathname: matchPathname, file })
-        : undefined
-    const baked = body !== undefined
-    // A default (partial) prefetch of a dynamic page with no baked segment must NOT fall through to a
-    // live render: Next answers such prefetches from static data only, and a hanging dynamic render
-    // would pin the prefetch connection open forever. Routes that opt into runtime prefetching keep
-    // the live render. Exception: a pure params-derived route (generateStaticParams, no request data)
-    // IS static content and its live render cannot hang, so it keeps the full render - it can lack a
-    // baked segment when its fallback shell failed to bake.
+    // A Partial Prefetching route always answers from its prerenders: its URL data rides the `2`.
+    const baked =
+      partialPrefetch &&
+      (routeRuntimePrefetch(route) || meta?.postponed !== true || !runtimePrefetch)
+        ? await bakedBody(config, selection, url, meta)
+        : null
+    // A default prefetch of a dynamic page with no baked segment must not live-render: Next answers
+    // such prefetches from static data only, and a hanging dynamic render would pin the connection.
+    // Exceptions that cannot hang: runtime-prefetch routes, pure params-derived routes, prerendered
+    // param sets, static routes, and routes with a loading/Suspense boundary (truncated render).
     const paramsOnlyStatic =
-      (selection.route.hasStaticParams === true && selection.route.usesRequest !== true) ||
-      clientStaticPrefetchable(selection.route)
-    // A route with a LOADING boundary renders a truncated loading shell on a default prefetch (Next's
-    // "show layout eagerly with loading one level down") - the render stops at the boundary, so it never
-    // hangs. Only a dynamic route with NO loading/Suspense boundary would pin the connection open, so the
-    // miss short-circuit applies just to those.
-    const hasLoadingShell = routeHasLoadingBoundary(selection.route)
-    // A route the build already prerendered for THIS param set (generateStaticParams)
-    // has a known-good static shell: the prefetch renders that shell truncated at
-    // its Suspense boundary (dynamic content stays a hole), so it cannot hang even
-    // though the route reads request data (connection()) inside the boundary.
-    const paramPrerendered = routeParamPrerendered(selection.route, selection.params)
-    // A params-derived route normally serves its complete content on a default prefetch - but only
-    // when the build actually knows that content. When THIS param set was never enumerated by
-    // generateStaticParams and the route has a `loading` boundary, its page is dynamic for this URL
-    // and the default prefetch stops at the loading shell. Truncating there also keeps the published
-    // vary set to what the shell really read, so every itemId of a category shares one entry.
-    const truncateAtLoading = routeHasLoadingFile(selection.route) && !paramPrerendered
-    // A fully STATIC route with no baked segment (no cacheComponents build)
-    // also live-renders: its content is static data Next serves complete on a
-    // default prefetch, and the render cannot hang.
-    if (
+      (route.hasStaticParams === true && route.usesRequest !== true) ||
+      clientStaticPrefetchable(route)
+    const hasLoadingShell = routeHasLoadingBoundary(route)
+    const paramPrerendered = paramsPrerendered(route, selection.params)
+    // Params not enumerated by generateStaticParams on a `loading` route: the page is dynamic for this
+    // URL, so the default prefetch stops at the loading shell (and its vary set stays honest).
+    const truncateAtLoading = routeHasLoadingFile(route) && !paramPrerendered
+    const unbakedDynamic =
       partialPrefetch &&
       !runtimePrefetch &&
-      body === undefined &&
+      baked === null &&
       !paramsOnlyStatic &&
       !paramPrerendered &&
-      !isStatic &&
-      !hasLoadingShell
-    ) {
-      return withRewriteHeaders(segmentMissResponse(), rewriteHeaders)
+      !isStatic
+    if (unbakedDynamic && !hasLoadingShell) return miss()
+    // Kept alive by an in-page <Suspense> boundary: Next answers the default prefetch with the
+    // route's SHARED fallback shell (params hang, one entry for every param value).
+    if (isBodySegment && unbakedDynamic && !routeHasLoadingFile(route)) {
+      const shared = await serveSharedShell(true)
+      if (shared) return shared
     }
-    // Segment-M2 deliverable 4: exactly the routes the miss short-circuit above
-    // used to swallow, now kept alive by an IN-PAGE <Suspense> boundary. Next
-    // answers their default prefetch with the route's SHARED fallback shell:
-    // params hang, so the params-dependent child stays behind its Suspense
-    // fallback and the (empty) vary set files ONE entry the client reuses for
-    // every param value. A concrete-params render would record the child's param
-    // access instead and key an identical fallback per URL. Same conditions as
-    // the short-circuit, so no route that already served content changes shape;
-    // a shell that fails to render falls through to the live truncated render.
-    if (
-      (segment === ROUTE_SEGMENT_PATH || segment === '/_index') &&
-      partialPrefetch &&
-      !runtimePrefetch &&
-      body === undefined &&
-      !paramsOnlyStatic &&
-      !paramPrerendered &&
-      !isStatic &&
-      !routeHasLoadingFile(selection.route)
-    ) {
-      const shell = await renderInstantPrefetchShell({
-        config,
-        selection,
-        pathname: matchPathname,
-        url,
-        request,
-        fallbackParams: true,
-      })
-      if (shell) {
-        return withRewriteHeaders(
-          segmentBodyResponse(
-            shell.html,
-            effectiveStaleTime(meta, true),
-            // A shell, not the whole page: the navigation still fetches the
-            // dynamic continuation behind the boundary.
-            true,
-            // A pure function of the ROUTE (its params hung), so the client may
-            // paint it for any URL of that route — which its reuse policy allows
-            // only for payloads marked static.
-            true,
-            deploymentId(),
-            segment,
-            segmentVaryInfo(shell.vary, 'body', selection),
-          ),
-          rewriteHeaders,
-        )
-      }
-    }
-    // `/_head`: the outlined dynamic head (metadata) of a full prefetch. The
-    // client fetches it as a follow-up to an /_index response marked
-    // x-pnext-head-outlined, so the title arrives in its own response AFTER
-    // the page content (Next fetches metadata separately from segment data,
-    // and the suites assert that response order).
-    if (segment === HEAD_SEGMENT_PATH) {
-      const rendered = await renderRuntimeSegment({
-        config,
-        selection,
-        pathname: matchPathname,
-        url,
-        request,
-        nav: prefetchNav,
-      })
-      const title = rendered ? extractDocumentTitle(rendered.body) : null
-      if (title === null) return withRewriteHeaders(segmentMissResponse(), rewriteHeaders)
-      return withRewriteHeaders(
-        segmentBodyResponse(
-          title,
-          effectiveStaleTime(meta, false),
-          false,
-          false,
-          deploymentId(),
-          segment,
-          // The head segment publishes the HEAD vary set — generateMetadata's
-          // own param access, tracked separately from the page body's.
-          segmentVaryInfo(rendered!.vary, 'head', selection),
-        ),
-        rewriteHeaders,
-      )
-    }
+    let body: string
     let postponed: boolean
-    // Segment-M2: the vary set of the live render, when one happened. A BAKED
-    // segment was produced at build time outside any tracking scope, so it stays
-    // undefined and the client keys that entry on the exact URL.
+    /** The vary set of the live render, or the baked artifact's recorded one; undefined keys on the URL. */
     let bodyVary: ResponseVaryParams | undefined
-    // The set came off the BAKED `route.segment.meta`, i.e. the BUILD already applied its own trust rule
-    // before persisting it - and only the build has the evidence (was the render tracked? did its params
-    // hang?). Re-testing it below with the REQUEST-render rule would discard a fallback shell's honest
-    // empty set. Presence in the meta IS the trust.
-    let bakedVaryFromMeta = false
-    // True when this response is a render TRUNCATED at the route's `loading`
-    // boundary (see `truncateAtLoading`): the shell above the boundary, with the
-    // dynamic page left as a hole.
+    let bakedVaryTrusted = false
     let truncatedShell = false
-    /** The live render's own `use cache` window, when one rendered. */
     let renderStaleSeconds: number | undefined
-    if (body === undefined) {
-      // A route that only IMPLIED runtime prefetching (it reads searchParams, so a baked segment must
-      // not alias across search values) still follows the default-prefetch contract: the render is
-      // truncated at its loading/Suspense shell, never a full dynamic render. Only an explicit
-      // `allow-runtime` serves runtime data on a partial prefetch, and a pure params-derived route
-      // serves its complete static content.
-      truncatedShell =
-        partialPrefetch && !routeExplicitRuntimePrefetch(selection.route) && truncateAtLoading
+    if (baked === null) {
+      // An implied runtime-prefetch route (it reads searchParams) still follows the default-prefetch
+      // contract: truncated at its loading shell, never a full dynamic render.
+      truncatedShell = partialPrefetch && !routeExplicitRuntimePrefetch(route) && truncateAtLoading
       const rendered = await renderRuntimeSegment({
         config,
         selection,
@@ -738,73 +538,63 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
         request,
         keepPrefetchHeader:
           partialPrefetch &&
-          !routeExplicitRuntimePrefetch(selection.route) &&
+          !routeExplicitRuntimePrefetch(route) &&
           (!paramsOnlyStatic || truncateAtLoading),
         nav: prefetchNav,
       })
-      if (!rendered) return withRewriteHeaders(segmentMissResponse(), rewriteHeaders)
+      if (!rendered) return miss()
       body = rendered.body
       bodyVary = rendered.vary
       renderStaleSeconds = rendered.staleSeconds
-      // A truncated (loading-shell) prefetch is often answered from the route's baked PPR SUB-SHELL, so
-      // the request tracked no param access even though the bytes are a known function of the sub-shell's
-      // own params. Publish those instead of "unknown" - otherwise every itemId of one category re-fetches
-      // a byte-identical shell.
+      // A truncated prefetch answered from a baked sub-shell tracked no param access even though the
+      // bytes are a function of the sub-shell's params: publish those instead of "unknown".
       if (
         truncateAtLoading &&
         bodyVary.params.length === 0 &&
         !bodyVary.search &&
         Object.keys(selection.params).length > 0
       ) {
-        bodyVary = subShellVary(selection.route, selection.params) ?? bodyVary
+        bodyVary = subShellVary(route, selection.params) ?? bodyVary
       }
-      // The same artifact, one level up: a render answered from this URL's own
-      // BUILD prerender executes no user code, so it tracks nothing even though
-      // the build render recorded exactly what each segment read. Publish the
-      // persisted sets (`route.prerenderVary`) rather than "unknown".
-      if (bodyVary.params.length === 0 && !bodyVary.search) {
-        bodyVary = prerenderVary(selection.route, matchPathname) ?? bodyVary
-      }
-      postponed = rendered.postponed || (partialPrefetch && meta?.postponed === true)
-      // unstable_dynamicOnHover resume: the client already holds this route's
-      // static shell (x-pnext-resume-shell) and a full hover prefetch must not
-      // re-send static content it has cached. Strip the document down to its
-      // streamed dynamic chunks; the client merges them into its shell.
+      postponed =
+        rendered.postponed ||
+        (partialPrefetch &&
+          meta?.postponed === true &&
+          route.segmentConfig?.ensureStatic !== 'navigation')
+      // unstable_dynamicOnHover resume: the client holds the static shell, so send only the
+      // streamed dynamic chunks.
       if (!partialPrefetch && request.headers.get('x-pnext-resume-shell') === '1') {
         const resume = resumeOnlyDocument(body)
         if (resume) {
-          const response = segmentBodyResponse(
-            resume,
-            effectiveStaleTime(meta, false),
-            false,
-            false,
-            deploymentId(),
+          const response = segmentBodyResponse({
+            body: resume,
+            staleTime: effectiveStaleTime(meta, false),
+            deploymentId: deploymentId(),
             segment,
-            varyTrusted(rendered.vary, selection, 'body')
+            vary: varyTrusted(rendered.vary, selection, 'body')
               ? segmentVaryInfo(rendered.vary, 'body', selection)
               : undefined,
-          )
+          })
           response.headers.set('x-pnext-resume-only', '1')
           return withRewriteHeaders(response, rewriteHeaders)
         }
       }
     } else {
-      postponed = meta?.postponed === true
-      // Segment-M2: a BAKED body carries the vary set its BUILD render tracked
-      // (persisted into `route.segment.meta`). Without it every prerendered
-      // route keys on its exact URL and re-fetches the shared shell for every
-      // param value. Absent (an older/untracked artifact) stays "unknown".
-      bodyVary = meta?.vary ? responseVaryParamsFromWire(meta) : undefined
-      bakedVaryFromMeta = bodyVary !== undefined
+      body = baked.html
+      postponed = baked.postponed
+      bodyVary = baked.vary
+      // The build applied its own trust rule (did the render track? did its params hang?) before
+      // persisting the set; presence IS the trust.
+      bakedVaryTrusted = bodyVary !== undefined
     }
-    // A FULL prefetch of a route with DYNAMIC metadata: outline the <title> out of this response -
-    // the client fetches it via `/_head` as a separate, LATER response and merges it back before
-    // caching (Next serves the head separately, and the suites assert that order). A PARTIAL prefetch
-    // outlines too: its body is just as shared across params. A baked route-level shell was rendered
-    // with the params hanging and carries NO <title> at all, but the head is dynamic all the same, so
-    // mark it outlined and let the client fetch `/_head`.
+    // Dynamic metadata: outline the <title> so the client fetches it via `/_head` as a later response.
+    // A params-hanging shell carries no <title> at all, but the head is dynamic all the same.
+    // So is a head that reads params the shared body does not.
     let headOutlined = false
-    if (selection.route.pprMetadata === true) {
+    if (
+      route.pprMetadata === true ||
+      bodyVary?.head.some(name => !bodyVary.params.includes(name))
+    ) {
       const outlined = outlineDocumentTitle(body)
       if (outlined) {
         body = outlined
@@ -813,144 +603,186 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
         headOutlined = true
       }
     }
-    const completePrerender = baked && !postponed
-    // A postponed (shell-only) prefetch response carries only static data, so its shell reuses for the
-    // STATIC window regardless of the route's mode. Likewise a DEFAULT prefetch of a route that never
-    // reads request data: its content is a pure function of the URL, so even a complete live render reuses
-    // for the static window.
+    const completePrerender = baked !== null && !postponed
+    // A postponed (shell-only) response carries static data only, so it reuses for the STATIC window
+    // whatever the route's mode; so does a default prefetch of a route that never reads request data.
     const routeStaleTime = completePrerender
       ? meta && meta.staleTime > 0
         ? meta.staleTime
         : staleTimeSecondsFor(true)
       : effectiveStaleTime(
           meta,
-          postponed ||
-            isStatic ||
-            (partialPrefetch && (!selection.route.usesRequest || paramsOnlyStatic)),
+          postponed || isStatic || (partialPrefetch && (!route.usesRequest || paramsOnlyStatic)),
         )
-    // A RUNTIME-PREFETCH answer (`prefetch = 'allow-runtime'` downgrading a full
-    // prefetch) carries request-sampled data, so it goes stale with the SHORTEST
-    // cache the render resolved — typically a `use cache: private` window — not
-    // with the route's baked public-cache window.
+    // A request-sampled downgrade goes stale with the shortest cache it resolved.
     const staleTime =
       partialPrefetchDowngrade && renderStaleSeconds !== undefined
         ? Math.min(renderStaleSeconds, routeStaleTime)
         : routeStaleTime
-    const bodyResponse = segmentBodyResponse(
+    const ensureStatic = route.segmentConfig?.ensureStatic
+    const bodyResponse = segmentBodyResponse({
       body,
       staleTime,
       postponed,
-      // A pure params-derived live render is a prerender: its bytes are a
-      // function of the URL alone. Marking it lets the client alias it as
-      // reusable full data (no speculative re-fetch of the same URL).
-      //
-      // A TRUNCATED loading shell of such a route qualifies too: everything it
-      // contains sits above the boundary and reads nothing but params, so the
-      // client may share it across every URL its vary set covers instead of
-      // re-fetching a byte-identical shell per param value.
-      baked || isStatic || ((!postponed || truncatedShell) && paramsOnlyStatic),
-      deploymentId(),
+      // A pure params-derived render (or its truncated loading shell) is a prerender: a function of
+      // the URL alone, shareable across every URL its vary set covers.
+      prerendered:
+        baked !== null || isStatic || ((!postponed || truncatedShell) && paramsOnlyStatic),
+      deploymentId: deploymentId(),
       segment,
-      bodyVary &&
-        (bakedVaryFromMeta ||
+      vary:
+        bodyVary &&
+        (bakedVaryTrusted ||
           varyTrusted(
             bodyVary,
             selection,
             'body',
             false,
-            // Live render only (`!baked`): a baked body tracked nothing, so its empty set is the
-            // artifact this guard exists for. `allow-runtime` ONLY, not every "explicit"
-            // runtime-prefetch route: an `unstable_eager` route RESOLVES its params in this render, so
-            // an empty set there is the untracked artifact, not the truth - trusting it published one
-            // shared entry for the whole route and elided every later param's prefetch.
-            selection.route.segmentConfig?.prefetch === 'allow-runtime' && !baked,
+            // `allow-runtime` only: an `unstable_eager` route RESOLVES its params, so its empty set
+            // is the untracked artifact, not the truth.
+            route.segmentConfig?.prefetch === 'allow-runtime',
           ))
-        ? segmentVaryInfo(bodyVary, 'body', selection)
-        : undefined,
-      // App Shells: a COMPLETE per-URL prerender carries the route's shared
-      // shell alongside it, so a navigation to another param of the route has
-      // an instant shell to paint without a second request.
-      completePrerender || (!postponed && paramsOnlyStatic)
-        ? routeAppShell(config, selection)
-        : undefined,
-    )
+          ? segmentVaryInfo(bodyVary, 'body', selection)
+          : undefined,
+      shell: baked?.shell,
+      // An upgradeable ISR fallback: 1 lets the client replace it with a runtime prefetch, 2 (`ensureStatic`) does not.
+      fallback:
+        baked?.fallback && !paramPrerendered
+          ? ensureStatic === 'prefetch' || ensureStatic === 'navigation'
+            ? 2
+            : 1
+          : undefined,
+      // The latest render's verdict on the tree's static hints, which may be stale after a revalidation.
+      runtimeNeeded: baked && routeRuntimePrefetch(route) ? baked.runtimeNeeded : undefined,
+    })
     if (headOutlined) {
       bodyResponse.headers.set('x-pnext-head-outlined', headFetchedFirst(selection) ? 'first' : '1')
     }
-    // The client asked for a FULL prefetch; this answer is a shell. Same marker
-    // the runtime-prefetch (unstable_instant) downgrade uses — the generic
-    // postponed flags never downgrade a full prefetch (ordinary PPR full
-    // renders carry them while streaming complete resumed content).
-    if (partialPrefetchDowngrade) bodyResponse.headers.set('x-pnext-runtime-prefetch', '1')
+    // The artifact's holes wait on data (session, URL or hanging params) only a runtime request fills.
+    if (
+      baked?.runtime &&
+      routeRuntimePrefetch(route) &&
+      ensureStatic !== 'prefetch' &&
+      ensureStatic !== 'navigation'
+    ) {
+      bodyResponse.headers.set('x-pnext-needs-runtime', '1')
+    }
+    // A FULL prefetch answered with a shell: the same marker the runtime-prefetch downgrade uses.
+    if (partialPrefetchDowngrade) {
+      bodyResponse.headers.set('x-pnext-runtime-prefetch', '1')
+      if (!postponed) bodyResponse.headers.set('x-pnext-runtime-complete', '1')
+    }
     return withRewriteHeaders(bodyResponse, rewriteHeaders)
   }
 
-  // `/_tree`: the RootTreePrefetch. Unmatched/non-page targets get an empty
-  // (dynamic) tree so the client falls back to a full nav fetch (never 404s).
+  // `/_tree`: the RootTreePrefetch. Non-page targets get an empty (dynamic) tree so the client
+  // falls back to a full nav fetch; an unmatched (or closed-param rejected) URL is a routing 404.
   const routeId = selection?.route.id
   const bakedTree = routeId ? readSegmentTree(config.outPath, routeId) : undefined
-  if (routeId && bakedTree) {
-    // The route tree's SHAPE is static in Next: it reuses for the static window
-    // regardless of whether the route itself renders dynamically. markUrlStaticFresh
-    // (router.ts) only records a URL's static freshness when x-nextjs-stale-time > 0,
-    // so a dynamic route's tree (dynamic window = 0) would never warm the elision
-    // map and every re-revealed link would refetch the tree (breaking the
-    // encoded-slash-params back-navigation contract). Stamp the STATIC window on the
-    // tree even for dynamic routes; the segment body branch keeps its own windows.
-    const staleTime = isStatic
-      ? effectiveStaleTime(readSegmentMeta(config.outPath, routeId), true)
-      : staleTimeSecondsFor(true)
-    return withRewriteHeaders(
-      new Response(treeWithStaleTime(bakedTree, staleTime, url.searchParams.has('_rsc')), {
-        status: 200,
-        headers: {
-          'content-type': RSC_CONTENT_TYPE_HEADER,
-          'x-nextjs-postponed': '2',
-          'x-nextjs-stale-time': String(staleTime),
-          ...(isStatic ? { 'x-nextjs-prerender': '1' } : {}),
-          // Announce head outlining on the tree HEADERS too, so the client
-          // can keep head-before-body order without reading the tree body.
-          ...(selection?.route.pprMetadata === true
-            ? { 'x-pnext-head-outlined': headFetchedFirst(selection) ? 'first' : '1' }
-            : {}),
-          'x-nextjs-deployment-id': deploymentId(),
-          // A static route's baked tree is CDN-cacheable like Next's
-          // prerendered payloads; the per-variant `_rsc` cache-buster keys
-          // it correctly on Vary-ignoring CDNs.
-          'cache-control': isStatic
-            ? 's-maxage=31536000, stale-while-revalidate'
-            : 'private, no-store',
-        },
-      }),
-      rewriteHeaders,
-    )
-  }
-  const payload = buildRootTreePrefetch({
-    pathname: matchPathname,
-    isStatic,
-    staleTimeSeconds: staleTimeSecondsFor(isStatic),
-    routeId: selection?.route.id,
-    runtimePrefetch:
-      (selection?.route.segmentConfig as { prefetch?: unknown } | undefined)?.prefetch ===
-      'allow-runtime',
-    postponed: Boolean(selection?.route.pprHoles?.length),
-    // Segment-M2: route identity + this URL's params so the client can key
-    // shared segment entries before it has fetched a body for this URL.
-    ...(selection?.route.kind === 'page'
-      ? { routePattern: selection.route.route, params: wireParams(selection.params) }
+  const meta =
+    selection?.route.kind === 'page' && (isStatic || routeRuntimePrefetch(selection.route))
+      ? readSegmentMeta(config.outPath, selection.route.id)
+      : undefined
+  const hints = partialPrefetchHints(selection, meta)
+  const format = url.searchParams.has('_rsc') ? 'flight' : 'json'
+  // The route tree's SHAPE is static in Next: a baked tree reuses for the static window even for a
+  // dynamic route (markUrlStaticFresh only warms the elision map when x-nextjs-stale-time > 0).
+  const payload =
+    (routeId &&
+      bakedTree &&
+      restampTree(bakedTree, {
+        staleTime: isStatic ? effectiveStaleTime(meta, true, false) : staleTimeSecondsFor(true),
+        isStatic,
+      })) ||
+    buildRootTreePrefetch({
+      pathname: matchPathname,
+      isStatic,
+      staleTimeSeconds: staleTimeSecondsFor(isStatic),
+      routeId: selection?.route.id,
+      runtimePrefetch:
+        (selection?.route.segmentConfig as { prefetch?: unknown } | undefined)?.prefetch ===
+        'allow-runtime',
+      partialPrefetching: hints !== undefined,
+      postponed: Boolean(selection?.route.pprHoles?.length),
+      // Route identity + this URL's params so the client can key shared segment entries early.
+      ...(selection?.route.kind === 'page'
+        ? {
+            routePattern: selection.route.route,
+            catchAllOptional: selection.route.catchAllOptional,
+            params: wireParams(selection.params),
+          }
+        : {}),
+      ...(selection?.route.pprMetadata === true
+        ? { headOutlined: true, ...(headFetchedFirst(selection) ? { headFirst: true } : {}) }
+        : {}),
+    })
+  // The static-prefetch attempt is this URL's own verdict, never the route's OR-merged one.
+  if (hints !== undefined)
+    payload.tree.h = ((payload.tree.h ?? 0) & ~PrefetchHint.ShouldAttemptStaticPrefetch) | hints
+  const headers = {
+    // A Partial Prefetching route's identity and hints ride the HEADERS: the client picks its flow
+    // before the body streams.
+    ...(hints !== undefined
+      ? {
+          [SEGMENT_ROUTE_HEADER]: selection!.route.route,
+          'x-pnext-prefetch-hints': String(payload.tree.h),
+        }
       : {}),
+    // Announced on the HEADERS too, so the client keeps head-before-body order without the tree body.
     ...(selection?.route.pprMetadata === true
-      ? { headOutlined: true, ...(headFetchedFirst(selection) ? { headFirst: true } : {}) }
+      ? { 'x-pnext-head-outlined': headFetchedFirst(selection) ? 'first' : '1' }
       : {}),
-  })
-  const treeResponse = treePrefetchResponse(payload, {
-    format: url.searchParams.has('_rsc') ? 'flight' : 'json',
-  })
-  // Mirror the payload's head-outlining on the HEADERS (see baked branch).
-  if (selection?.route.pprMetadata === true) {
-    treeResponse.headers.set('x-pnext-head-outlined', headFetchedFirst(selection) ? 'first' : '1')
+    // The client warms these beside its body request, so the warm never trails the prefetch.
+    ...(selection?.route.clientEntry
+      ? { 'x-pnext-assets': routeModuleTags(config, selection.route) }
+      : {}),
+    'x-nextjs-deployment-id': deploymentId(),
   }
-  return withRewriteHeaders(withDeploymentId(treeResponse), rewriteHeaders)
+  return withRewriteHeaders(
+    treePrefetchResponse(payload, { format, status: selection ? 200 : 404, headers }),
+    rewriteHeaders,
+  )
+}
+
+/**
+ * A Partial Prefetching route's hints: ShouldAttemptStaticShell when the App Shell artifact serving
+ * this URL waited on no session data (or `ensureStatic` forces it). Undefined for other routes.
+ */
+function partialPrefetchHints(
+  selection: ReturnType<typeof selectRouteForRequest>,
+  meta: SegmentMeta | undefined,
+): number | undefined {
+  if (selection?.route.kind !== 'page' || !routeRuntimePrefetch(selection.route)) return undefined
+  const { route } = selection
+  // No baked artifact to judge from: the route goes straight to its runtime requests, unless this
+  // URL prerendered whole (it read no runtime data).
+  const runtime =
+    shellEntryFor(route, selection.params)?.shellRuntime ??
+    (meta
+      ? (meta.shellRuntime ?? meta.runtime ?? 0)
+      : paramsPrerendered(route, selection.params)
+        ? 0
+        : undefined)
+  const ensureStatic = route.segmentConfig?.ensureStatic
+  const shellStatic =
+    ensureStatic !== undefined || (runtime !== undefined && !(runtime & RUNTIME_SESSION))
+  // The prefetch hint follows this URL's own prerender, like Next's per-prerender tree.
+  const keys = routeParamKeys(route)
+  const own = route.pprSubShells?.find(
+    c =>
+      Object.keys(c.concreteParams).length === keys.length &&
+      paramSetMatches(c.concreteParams, selection.params, keys),
+  )
+  const prefetchRuntime = own ? (own.runtime ?? 0) : meta ? (meta.runtime ?? 0) : runtime
+  const prefetchStatic =
+    ensureStatic === 'prefetch' ||
+    ensureStatic === 'navigation' ||
+    (prefetchRuntime !== undefined && !(runtimeNeededBits(route, 0, prefetchRuntime) & 2))
+  return (
+    PrefetchHint.SubtreeHasPartialPrefetching |
+    (shellStatic ? PrefetchHint.ShouldAttemptStaticShell : 0) |
+    (prefetchStatic ? PrefetchHint.ShouldAttemptStaticPrefetch : 0)
+  )
 }
 
 /**
@@ -1063,95 +895,236 @@ function routeHasLoadingFile(route: RouteManifestEntry): boolean {
   )
 }
 
-/** True when the build prerendered this route for the given param set. */
-function routeParamPrerendered(
-  route: RouteManifestEntry,
-  params: Record<string, unknown>,
-): boolean {
-  const sets = route.prerenderedParams
-  if (!sets?.length) return false
-  return sets.some(set => {
-    const keys = Object.keys(set)
-    return (
-      keys.length === Object.keys(params).length &&
-      keys.every(key => String(set[key]) === String(params[key]))
-    )
-  })
-}
-
-/**
- * The vary set of a prefetch answered from a PPR SUB-SHELL - the build baked that shell for a param
- * SUBSET, so a request-time render tracks nothing while its bytes are a pure function of exactly
- * those params. The layout chain consumed them; the page contributed only its `loading` fallback, so
- * the PAGE frame stays shareable across every value of the remaining params.
- */
-/**
- * The route's shared APP SHELL - the build's params-hanging render. Carried alongside a per-URL
- * prerender so the client can file it at the route's fallback vary path. Undefined for a param-free
- * route, or when the build baked no such shell.
- */
-function routeAppShell(
-  config: ResolvedConfig,
-  selection: NonNullable<ReturnType<typeof selectRouteForRequest>>,
-): SegmentAppShell | undefined {
-  // Strictly opt-in, like the client's second (param-stripped) shell prefetch:
-  // without the flag the extra bytes would ride on every prerender response.
-  if (!appShellsEnabled()) return undefined
-  if (!selection.route.route.includes(':')) return undefined
-  const file = join(config.outPath, 'ppr', `${selection.route.id}.html`)
-  if (!existsSync(file)) return undefined
-  try {
-    return { html: readFileSync(file, 'utf8'), route: selection.route.route }
-  } catch {
-    return undefined
-  }
-}
-
-/** The vary sets the BUILD render of this exact prerendered URL tracked. */
-function prerenderVary(
-  route: RouteManifestEntry,
-  pathname: string,
-): ResponseVaryParams | undefined {
-  const wire = route.prerenderVary?.[pathname || '/']
-  return wire ? responseVaryParamsFromWire(wire) : undefined
-}
-
+/** The vary set of a prefetch answered from a PPR SUB-SHELL: the concrete params it was baked for. */
 function subShellVary(
   route: RouteManifestEntry,
   params: Record<string, unknown>,
 ): ResponseVaryParams | undefined {
-  const shell = route.pprSubShells?.find(candidate =>
-    Object.entries(candidate.concreteParams).every(
-      ([name, value]) => String(value) === String(params[name]),
-    ),
-  )
-  const names = Object.keys(shell?.concreteParams ?? {}).sort()
+  const names = Object.keys(subShellFor(route, params)?.concreteParams ?? {}).sort()
   if (!names.length) return undefined
   return responseVaryParamsFromWire({ vary: names, layoutVary: names, pageVary: [] })
 }
 
-async function readBakedSegment({
-  config,
-  selection,
-  pathname,
-  file,
-}: {
-  config: ResolvedConfig
-  selection: NonNullable<ReturnType<typeof selectRouteForRequest>>
-  pathname: string
-  file: string
-}): Promise<string | undefined> {
-  if (!existsSync(file)) return undefined
-  await regenerateStaleSegment({ config, selection, pathname, file })
-  try {
-    // A baked FALLBACK-shell segment was rendered with every param hanging, so
-    // its `__PNEXT_ROUTE__` carries `params: {}`. Stamp this request's params
-    // in, exactly as the document path does — the client paints this body as
-    // the loading shell and reads its route state for useParams()/prediction.
-    return withRequestRouteParams(readFileSync(file, 'utf8'), selection.params)
-  } catch {
-    return undefined
+function subShellFor(route: RouteManifestEntry, params: Record<string, unknown>) {
+  return route.pprSubShells?.find(candidate =>
+    paramSetMatches(
+      candidate.concreteParams,
+      params as Record<string, RouteParamValue>,
+      Object.keys(candidate.concreteParams),
+    ),
+  )
+}
+
+/** The root-param prefix sub-shell whose prefetch shell serves `params`, when the build baked one. */
+function shellEntryFor(route: RouteManifestEntry, params: Record<string, unknown>) {
+  const shells = route.pprSubShells?.filter(candidate => candidate.shellRuntime !== undefined)
+  const exact = shells?.find(candidate =>
+    paramSetMatches(
+      candidate.concreteParams,
+      params as Record<string, RouteParamValue>,
+      Object.keys(candidate.concreteParams),
+    ),
+  )
+  if (exact || !shells?.length) return exact
+  // Another root-param value runs the same App Shell code: its own shell renders on demand.
+  const keys = Object.keys(shells[0]!.concreteParams)
+  if (keys.some(key => params[key] === undefined)) return undefined
+  const concreteParams = Object.fromEntries(keys.map(key => [key, params[key] as RouteParamValue]))
+  return { ...shells[0]!, key: subShellKey(concreteParams), concreteParams }
+}
+
+/**
+ * The static body of a prefetch: the URL's most specific baked prerender (`servedPprShell` picks the
+ * full-param sub-shell, else the root-prefix one, else the base shell; a stale base shell regenerates
+ * single-flight). On a Partial Prefetching route a non-prerendered URL is answered with the prefetch
+ * shell baked for its root-param prefix, and a per-URL prerender whose vary names a non-root param
+ * carries that shell alongside so sibling params paint it instantly.
+ */
+async function bakedBody(
+  config: ResolvedConfig,
+  selection: NonNullable<ReturnType<typeof selectRouteForRequest>>,
+  url: URL,
+  meta: SegmentMeta | undefined,
+): Promise<{
+  html: string
+  postponed: boolean
+  vary: ResponseVaryParams | undefined
+  runtime: number
+  /** The served shell is still an upgradeable fallback for this URL. */
+  fallback: boolean
+  runtimeNeeded?: number
+  shell?: SegmentAppShell
+} | null> {
+  const { route, params } = selection
+  const regen = {
+    config,
+    route,
+    params,
+    url: new URL(`http://pnext.local${url.pathname}`),
+    boundedRegen: true,
   }
+  // The body prefetch arrived: its own fallback scheduling supersedes the tree's warm.
+  clearTimeout(pendingTreeWarms.get(url.pathname))
+  pendingTreeWarms.delete(url.pathname)
+  const pprShells = await pprShell()
+  const served = await pprShells.servedPprShell(regen)
+  const rootEntry = shellEntryFor(route, params)
+  const paramKeys = routeParamKeys(route)
+  const shellRender = { ...regen, prefetchShell: true, runtimeRegen: true }
+  // The App Shell serving this URL: the root-prefix prefetch shell when baked, else the route's.
+  const appShell = (root = rootEntry) =>
+    root
+      ? freshPrefetchShell(
+          shellSegmentFile(config.outPath, route.id, root.key),
+          pprSubShellPath(config.outPath, route.id, root.key),
+          () =>
+            pprShells.renderSubShell({
+              ...shellRender,
+              concreteParams: root.concreteParams,
+              paramKeys,
+            }),
+        )
+      : freshPrefetchShell(
+          bodySegmentFile(config.outPath, route.id),
+          pprShellPath(config.outPath, route.id),
+          () =>
+            paramKeys.length
+              ? pprShells.renderFallbackShell(shellRender)
+              : pprShells.renderPartialShell(shellRender),
+        )
+  const stamp = (html: string) => pprShells.withRequestRouteParams(html, params)
+  const partial = routeRuntimePrefetch(route)
+  if (!served) {
+    // An ungenerated root-param value: its App Shell renders blocking, like Next's on-demand shell.
+    const html = partial && rootEntry ? await appShell(rootEntry) : undefined
+    return html === undefined
+      ? null
+      : {
+          html: stamp(html),
+          postponed: true,
+          vary: responseVaryParamsFromWire(rootEntry!.shellVary ?? { vary: [] }),
+          runtime: rootEntry!.shellRuntime ?? 0,
+          fallback: false,
+          runtimeNeeded: meta?.runtimeNeeded,
+        }
+  }
+  const { shell: picked, fallback } = served
+  if (picked.softStale) void pprShells.regenerateStalePprShell(regen)
+  const concrete = Object.keys(picked.concreteParams ?? {})
+  // Only a regeneration or promotion reports runtime data: its verdicts outrank the build's, and a
+  // regenerated base shell's become the route's.
+  let runtimeNeeded = meta?.runtimeNeeded
+  if (picked.runtimeData !== undefined) {
+    const shellRuntime =
+      rootEntry?.shellRuntime ?? (picked.runtimeData & RUNTIME_SHELL ? RUNTIME_SESSION : 0)
+    runtimeNeeded = runtimeNeededBits(route, shellRuntime, picked.runtimeData)
+    if (meta && concrete.length === 0 && picked.runtimeData !== meta.runtime) {
+      meta = {
+        ...meta,
+        postponed: picked.holes.length > 0,
+        runtime: picked.runtimeData,
+        shellRuntime,
+        runtimeNeeded,
+      }
+      void writeSegmentMeta(config.outPath, route.id, meta).catch(() => undefined)
+    }
+  }
+  // By value: a promoted (in-memory) shell carries its own params object for the same prefix.
+  const entry = route.pprSubShells?.find(
+    c =>
+      Object.keys(c.concreteParams).length === concrete.length &&
+      paramSetMatches(c.concreteParams, picked.concreteParams!, concrete),
+  )
+  // The base prerender is every such URL's static prefetch; the App Shell is a prefix of it.
+  if (concrete.length === 0) {
+    return {
+      html: stamp(picked.shell),
+      postponed: picked.holes.length > 0 || picked.metadataDynamic,
+      vary: meta?.vary ? responseVaryParamsFromWire(meta) : undefined,
+      runtime: meta?.runtime ?? 0,
+      fallback,
+      runtimeNeeded,
+    }
+  }
+  if (partial && entry?.shellVary && concrete.length < paramKeys.length) {
+    const html = await appShell(entry)
+    if (html === undefined) return null
+    return {
+      html: stamp(html),
+      postponed: true,
+      vary: responseVaryParamsFromWire(entry.shellVary),
+      runtime: entry.shellRuntime ?? 0,
+      fallback,
+      runtimeNeeded,
+    }
+  }
+  // Untracked: every frame is a function of the params the artifact was baked for.
+  const vary = responseVaryParamsFromWire(
+    entry?.vary ?? { vary: concrete.sort(), layoutVary: concrete, pageVary: concrete },
+  )
+  const rootNames = rootParamNames(config, route)
+  const shell =
+    partial &&
+    concrete.length === paramKeys.length &&
+    vary.params.some(name => !rootNames.includes(name))
+      ? await appShell()
+      : undefined
+  return {
+    html: stamp(picked.shell),
+    postponed: picked.holes.length > 0 || route.pprMetadata === true,
+    vary,
+    runtime: entry?.runtime ?? picked.runtimeData ?? 0,
+    fallback,
+    runtimeNeeded,
+    ...(shell !== undefined
+      ? {
+          shell: {
+            html: shell,
+            route: route.route,
+            vary: rootEntry?.shellVary?.vary ?? [],
+          },
+        }
+      : {}),
+  }
+}
+
+const pendingPrefetchShells = new Map<string, Promise<string | undefined>>()
+
+/**
+ * The baked prefetch shell at `file`, re-rendered (single-flight) when the shell it was cut from
+ * (`source`, already validated fresh by loadPprShell) was regenerated after it.
+ */
+async function freshPrefetchShell(
+  file: string,
+  source: string,
+  render: () => Promise<{ shell: string } | null>,
+): Promise<string | undefined> {
+  const mtime = (path: string) =>
+    stat(path).then(
+      stats => stats.mtimeMs,
+      () => undefined,
+    )
+  const [baked, sourceMtime] = await Promise.all([mtime(file), mtime(source)])
+  if (baked !== undefined && (sourceMtime === undefined || sourceMtime <= baked)) {
+    return readFile(file, 'utf8')
+  }
+  let pending = pendingPrefetchShells.get(file)
+  if (!pending) {
+    pending = getRenderExtensions()
+      .collectRenderMeta(render, {
+        refreshFetches: true,
+        blockingStaleFetches: true,
+        prerender: true,
+      })
+      .then(async ({ value }) => {
+        if (!value) return undefined
+        await writeFileAtomic(file, value.shell).catch(() => undefined)
+        return value.shell
+      })
+      .finally(() => pendingPrefetchShells.delete(file))
+    pendingPrefetchShells.set(file, pending)
+  }
+  return pending
 }
 
 /** True when the route EXPLICITLY opts into runtime prefetching via segment config. */
@@ -1169,16 +1142,31 @@ function routeExplicitRuntimePrefetch(route: RouteManifestEntry): boolean {
 function routeRuntimePrefetchRender(route: RouteManifestEntry): boolean {
   const config = route.segmentConfig
   if (config?.unstableInstant === false) return false
-  return config?.unstableInstant === true || config?.prefetch === 'allow-runtime'
+  // Stable `instant` alone keeps a full prefetch full (Next 16.4); `unstable_instant` or a prefetch export opts in.
+  if (config?.unstableInstant === true && !config.stableInstant) return true
+  return config?.prefetch === 'allow-runtime'
 }
 
+const runtimePrefetchByRoute = new WeakMap<RouteManifestEntry, boolean>()
+const clientStaticByRoute = new WeakMap<RouteManifestEntry, boolean>()
+
 function routeUsesRuntimePrefetch(route: RouteManifestEntry): boolean {
-  if (routeExplicitRuntimePrefetch(route)) return true
-  if (clientStaticPrefetchable(route)) return false
+  let uses = runtimePrefetchByRoute.get(route)
+  if (uses === undefined) {
+    uses =
+      routeExplicitRuntimePrefetch(route) ||
+      (!clientStaticPrefetchable(route) &&
+        /\b(?:searchParams|useSearchParams)\b/.test(readTextOrEmpty(route.file)))
+    runtimePrefetchByRoute.set(route, uses)
+  }
+  return uses
+}
+
+function readTextOrEmpty(file: string): string {
   try {
-    return /\b(?:searchParams|useSearchParams)\b/.test(readFileSync(route.file, 'utf8'))
+    return readFileSync(file, 'utf8')
   } catch {
-    return false
+    return ''
   }
 }
 
@@ -1188,22 +1176,22 @@ function routeUsesRuntimePrefetch(route: RouteManifestEntry): boolean {
  * true when no server segment in the chain reads real request data.
  */
 function clientStaticPrefetchable(route: RouteManifestEntry): boolean {
-  if (route.client !== true) return false
-  // Only the route's own app segments matter (sourceFiles also lists framework
-  // modules, whose text mentions request APIs in comments/implementations).
-  const appDir = route.file.slice(0, route.file.lastIndexOf('/app/') + '/app/'.length)
-  for (const file of route.sourceFiles ?? []) {
-    if (file === route.file) continue
-    if (!appDir || !file.startsWith(appDir)) continue
-    try {
-      if (/\b(?:cookies|headers|connection|draftMode)\s*\(/.test(readFileSync(file, 'utf8'))) {
-        return false
-      }
-    } catch {
-      return false
-    }
+  let result = clientStaticByRoute.get(route)
+  if (result === undefined) {
+    // Only the route's own app segments matter (sourceFiles also lists framework modules).
+    const appDir = route.file.slice(0, route.file.lastIndexOf('/app/') + '/app/'.length)
+    result =
+      route.client === true &&
+      (route.sourceFiles ?? []).every(
+        file =>
+          file === route.file ||
+          !appDir ||
+          !file.startsWith(appDir) ||
+          !/\b(?:cookies|headers|connection|draftMode)\s*\(/.test(readTextOrEmpty(file)),
+      )
+    clientStaticByRoute.set(route, result)
   }
-  return true
+  return result
 }
 
 /**
@@ -1217,6 +1205,8 @@ async function renderInstantPrefetchShell({
   url,
   request,
   fallbackParams = false,
+  appShell,
+  nav,
 }: {
   config: ResolvedConfig
   selection: NonNullable<ReturnType<typeof selectRouteForRequest>>
@@ -1225,6 +1215,10 @@ async function renderInstantPrefetchShell({
   request: Request
   /** App Shells: render the SHARED shell (params hang, request data resolves). */
   fallbackParams?: boolean
+  /** Runtime App Shell (`3`): these root params stay concrete, every other param and prefetch() hang. */
+  appShell?: string[]
+  /** The client's nav state: a runtime request renders the delta below the layouts it already has. */
+  nav?: ReturnType<typeof parseNavState>
 }): Promise<{
   html: string
   postponed: boolean
@@ -1239,9 +1233,10 @@ async function renderInstantPrefetchShell({
   const headers = new Headers(request.headers)
   headers.delete(NEXT_ROUTER_PREFETCH_HEADER)
   headers.delete(NEXT_ROUTER_SEGMENT_PREFETCH_HEADER)
-  // Segment-M2 deliverable 1: the render runs inside a vary-params tracking
-  // scope so the response can publish which params it actually read.
+  headers.set(SEGMENT_RENDER_HEADER, '1')
+  // Tracked so the response can publish which params it actually read.
   let staleSeconds: number | undefined
+  const { renderRuntimePrefetchDocument } = await pprShell()
   const tracked = await withVaryParamsTracking(() =>
     getRenderExtensions().collectRenderMeta(
       async () => {
@@ -1252,7 +1247,17 @@ async function renderInstantPrefetchShell({
             params: selection.params,
             url: renderUrl,
             request: new Request(renderUrl, { headers }),
+            ...(nav ? { nav: { soft: true, state: nav, childrenPath: pathname } } : {}),
             ...(fallbackParams ? { fallbackParams: true } : {}),
+            ...(appShell
+              ? {
+                  prefetchShell: true,
+                  fallbackConcreteParams: Object.fromEntries(
+                    appShell.map(name => [name, selection.params[name]!]),
+                  ),
+                  fallbackParamKeys: routeParamKeys(selection.route),
+                }
+              : {}),
           }),
         )
         // Read inside the collection scope: the shortest window any cache this
@@ -1271,7 +1276,8 @@ async function renderInstantPrefetchShell({
   return rendered
     ? {
         ...rendered,
-        vary: tracked.vary,
+        // An App Shell is keyed on the root params it read: everything else hung.
+        vary: appShell ? restrictVary(tracked.vary, appShell) : tracked.vary,
         ...(staleSeconds !== undefined ? { staleSeconds } : {}),
       }
     : null
@@ -1376,13 +1382,6 @@ const LAYOUT_SEGMENT_PATH = '/_layout'
 const PAGE_SEGMENT_PATH = '/_page'
 
 /**
- * App Shells: the client's marker for the SECOND, param-stripped prefetch that
- * primes a route's shared shell (compat/client/segment-prefetch.ts). Only
- * meaningful under `experimental.appShells`.
- */
-const APP_SHELL_PREFETCH_HEADER = 'x-pnext-app-shell'
-
-/**
  * Marks the render behind a segment-prefetch response, after the segment header
  * itself has been stripped. The renderer keys its shared-layout delta on this
  * (see fullSegmentPrefetchSkipsSharedLayout).
@@ -1443,90 +1442,6 @@ interface RewriteHeaderInfo {
   query?: string
 }
 
-/** Modification time of `file`, or undefined when it does not exist. */
-function fileMtimeMs(file: string): number | undefined {
-  try {
-    return statSync(file).mtimeMs
-  } catch {
-    return undefined
-  }
-}
-
-async function regenerateStaleSegment({
-  config,
-  selection,
-  pathname,
-  file,
-}: {
-  config: ResolvedConfig
-  selection: NonNullable<ReturnType<typeof selectRouteForRequest>>
-  pathname: string
-  file: string
-}): Promise<void> {
-  let mtimeMs: number
-  try {
-    mtimeMs = statSync(file).mtimeMs
-  } catch {
-    return
-  }
-  const servedVersion = segmentArtifactVersions.get(file) ?? 0
-  const url = new URL(`http://pnext.local${pathname}`)
-  // A PPR route's shell is the SAME render this segment body is cut from, so a
-  // shell that was rewritten after this artifact makes the artifact stale even
-  // when no revalidation is outstanding: without it the document serves the new
-  // regeneration's data while the prefetch keeps replaying the old one's.
-  const shellMtimeMs =
-    selection.route.ppr === true
-      ? fileMtimeMs(pprShellPath(config.outPath, selection.route.id))
-      : undefined
-  const stale =
-    servedVersion < segmentRevalidationVersion ||
-    getRequestExtensions().staticStaleness(pathname, mtimeMs, []) ||
-    (shellMtimeMs !== undefined && shellMtimeMs > mtimeMs)
-  if (!stale) return
-
-  // Adopt the shell this route currently serves (regenerating it only when it
-  // is itself stale, through the renderer's single-flight) rather than running
-  // a second, independent prerender whose cache reads would resolve to their
-  // own values.
-  if (shellMtimeMs !== undefined) {
-    const shell = await currentPprShellHtml({
-      config,
-      route: selection.route,
-      params: selection.params,
-      url,
-    })
-    if (shell !== null) {
-      await writeFile(file, shell)
-      segmentArtifactVersions.set(file, segmentRevalidationVersion)
-      return
-    }
-  }
-
-  const rendered = await getRenderExtensions().collectRenderMeta(
-    () =>
-      withRouteRuntime(selection.route.segmentConfig?.runtime, () =>
-        renderPartialShell({
-          config,
-          route: selection.route,
-          params: selection.params,
-          url,
-          runtimeRegen: true,
-        }),
-      ),
-    {
-      fetchCache: selection.route.segmentConfig?.fetchCache,
-      refreshFetches: true,
-      blockingStaleFetches: true,
-      route: pathname,
-      prerender: true,
-    },
-  )
-  if (!rendered.value) return
-  await writeFile(file, rendered.value.shell)
-  segmentArtifactVersions.set(file, segmentRevalidationVersion)
-}
-
 const segmentRewriteCache = new Map<string, Promise<CompatRewrite[]>>()
 
 function loadSegmentRewrites(config: ResolvedConfig): Promise<CompatRewrite[]> {
@@ -1536,18 +1451,6 @@ function loadSegmentRewrites(config: ResolvedConfig): Promise<CompatRewrite[]> {
     segmentRewriteCache.set(config.root, cached)
   }
   return cached
-}
-
-function parseCookieHeader(header: string | null): Record<string, string> {
-  if (!header) return {}
-  const cookies: Record<string, string> = {}
-  for (const part of header.split(';')) {
-    const index = part.indexOf('=')
-    if (index === -1) continue
-    const key = part.slice(0, index).trim()
-    if (key) cookies[key] = decodeURIComponent(part.slice(index + 1).trim())
-  }
-  return cookies
 }
 
 /**
@@ -1600,31 +1503,6 @@ function withRewriteHeaders(response: Response, info: RewriteHeaderInfo | undefi
   return response
 }
 
-const ROUTER_VARY = [
-  'rsc',
-  'next-router-state-tree',
-  'next-router-prefetch',
-  'next-router-segment-prefetch',
-]
-
-function mergeRouterVary(headers: Headers): void {
-  const existing = headers.get('vary')
-  const values = existing
-    ? existing
-        .split(',')
-        .map(value => value.trim())
-        .filter(Boolean)
-    : []
-  const present = new Set(values.map(value => value.toLowerCase()))
-  for (const value of ROUTER_VARY) {
-    if (!present.has(value)) {
-      present.add(value)
-      values.push(value)
-    }
-  }
-  headers.set('vary', values.join(', '))
-}
-
 // Stamp x-nextjs-stale-time on router responses that a `use cache` route did
 // not already stamp, so both prefetches and navigation-seeded entries learn
 // their reuse window from the route mode.
@@ -1658,15 +1536,7 @@ export const prefetchStaleTimeFinalizer: ResponseFinalizer = ctx => {
     ctx.routeMode === 'static' ||
     ctx.routeMode === 'isr' ||
     (prefetchRequest && postponedResponse) ||
-    (selection !== null && routeParamPrerendered(selection.route, selection.params ?? {}))
-  // A NAVIGATION response of a postponed (PPR) route streams the resumed
-  // dynamic data: it is a dynamic document and must reuse for the DYNAMIC
-  // window (staleTimes.dynamic gates how long the client re-commits it), even
-  // though the route's built segment meta carries the shell's static window.
-  if (!isStatic && postponedResponse) {
-    ctx.headers.set('x-nextjs-stale-time', String(staleTimeSecondsFor(false)))
-    return
-  }
+    (selection !== null && paramsPrerendered(selection.route, selection.params ?? {}))
   // A statically-served prerender never re-runs its `use cache` scopes, so the
   // use-cache finalizer can't stamp the route's own cacheLife window here. The
   // build persisted it into the route's segment meta — prefer that over the
@@ -1708,9 +1578,25 @@ function readSegmentMeta(outPath: string, routeId: string): SegmentMeta | undefi
   }
 }
 
-function effectiveStaleTime(meta: SegmentMeta | undefined, isStatic: boolean): number {
+async function writeSegmentMeta(
+  outPath: string,
+  routeId: string,
+  meta: SegmentMeta,
+): Promise<void> {
+  const file = segmentMetaFile(outPath, routeId)
+  await writeFile(`${file}.tmp`, JSON.stringify(meta))
+  await rename(`${file}.tmp`, file)
+}
+
+function effectiveStaleTime(
+  meta: SegmentMeta | undefined,
+  isStatic: boolean,
+  declared = true,
+): number {
   const configured = staleTimeSecondsFor(isStatic)
   if (!meta) return configured
+  // The route's own cacheLife() window - a declared 0 is "re-fetch on every reveal", not a default.
+  if (declared && meta.staleTimeDeclared) return meta.staleTime
   const builtDefault = isStatic
     ? DEFAULT_STATIC_STALE_TIME_SECONDS
     : DEFAULT_DYNAMIC_STALE_TIME_SECONDS
@@ -1732,16 +1618,18 @@ function readSegmentTree(outPath: string, routeId: string): string | undefined {
   }
 }
 
-function treeWithStaleTime(tree: string, staleTime: number, flight: boolean): string {
-  const json = tree.startsWith('0:') ? tree.slice(2) : tree
+/** The baked tree restamped with this request's staleTime and staticness; null when unreadable. */
+function restampTree(
+  tree: string,
+  stamp: { staleTime: number; isStatic: boolean },
+): RootTreePrefetch | null {
   try {
-    const payload = JSON.parse(json) as { staleTime?: unknown }
-    const body = JSON.stringify(
-      payload.staleTime === staleTime ? payload : { ...payload, staleTime },
-    )
-    return flight ? `0:${body}` : body
+    const payload = JSON.parse(tree.startsWith('0:') ? tree.slice(2) : tree) as RootTreePrefetch
+    payload.staleTime = stamp.staleTime
+    payload.isStatic = stamp.isStatic
+    return payload
   } catch {
-    return tree
+    return null
   }
 }
 
@@ -1768,16 +1656,6 @@ function withRscQuery(url: URL, headers?: Headers): string {
   return next.href
 }
 
-// The public URL pattern of a route in the client's bracket form, split into
-// segments — the same shape the optimistic-routing trie keys on.
-function routePublicPattern(route: Pick<RouteManifestEntry, 'route'>): string[] {
-  return route.route
-    .replace(/:([a-zA-Z0-9_]+)\*/g, '[...$1]')
-    .replace(/:([a-zA-Z0-9_]+)/g, '[$1]')
-    .split('/')
-    .filter(Boolean)
-}
-
 /**
  * Static siblings of the route's deepest dynamic segment, for the RSC payload.
  * Next's flight data carries the sibling names of a dynamic trie level so the
@@ -1788,7 +1666,7 @@ function routeStaticChildren(
   routes: readonly RouteManifestEntry[],
   route: RouteManifestEntry,
 ): string[] {
-  return staticSiblingNames(routes, routePublicPattern(route))
+  return staticSiblingNames(routes, nextRoutePattern(route.route).split('/').filter(Boolean))
 }
 
 /**
@@ -1876,9 +1754,4 @@ function fullRouteRscResponse(
       'cache-control': 'private, no-store',
     },
   })
-}
-
-function withDeploymentId(response: Response): Response {
-  response.headers.set('x-nextjs-deployment-id', deploymentId())
-  return response
 }

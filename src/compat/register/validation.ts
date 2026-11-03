@@ -17,12 +17,13 @@ import {
 } from '../../extensions'
 import type { RouteManifestEntry } from '../../types'
 import { writeBuildFlags } from '../cache/build-flags'
-import { validateBuild } from '../validation/validate'
+import { validateBuild, validatePrerenderRoutes } from '../validation/validate'
 import {
   diagnoseCacheComponentsPrerender,
   diagnosticLeadsWithErrorLine,
   prerenderFailureFooter,
 } from '../validation/prerender-diagnostics'
+import { formatBuildError } from '../validation/errors'
 
 let registered = false
 // Host-scoped guard: a fresh host must be registered into again.
@@ -32,16 +33,17 @@ export function registerValidationExtensions(config: ResolvedConfig): void {
   if (registered) return
   if (!nextCompatEnabled(config)) return
   registered = true
-
   const step: BuildStep = async ctx => {
     // Runtime compat gate: the extension registry is process-global, so once any compat.next build
     // registers this step it stays registered for every later buildProject() in the same process -
     // including pure-core fixtures that legitimately have no root layout. Re-check enablement per build so
     // validation only runs for the app that actually enabled compat.next.
     if (!nextCompatEnabled(ctx.config)) return
-    await ctx.log.step('validate build', () =>
-      Promise.resolve(validateBuild(ctx.config, ctx.routes as RouteManifestEntry[])),
-    )
+    await ctx.log.step('validate build', async () => {
+      const routes = ctx.routes as RouteManifestEntry[]
+      validateBuild(ctx.config, routes, ctx.prerender)
+      if (ctx.prerender !== false) await validatePrerenderRoutes(ctx.config, routes)
+    })
   }
   // Gate step: validation diagnostics must beat any error the invalid app would
   // otherwise raise first from bundling or the not-found prerender.
@@ -50,6 +52,7 @@ export function registerValidationExtensions(config: ResolvedConfig): void {
   setBuildCompatExtensions({
     diagnoseCacheComponentsPrerender,
     diagnosticLeadsWithErrorLine,
+    formatBuildError,
     prerenderFailureFooter,
     recordBuildFlags: writeBuildFlags,
   })

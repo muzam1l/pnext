@@ -3,9 +3,12 @@
 # pull_request_target so fork PRs get secrets; nothing here checks out or runs PR code.
 name: tests
 
+# No `labeled` here: a skipped run from any other label would replace this check's real result on the PR.
+# The guest `ok-to-test` label calls this workflow from ok-to-test.yml.
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, labeled]
+    types: [opened, reopened, synchronize]
+  workflow_call:
 
 permissions:
   checks: write
@@ -13,10 +16,8 @@ permissions:
 jobs:
   tests:
     if: >-
-      github.event.action == 'labeled' && github.event.label.name == 'ok-to-test'
-      || github.event.action != 'labeled'
-      && (contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
-      || contains(github.event.pull_request.labels.*.name, 'ok-to-test'))
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+      || contains(github.event.pull_request.labels.*.name, 'ok-to-test')
     runs-on: ubuntu-latest
     timeout-minutes: 180
     concurrency:

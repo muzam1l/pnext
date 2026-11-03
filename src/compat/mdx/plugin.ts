@@ -11,7 +11,6 @@
 import { readFile } from 'node:fs/promises'
 import type { Plugin } from 'esbuild'
 import { applyClientSourceTransforms } from '../../extensions'
-import { compileMdx } from './compile'
 
 const MDX_FILTER = /\.mdx?$/
 
@@ -26,7 +25,10 @@ export function mdxEsbuildPlugin(rootOverride?: string): Plugin {
     setup(build) {
       const root = rootOverride ?? build.initialOptions.absWorkingDir ?? process.cwd()
       build.onLoad({ filter: MDX_FILTER }, async args => {
-        const source = await readFile(args.path, 'utf8')
+        const [source, { compileMdx }] = await Promise.all([
+          readFile(args.path, 'utf8'),
+          import('./compile'),
+        ])
         const { code } = await compileMdx(source, args.path, root)
         // Compiled MDX must still pass through registered source transforms
         // (e.g. modularizeImports) — raw compileMdx output bypasses them.

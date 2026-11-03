@@ -28,6 +28,7 @@ import {
 type AfterTask<T> = Promise<T> | (() => T | Promise<T>)
 
 const requestContextSymbol = Symbol.for('@next/request-context')
+const afterRenderPhaseSymbol = Symbol.for('pnext.afterRenderPhase')
 
 /**
  * Marks an error that escaped an after() task during a BUILD prerender. The build's per-route
@@ -131,14 +132,20 @@ export function after<T>(task: AfterTask<T>): void {
   const unit = getWorkUnit()
   const isHandlerOrAction =
     unit?.phase === 'action' || unit?.phase === 'middleware' || unit?.routeKind === 'route-handler'
-  const isNestedRequestAfter =
-    unit?.phase === 'after' && Boolean(currentRequest()) && afterRequestApisAllowed()
+  const isNestedRequestAfter = Boolean(currentRequest()) && afterRequestApisAllowed()
   // Handlers and actions capture the live request scope so headers()/cookies() keep working inside their
   // after() callbacks. A page render (or generateMetadata) instead captures only the React cache()
   // scope, so cache() shares the render's memo cache in the callback while the request scope stays
   // detached and headers()/cookies()/connection() still throw Next's "used inside after()" error.
-  const withScope =
+  const capturedScope =
     isHandlerOrAction || isNestedRequestAfter ? captureRequestScope() : captureCacheScope()
+  const withScope = <R>(callback: () => R): R => {
+    // Promise continuations captured during render retain the original work unit, not the flush copy.
+    if (unit?.phase === 'render' && !isHandlerOrAction && !isNestedRequestAfter) {
+      unit.phase = 'after'
+    }
+    return capturedScope(callback)
+  }
   // Static-generation render (build prerender or ISR regeneration): there is
   // no response close to flush against, so the task queues on the render's
   // cache meta and the render drains it once produce settles (Next waits for
@@ -166,9 +173,19 @@ export function after<T>(task: AfterTask<T>): void {
     ;(meta.afterTasks ??= []).push(run)
     return
   }
+  if (unit?.phase === 'render' && !isHandlerOrAction && !isNestedRequestAfter) {
+    unit.compat ??= {}
+    if (!unit.compat[afterRenderPhaseSymbol]) {
+      unit.compat[afterRenderPhaseSymbol] = true
+      // Render promise continuations must enter after before any action callback can release them.
+      unit.afterTasks.unshift(() => {
+        unit.phase = 'after'
+      })
+    }
+  }
   const requestApisAllowed = Boolean(isHandlerOrAction || isNestedRequestAfter)
   const queued = queueAfterTask(() =>
-    withScope(() => runWithAfterRequestApiScope(requestApisAllowed, () => runAfterTask(task))),
+    capturedScope(() => runWithAfterRequestApiScope(requestApisAllowed, () => runAfterTask(task))),
   )
   if (queued) return
   // No active work unit (e.g. called at module scope): best-effort microtask.

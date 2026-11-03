@@ -28,10 +28,11 @@ import {
   releaseModuleHref,
 } from '../../runtime/production'
 import {
-  isPprShellUpgradeEligible,
+  pprShellLeavesParamHoles,
   renderGlobalNotFoundResponse,
   renderPageResponse,
   renderPageWithStatus,
+  warmPageModules,
 } from '../../render/renderer'
 import {
   handleRouteModule,
@@ -63,7 +64,9 @@ import {
   flushWorkUnit,
   flushWorkUnitOnClose,
   getWorkUnit,
+  recordServerTiming,
   runWithWorkUnit,
+  serverTimingEnabled,
   setPhase,
   setWorkUnitRelease,
   setWorkUnitRoute,
@@ -80,13 +83,22 @@ import type {
   StaticFileMetadata,
 } from '../../types'
 
+const NON_HTML_SEC_FETCH_DEST =
+  /^(?:audio|audioworklet|font|image|json|manifest|paintworklet|report|script|serviceworker|sharedworker|style|track|video|webidentity|worker|xslt)$/
+
 /**
  * The production request handler `pnext start` serves with. Exposed on its own
  * so deployment adapters (e.g. Vercel) can serve the exact same pipeline
  * without the Bun.serve wrapper.
  */
 export async function createRequestHandler(
-  options: { root?: string; config?: ResolvedConfig; manifest?: BuildManifest } = {},
+  options: {
+    root?: string
+    config?: ResolvedConfig
+    manifest?: BuildManifest
+    /** Import every page's modules in the background once ready (a serverless instance's boot). */
+    warm?: boolean
+  } = {},
 ) {
   // `start` already resolved (and bootstrapped) the config for its output-mode
   // guard; reusing it skips a second loadConfig — env load, pnext.config +
@@ -94,8 +106,7 @@ export async function createRequestHandler(
   const config = options.config ?? (await loadConfig(options.root, { serve: true }))
   // Compat plugin loader: the single gated seam that populates the core
   // extension registries when compat is enabled (no-op for pure-core apps).
-  // A prod server answers the very next request, so it takes both tiers here.
-  await bootstrapCompat(config)
+  await bootstrapCompat(config, { serve: true })
   const manifestPath = buildManifestFile(config.outPath)
   // `start` reads the manifest before binding the port (a missing build must
   // still fail there, not on the first request) and hands it over.
@@ -286,6 +297,18 @@ export async function createRequestHandler(
   })
 
   async function renderNotFound(request: Request): Promise<Response> {
+    if (
+      (request.method === 'GET' || request.method === 'HEAD') &&
+      NON_HTML_SEC_FETCH_DEST.test(request.headers.get('sec-fetch-dest') ?? '')
+    ) {
+      return new Response('Not Found', {
+        status: 404,
+        headers: {
+          'cache-control': 'private, no-cache, no-store, max-age=0, must-revalidate',
+          'content-type': 'text/plain; charset=utf-8',
+        },
+      })
+    }
     const built = await maybeBuiltFile(
       config.outPath,
       '/404',
@@ -319,6 +342,8 @@ export async function createRequestHandler(
     )
   }
 
+  if (options.warm) void warmPages(config, manifest.routes)
+
   return function handleRequest(request: Request, server?: PeerAddressSource): Promise<Response> {
     // One work unit spans the whole request; its after-queue flushes once the
     // response fully closes (stream end, redirect, notFound, error, abort).
@@ -326,6 +351,8 @@ export async function createRequestHandler(
       const unit = getWorkUnit()
       // Every request is work of this release: app-directory facts come from it, never the disk.
       setWorkUnitRelease(release)
+      const started = performance.now()
+      if (unit && serverTimingEnabled()) unit.timings = []
       try {
         const raw = await handle(request, server)
         const finalized = await finalizeResponse(
@@ -337,11 +364,24 @@ export async function createRequestHandler(
             hints: unit?.responseHints,
           },
         )
+        if (unit?.timings) appendServerTiming(finalized, unit.timings, performance.now() - started)
         const response = maybeCloseNodeFetchConnection(finalized, request)
         // Wired before the close-observer wraps the body: the stream a handler
         // passed through from fetch is still the one the abort map knows.
         abortUpstreamFetchOnDisconnect(response.body, request.signal)
-        return flushWorkUnitOnClose(response, unit, request.signal)
+        const onBodyError = getRequestExtensions().onResponseBodyError
+        return flushWorkUnitOnClose(
+          response,
+          unit,
+          request.signal,
+          onBodyError &&
+            (error =>
+              onBodyError(
+                error,
+                { method: request.method, url: request.url, headers: request.headers },
+                { phase: unit?.phase, routeKind: unit?.routeKind },
+              )),
+        )
       } catch (error) {
         // A dropped promise here would close the socket without a response
         // (client sees "socket hang up"); surface a 500 instead. The error
@@ -356,8 +396,17 @@ export async function createRequestHandler(
         if (markErrorLogged(error)) {
           console.error(`pnext start: request failed for ${request.url}:`, error)
         }
-        flushWorkUnit(unit)
-        return new Response('Internal Server Error', { status: 500 })
+        try {
+          return await finalizeResponse(
+            new Response('Internal Server Error', { status: 500 }),
+            { method: request.method, url: new URL(request.url), headers: request.headers },
+            { routeKind: unit?.routeKind ?? 'html', routeMode: unit?.routeMode },
+          )
+        } catch {
+          return new Response('Internal Server Error', { status: 500 })
+        } finally {
+          flushWorkUnit(unit)
+        }
       }
     })
   }
@@ -415,9 +464,12 @@ export async function createRequestHandler(
     const canonicalRedirect = trailingSlashRedirect(config, requestedUrl)
     if (canonicalRedirect) return canonicalRedirect
     const canonicalUrl = new URL(request.url)
-    const canonicalHeaders = request.headers
+    const beforeProxy = getRequestExtensions().beforeProxy
+    if (beforeProxy) await beforeProxy(request)
     let proxyResponse: Response | undefined
+    const proxyStarted = performance.now()
     const proxyResult = revalidateBypass ? undefined : await proxyRunner(request)
+    recordServerTiming('proxy', performance.now() - proxyStarted)
     if (proxyResult instanceof Response) return proxyResult
     if (proxyResult) {
       request = proxyResult.request
@@ -435,6 +487,7 @@ export async function createRequestHandler(
     // rewrite's destination path), while matching / static lookup / staleness
     // use the (possibly rewritten) url. Pure-core apps register no
     // interceptors (a no-op).
+    const interceptStarted = performance.now()
     for (const interceptor of getRequestExtensions().interceptors) {
       const result = await interceptor(request, { config })
       // Interceptor responses (segment/flight payloads, action results) sit in
@@ -444,6 +497,7 @@ export async function createRequestHandler(
         return applyProxyResponse(compressResponse(result, request), proxyResponse)
       if (result) request = result.request
     }
+    recordServerTiming('intercept', performance.now() - interceptStarted)
     let url = new URL(request.url)
     const rewritten = url.href !== canonicalUrl.href
     // Unlike pathname, Next DOES thread a rewrite's destination query into the page's `searchParams`
@@ -452,17 +506,18 @@ export async function createRequestHandler(
     // picks up whatever search ended up on the fully-resolved request.
     const canonicalRequestUrl = new URL(canonicalUrl)
     canonicalRequestUrl.search = url.search
+    // The resolved request's headers: a middleware rewrite's request-header overrides apply to the render.
     const canonicalRequest =
       canonicalRequestUrl.href === request.url
         ? request
-        : new Request(canonicalRequestUrl, { headers: canonicalHeaders })
+        : new Request(canonicalRequestUrl, { headers: request.headers })
 
     const method = request.method.toUpperCase()
     // Soft navigations carry the client's parallel-route state; when the
     // target involves slots, interception, or a host render, the response is
     // state-dependent and must render dynamically (never from prebuilt html).
     const nav = parseNavState(request)
-    const selection = selectRouteForRequest(manifest.routes, url.pathname, nav)
+    const selection = selectRouteForRequest(manifest.routes, url.pathname, nav, request.headers)
     const softDynamic = Boolean(
       nav &&
       selection?.route.kind === 'page' &&
@@ -716,13 +771,6 @@ export async function createRequestHandler(
       )
     }
 
-    // dynamicParams=false: dynamic segments governed by it must resolve to a
-    // prerendered param set; anything else is a 404. (Prebuilt paths were
-    // already served from the static output above.)
-    if (!dynamicParamsAllowed(matched.route, matched.params)) {
-      return applyProxyResponse(await renderNotFound(canonicalRequest), proxyResponse)
-    }
-
     // force-static routes render with an empty request and no search params
     // even when served dynamically (Next returns empty cookies/headers/params).
     const forceStaticRoute = matched.route.segmentConfig?.dynamic === 'force-static'
@@ -738,10 +786,21 @@ export async function createRequestHandler(
         ? new Request(canonicalRequest.url, { headers: canonicalRequest.headers })
         : canonicalRequest
     const pageRevalidateReason = stalePage ? staleReason : hardExpired ? 'on-demand' : undefined
+    // An unbuilt param of a route whose build prerenders stayed static: dynamic usage fails it.
+    const onDemandPrerender =
+      nextCompat &&
+      matched.route.onDemandStatic === true &&
+      !built &&
+      !draftBypass &&
+      !softDynamic &&
+      (method === 'GET' || method === 'HEAD')
+    // A draft-mode render is per request: never an ISR document a CDN may keep.
+    const revalidateReason = draftBypass ? undefined : pageRevalidateReason
+    const mode = draftBypass ? 'dynamic' : routeModeOf(matched.route)
     setWorkUnitRoute(
       'html',
-      pageRevalidateReason ? 'isr' : routeModeOf(matched.route),
-      responseHintsFor(matched.route, pageRevalidateReason),
+      revalidateReason ? 'isr' : onDemandPrerender && mode === 'dynamic' ? 'static' : mode,
+      responseHintsFor(matched.route, revalidateReason),
     )
     const renderMatchedPage = () =>
       withRouteRuntime(matched.route.segmentConfig?.runtime, () =>
@@ -772,6 +831,7 @@ export async function createRequestHandler(
       fetchCache: matched.route.segmentConfig?.fetchCache,
       refreshFetches: Boolean(stalePage),
       route: url.pathname,
+      onDemandPrerender,
     })
     const renderRevalidateSeconds =
       renderedPage.revalidateSeconds ??
@@ -789,14 +849,18 @@ export async function createRequestHandler(
     // so after a server action revalidated the path the browser replayed the pre-revalidation payload.
     // A `segmentConfig.revalidate > 0` route is already classified 'isr' by routeModeOf above.
     const renderWasDynamic =
-      matched.route.mode === 'dynamic' || matched.route.usesRequest || renderedPage.noStore === true
+      renderedPage.noStore === true ||
+      (!onDemandPrerender && (matched.route.mode === 'dynamic' || matched.route.usesRequest))
     if (renderRevalidateSeconds !== undefined && renderRevalidateSeconds > 0 && !renderWasDynamic) {
       setWorkUnitRoute('html', 'isr', {
         ...(getWorkUnit()?.responseHints ?? {}),
         revalidateSeconds: renderRevalidateSeconds,
       })
     }
-    const pageResponse = renderedPage.value
+    let pageResponse = renderedPage.value
+    // Its SSR pass failed (failOnDemandPrerender): Next answers 500 while the browser recovers.
+    if (onDemandPrerender && renderedPage.noStore)
+      pageResponse = new Response(pageResponse.body, { status: 500, headers: pageResponse.headers })
 
     // A PPR resume replays the prebuilt shell without re-running the
     // components whose react-dom preload()/font hints produced the prerender's
@@ -823,13 +887,12 @@ export async function createRequestHandler(
     // requests serve it as a HIT, Next-style.
     const lazyStaticCapable =
       matched.route.kind === 'page' &&
-      // A request that can promote a fallback shell into a more specific route
-      // shell must keep re-entering the renderer: caching its first (still
-      // un-upgraded) render on disk would serve every later request as a HIT
-      // and the upgraded shell would never reach the client.
-      !isPprShellUpgradeEligible(config, matched.route, url) &&
       (forceStaticRoute ||
+        onDemandPrerender ||
         (!matched.route.usesRequest &&
+          // `dynamic = 'force-dynamic'` opts the route out of every render cache in Next: persisting
+          // the first render would serve every later request as a static HIT and never re-render.
+          matched.route.segmentConfig?.dynamic !== 'force-dynamic' &&
           // Next never statically caches `runtime = 'edge'` pages (they are
           // excluded from build prerendering too — see build.ts); their data
           // stability comes from the fetch cache alone.
@@ -845,10 +908,23 @@ export async function createRequestHandler(
       method === 'GET' &&
       url.search === '' &&
       pageResponse.status === 200 &&
-      (pageResponse.headers.get('content-type') ?? '').includes('text/html')
+      (pageResponse.headers.get('content-type') ?? '').includes('text/html') &&
+      // A document whose shell still hangs a param is not this URL's static page.
+      !pprShellLeavesParamHoles(
+        matched.route,
+        matched.targetPath === url.pathname ? url : new URL(matched.targetPath, url),
+      )
     ) {
       try {
-        const file = lazyStaticHtmlPath(config.outPath, url.pathname)
+        // Stored like build prerenders (decoded) unless decoding is ambiguous; lookups try both.
+        const segments = url.pathname.split('/').map(decodeURIComponent)
+        const decoded = segments.join('/')
+        const file = lazyStaticHtmlPath(
+          config.outPath,
+          decoded.includes('%') || segments.some(segment => segment.includes('/'))
+            ? url.pathname
+            : decoded,
+        )
         if (!file) throw new Error('unsafe path')
         await mkdir(path.dirname(file), { recursive: true })
         await writeFile(file, await pageResponse.clone().text())
@@ -870,8 +946,8 @@ export async function createRequestHandler(
           ],
           routeId: matched.route.id,
           kind: 'page',
-          ...(renderedPage.revalidateSeconds !== undefined
-            ? { revalidateSeconds: renderedPage.revalidateSeconds }
+          ...(renderRevalidateSeconds !== undefined
+            ? { revalidateSeconds: renderRevalidateSeconds }
             : {}),
           ...(matched.route.cacheLife?.expireSeconds !== undefined
             ? { expireSeconds: matched.route.cacheLife.expireSeconds }
@@ -927,6 +1003,30 @@ export async function createRequestHandler(
       pageResponse.headers.set('x-nextjs-cache', 'REVALIDATED')
     }
     return applyProxyResponse(compressResponse(pageResponse, request), proxyResponse)
+  }
+}
+
+/** One page at a time, so a request arriving mid-warm shares the imports rather than queueing behind all of them. */
+async function warmPages(config: ResolvedConfig, routes: RouteManifestEntry[]) {
+  for (const route of routes) {
+    if (route.kind !== 'page' || route.segmentConfig?.runtime === 'edge') continue
+    await warmPageModules(config, route)
+  }
+}
+
+/** Time to headers per phase, as a Server-Timing header. Steps after the headers (streaming) are not in it. */
+function appendServerTiming(response: Response, timings: [string, number][], total: number) {
+  const entries = timings.map(
+    ([label, ms]) =>
+      `${label.replace(/[^\w-]+/g, '-')};desc=${JSON.stringify(label)};dur=${ms.toFixed(1)}`,
+  )
+  try {
+    response.headers.append(
+      'server-timing',
+      [...entries, `total;dur=${total.toFixed(1)}`].join(', '),
+    )
+  } catch {
+    // Immutable headers (a passed-through fetch response): serve it without the breakdown.
   }
 }
 
@@ -1129,7 +1229,12 @@ function builtFileCandidates(
   // pathname arrives percent-encoded (prerender-encoding suite).
   try {
     const decoded = decodeURIComponent(trimmed)
-    if (decoded !== trimmed && !decoded.split('/').some(seg => seg === '..' || seg === '')) {
+    // A decoded `%` would let a double-encoded request answer with its single-encoded twin's file.
+    if (
+      decoded !== trimmed &&
+      !decoded.includes('%') &&
+      !decoded.split('/').some(seg => seg === '..' || seg === '')
+    ) {
       candidates.push(
         path.join(publicPath, decoded, 'index.html'),
         path.join(publicPath, `${decoded.replace(/\/+$/, '')}.html`),
@@ -1195,26 +1300,6 @@ function cacheLifeResponseHeaders(life: RouteManifestEntry['cacheLife']): [strin
 // route-handler bodies. `relative` uses forward slashes (see builtFileInfo).
 function isImmutableAssetFile(relative: string) {
   return relative.startsWith('assets/') || relative.startsWith('_next/static/')
-}
-
-// `dynamicParams = false` (route segment config): params governed by the
-// declaration must match one of the build's static param sets. When
-// the page has its own static params export, the route behaves like Next's
-// fallback: false — the full param tuple must match a prerendered path.
-function dynamicParamsAllowed(route: RouteManifestEntry, params: Record<string, RouteParamValue>) {
-  const governed = route.segmentConfig?.dynamicParamsFalse
-  if (!governed?.length) return true
-  const allowed = route.prerenderedParams ?? []
-  const required = route.segmentConfig?.strictDynamicParams
-    ? [...route.params, ...(route.catchAll ? [route.catchAll] : [])]
-    : governed
-  return allowed.some(set => required.every(param => paramValueEqual(set[param], params[param])))
-}
-
-function paramValueEqual(a: RouteParamValue | undefined, b: RouteParamValue | undefined) {
-  if (a === undefined || b === undefined) return false
-  const join = (value: RouteParamValue) => (Array.isArray(value) ? value.join('/') : value)
-  return join(a) === join(b)
 }
 
 export async function maybeBuiltFile(

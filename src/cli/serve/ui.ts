@@ -7,6 +7,8 @@ interface ReadyBanner {
   /** The bind hostname, used to derive Local/Network URLs. */
   hostname: string
   port: number
+  networkHostname?: string
+  protocol?: 'http' | 'https'
   /** Milliseconds to boot, when known (dev server startup). */
   elapsedMs?: number
 }
@@ -24,14 +26,24 @@ export function browserHost(hostname: string) {
 }
 
 /** Print a Next.js-style "server ready" banner with local and network URLs. */
-export function printServerReady({ mode, hostname, port, elapsedMs }: ReadyBanner) {
-  const rows: [string, string][] = [['Local:', cyan(`http://${browserHost(hostname)}:${port}`)]]
+export function printServerReady({
+  mode,
+  hostname,
+  port,
+  elapsedMs,
+  networkHostname,
+  protocol = 'http',
+}: ReadyBanner) {
+  const rows: [string, string][] = [
+    ['Local:', cyan(`${protocol}://${browserHost(hostname)}:${port}`)],
+  ]
 
   // When bound to all interfaces, surface the LAN address so it's reachable
   // from other devices (phones, other machines) without hunting for the IP.
   // Next prints the bracketed wildcard itself for IPv6 (`http://[::]:port`).
-  const lan = hostname === '::' ? '[::]' : wildcard(hostname) ? lanAddress() : undefined
-  if (lan) rows.push(['Network:', cyan(`http://${lan}:${port}`)])
+  const lan =
+    networkHostname ?? (hostname === '::' ? '[::]' : wildcard(hostname) ? lanAddress() : undefined)
+  if (lan) rows.push(['Network:', cyan(`${protocol}://${lan}:${port}`)])
 
   const ready =
     elapsedMs === undefined
@@ -51,6 +63,24 @@ export function printServerReady({ mode, hostname, port, elapsedMs }: ReadyBanne
 
 function wildcard(hostname: string) {
   return hostname === '0.0.0.0' || hostname === '::'
+}
+
+export async function availableDevPort(port: number | undefined, hostname: string) {
+  if (port === 0) return port
+  const initial = port ?? 3000
+  for (let candidate = initial; ; candidate++) {
+    try {
+      await ensurePortFree(candidate, hostname)
+    } catch (error) {
+      if (port !== undefined || candidate === initial + 10) throw error
+      continue
+    }
+    if (candidate !== initial)
+      console.warn(
+        `⚠ Port ${initial} is in use by an unknown process, using available port ${candidate} instead.`,
+      )
+    return candidate
+  }
 }
 
 /**

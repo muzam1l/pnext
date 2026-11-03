@@ -1,10 +1,14 @@
+import {
+  USE_CACHE_HANGING_MESSAGE,
+  useCacheSearchParamsMessage,
+} from '../cache/build-prerender-errors'
 // Build-time validation pass (COMPAT - may import core freely).
 //
 // One route-tree + module-graph scan emitting Next-compatible build-error strings. Runs as a build
 // step; a validation failure throws, which aborts `pnext build` - exactly what the Next e2e suites
 // assert (`next build` FAILS with a specific message, substring-matched from stderr).
 //
-// The pass reads ONLY the scanned route table plus route source files on disk. It never renders.
+// Structural checks read source; prerender constraints resolve selected modules without rendering.
 // Checks: missing root layout; an app/ page conflicting with a pages/ file; two parallel
 // (route-group) pages resolving to the same path; useSearchParams() without a Suspense boundary;
 // undefined/non-component default export; and the output:'export' extras (exportPathMap + app, a
@@ -12,19 +16,37 @@
 
 import { existsSync, readdirSync } from 'node:fs'
 import path from 'node:path'
+import { workspaceRootInfo } from '../../resolve/package-json'
+import { devServerModuleHref } from '../../runtime/load'
+import { setNavigationPrerenderRoutes } from '../cache/build-prerender-errors'
+import { segmentNames } from '../cache/use-cache-transform'
 import { readSourceSync } from '../../resolve/source-text'
 import type { ResolvedConfig } from '../../config'
 import { extraPageExtensions } from '../../extensions'
 import type { RouteManifestEntry } from '../../types'
 import { legacyRequestAPIs } from '../../request/context'
+import { routeParamKeys } from '../../render/renderer'
 import { getNextConfig } from '../next/config-loader'
+import { isPNextRuntimeFile } from '../bundler/webpack-loaders'
+import { unrenderableSlots } from '../../routing/slots'
 import { stripComments } from '../../utils/code'
+import {
+  consumedSegments,
+  matchSegments,
+  slotConventionFile,
+  slotDirectoriesIn,
+} from '../../routing/slots'
 import {
   conflictingAppAndPageMessage,
   conflictingParallelPagesMessage,
   dynamicForceDynamicWithExportMessage,
   forceDynamicPageWithExportMessage,
   exportPathMapWithAppDirMessage,
+  generatedStaticParamsEmptyMessage,
+  generatedStaticParamsIncompleteMessage,
+  generatedStaticParamsInvalidEntryMessage,
+  generatedStaticParamsInvalidValueMessage,
+  generatedStaticParamsValueType,
   incompatibleCacheComponentsSegmentConfigMessage,
   missingDefaultParallelRouteMessage,
   missingGenerateStaticParamsForExportMessage,
@@ -33,28 +55,26 @@ import {
   routeHandlerNotStaticWithExportMessage,
   undefinedDefaultExportMessage,
   unresolvedCodemodCommentMessage,
+  PnextBuildValidationError,
 } from './errors'
 
 const BASE_PAGE_EXTENSIONS = ['tsx', 'ts', 'jsx', 'js', 'mjs'] as const
+const navigationStaticRoutes = new Set<string>()
 
 /**
- * A build-error the validation pass surfaces. Carries only Next's message; the
- * build's catch surfaces `.message` to stderr, where the harness greps it.
- */
-export class PnextBuildValidationError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = 'PnextBuildValidationError'
-  }
-}
-
-/**
- * Run every validation check; throws PnextBuildValidationError on the first
+ * Run source-only validation checks; throws PnextBuildValidationError on the first
  * failure. Fully synchronous: every check reads through `readSource`, so the
  * pass never yields and each file is read at most once.
  */
-export function validateBuild(config: ResolvedConfig, routes: RouteManifestEntry[]): void {
+export function validateBuild(
+  config: ResolvedConfig,
+  routes: RouteManifestEntry[],
+  prerender = true,
+): void {
   sourceCache.clear()
+  navigationStaticRoutes.clear()
+  setNavigationPrerenderRoutes([])
+  applyInstantAliases(config, routes)
   const pageRoutes = routes.filter(route => route.kind === 'page' && !route.interception)
 
   // Warnings first: Next surfaces them while compiling, i.e. BEFORE any
@@ -64,19 +84,410 @@ export function validateBuild(config: ResolvedConfig, routes: RouteManifestEntry
   validateRootLayout(config, pageRoutes)
   validateAppPagesConflict(config)
   validateParallelPageConflicts(config, pageRoutes)
-  validateMissingSlotDefaults(config, routes)
+  if (looseRouteMatching()) validateMissingSlotDefaults(config, routes)
+  else validateStrictRouteStructure(config, routes)
   validateCodemodComments(routes)
   validateDefaultExports(config, routes)
-  validateSearchParamsSuspense(config, pageRoutes)
+  if (prerender) {
+    validateNonEmptyStaticParams(config, pageRoutes)
+    validateSearchParamsSuspense(config, pageRoutes)
+    validateUseCacheSearchParams(routes)
+    validateUseCacheHangingInputs(routes)
+    validateInstantStaticShells(config, routes)
+    validateExportMode(config, routes)
+  }
   validateUseCacheDirectives(config, routes)
-  validateUseCacheSearchParams(routes)
-  validateUseCacheHangingInputs(routes)
   validateCacheComponentsSegmentConfigs(config, routes)
-  validateInstantStaticShells(config, routes)
   validateClientSegmentConfigs(config, routes)
   validateImageLoaderFile(config)
   validateStaticImageImports(config, routes)
-  validateExportMode(config, routes)
+}
+
+interface RoutePatternCoverage {
+  prefix: (string | null)[]
+  minLength: number
+  unbounded: boolean
+}
+
+function routePatternCoverage(route: string): RoutePatternCoverage {
+  const segments = route.split('/').filter(Boolean)
+  const tail = segments.at(-1)
+  const optional = tail?.startsWith('[[...') ?? false
+  const unbounded = optional || (tail?.startsWith('[...') ?? false)
+  const prefix = unbounded ? segments.slice(0, -1) : segments
+  return {
+    prefix: prefix.map(segment => (segment.startsWith('[') ? null : segment)),
+    minLength: prefix.length + (unbounded && !optional ? 1 : 0),
+    unbounded,
+  }
+}
+
+function routePatternCovered(route: string, canonical: RoutePatternCoverage[]): boolean {
+  const intercepted = routePatternCoverage(route)
+  const prefixCovers = (pattern: RoutePatternCoverage) =>
+    pattern.prefix.every(
+      (segment, index) => segment === null || segment === intercepted.prefix[index],
+    )
+  const acceptsLength = (pattern: RoutePatternCoverage, length: number) =>
+    pattern.unbounded ? length >= pattern.minLength : length === pattern.minLength
+  const coveredAtLength = (length: number) =>
+    canonical.some(pattern => acceptsLength(pattern, length) && prefixCovers(pattern))
+  if (!intercepted.unbounded) return coveredAtLength(intercepted.minLength)
+
+  const unboundedStart = Math.min(
+    ...canonical
+      .filter(pattern => pattern.unbounded && prefixCovers(pattern))
+      .map(pattern => Math.max(intercepted.minLength, pattern.minLength)),
+  )
+  if (unboundedStart === Infinity) return false
+  // Fixed routes can cover shorter URLs before a canonical catch-all takes over.
+  for (let length = intercepted.minLength; length < unboundedStart; length++) {
+    if (!coveredAtLength(length)) return false
+  }
+  return true
+}
+
+function looseRouteMatching(): boolean {
+  const deprecated = getNextConfig().deprecated as { looseRouteMatching?: boolean } | undefined
+  return Boolean(deprecated?.looseRouteMatching)
+}
+
+function validateStrictRouteStructure(config: ResolvedConfig, routes: RouteManifestEntry[]): void {
+  const failures: string[] = []
+  const canonical = routes
+    .filter(route => route.kind === 'page' && !route.interception)
+    .map(route => routePatternCoverage(nextPagePath(route)))
+  const missingCanonical = routes.filter(
+    route => route.interception && !routePatternCovered(nextPagePath(route), canonical),
+  )
+  if (missingCanonical.length) {
+    const descriptions = missingCanonical
+      .map(route => {
+        const source = appDirRelativeFile(config, route.file)
+          .replace(/\/page\.[^.]+$/, '')
+          .split('/')
+          .filter(part => !part.startsWith('@') && !isGroupDir(part))
+          .join('/')
+        return `- /${source} (expected ${nextPagePath(route)})`
+      })
+      .sort()
+    failures.push(
+      `The following interception routes do not have a canonical route:\n${descriptions.join('\n')}\n\nEvery interception route must have a matching non-interception route so the URL can be loaded directly or refreshed.`,
+    )
+  }
+  interface PagePath {
+    file: string
+    parts: string[]
+    url: string[]
+    fallback: boolean
+    interception: boolean
+  }
+  const pages: PagePath[] = []
+  const visit = (dir: string) => {
+    for (const entry of readDirEntries(dir)) {
+      const file = path.join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (!entry.name.startsWith('_')) visit(file)
+      } else if (
+        pageExtensions().some(
+          ext => entry.name === `page.${ext}` || entry.name === `default.${ext}`,
+        )
+      ) {
+        // An explicit `@children` folder is the children slot itself.
+        const parts = path
+          .relative(config.appPath, dir)
+          .split(path.sep)
+          .filter(part => part && part !== '@children')
+        pages.push({
+          file,
+          parts,
+          url: parts.filter(part => !part.startsWith('@') && !isGroupDir(part)),
+          fallback: entry.name.startsWith('default.'),
+          interception: parts.some(part => part.startsWith('(.')),
+        })
+      }
+    }
+  }
+  visit(config.appPath)
+  const ordinaryPages = pages.filter(page => !page.interception)
+  const levels = new Map<string, { parts: string[]; slots: Set<string> }>()
+  for (const page of pages) {
+    for (let index = 0; index < page.parts.length; index++) {
+      if (!page.parts[index]!.startsWith('@')) continue
+      const parts = page.parts.slice(0, index)
+      const key = parts.join('/')
+      const level = levels.get(key) ?? { parts, slots: new Set<string>() }
+      level.slots.add(page.parts[index]!)
+      levels.set(key, level)
+    }
+  }
+  const inLevel = (page: PagePath, parts: string[]) =>
+    parts.every((part, index) => page.parts[index] === part)
+  const slotFor = (page: PagePath, parts: string[]) =>
+    page.parts[parts.length]?.startsWith('@') ? page.parts[parts.length]! : 'children'
+  for (const level of levels.values()) {
+    if (pages.some(page => inLevel(page, level.parts) && slotFor(page, level.parts) === 'children'))
+      level.slots.add('children')
+  }
+  const covers = (pattern: string[], target: string[]) => {
+    for (let index = 0; index < pattern.length; index++) {
+      const segment = pattern[index]!
+      if (segment.startsWith('[[...')) return target.length >= index
+      if (segment.startsWith('[...')) return target.length > index
+      const candidate = target[index]
+      if (candidate === undefined || candidate.includes('...')) return false
+      if (!segment.startsWith('[') && segment !== candidate) return false
+    }
+    return pattern.length === target.length
+  }
+  const specificity = (part: string) =>
+    part.startsWith('[[...') ? 3 : part.startsWith('[...') ? 2 : part.startsWith('[') ? 1 : 0
+  const shadows = (winner: PagePath, loser: PagePath) => {
+    const a = winner.parts.filter(part => !isGroupDir(part))
+    const b = loser.parts.filter(part => !isGroupDir(part))
+    const index = b.findIndex((part, i) => part !== a[i])
+    const theirs = a[index] ?? '@'
+    return !theirs.startsWith('@') && specificity(theirs) < specificity(b[index]!)
+  }
+  const matched = new Set<string>()
+  const incompatible = new Map<string, Set<string>>()
+  const keys = new Map(
+    ordinaryPages.filter(page => !page.fallback).map(page => [page.url.join('/'), page.url]),
+  )
+  for (const url of keys.values()) {
+    const candidates = ordinaryPages.filter(page => !page.fallback && covers(page.url, url))
+    // A more specific segment shadows every page under the less specific sibling directory.
+    const selected = candidates.filter(page => !candidates.some(other => shadows(other, page)))
+    let complete = true
+    for (const level of levels.values()) {
+      if (!selected.some(page => inLevel(page, level.parts))) continue
+      const missing = [...level.slots].filter(
+        slot =>
+          !selected.some(
+            page => inLevel(page, level.parts) && slotFor(page, level.parts) === slot,
+          ) &&
+          !ordinaryPages.some(
+            page =>
+              page.fallback &&
+              page.parts.join('/') ===
+                [...level.parts, ...(slot === 'children' ? [] : [slot])].join('/'),
+          ),
+      )
+      if (!missing.length) continue
+      complete = false
+      if (url.some(segment => segment.includes('...'))) continue
+      const layout =
+        slotConventionFile(path.join(config.appPath, ...level.parts), 'layout') ??
+        path.join(config.appPath, ...level.parts, 'layout')
+      const label = path.relative(config.root, layout).split(path.sep).join('/')
+      const entries = incompatible.get(label) ?? new Set<string>()
+      for (const slot of missing)
+        entries.add(`- /${url.join('/')} is missing a matching page or default.tsx in ${slot}`)
+      incompatible.set(label, entries)
+    }
+    if (complete) for (const page of selected) matched.add(page.file)
+  }
+  if (incompatible.size) {
+    const descriptions = [...incompatible]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([layout, entries]) => `${layout}\n${[...entries].sort().join('\n')}`)
+    failures.push(
+      `The following layouts have parallel route slots that cannot render the same URLs:\n${descriptions.join('\n')}\n\nEvery URL matched by one slot must have a matching page or default.tsx in every sibling slot.`,
+    )
+  }
+  const unmatched = ordinaryPages
+    .filter(page => !page.fallback && !matched.has(page.file))
+    .map(page => path.relative(config.root, page.file).split(path.sep).join('/'))
+    .sort()
+  if (unmatched.length)
+    failures.push(
+      `The following page files do not match any complete route:\n${unmatched.map(file => `- ${file}`).join('\n')}\n\nEvery page must be part of at least one complete route. Add matching pages or default files for the sibling parallel route slots, or remove the unreachable pages.`,
+    )
+  if (failures.length) {
+    console.warn(
+      "Strict route matching is enabled by default. This validation indicates a bug in your app's route structure, but you can temporarily restore loose route matching by setting `deprecated.looseRouteMatching` to `true` in your Next.js config.",
+    )
+    throw new PnextBuildValidationError(failures.join('\n\n'))
+  }
+}
+
+type EnsureStatic = 'auto' | 'shell' | 'prefetch' | 'navigation' | false
+interface EnsureStaticSource {
+  value: EnsureStatic
+  file: string
+}
+
+function compareEnsureStatic(left: EnsureStatic, right: EnsureStatic): number {
+  if (left === 'auto' || right === 'auto' || left === right) return 0
+  if (left === false || right === false) return NaN
+  const order = ['shell', 'prefetch', 'navigation']
+  return order.indexOf(left) - order.indexOf(right)
+}
+
+export async function validatePrerenderRoutes(
+  config: ResolvedConfig,
+  routes: RouteManifestEntry[],
+): Promise<void> {
+  if (!cacheComponentsIsEnabled()) return
+  const navigationRoutes: { pattern: string; page: string }[] = []
+  const modules = new Map<string, Promise<Record<string, unknown>>>()
+  const load = (file: string) => {
+    let pending = modules.get(file)
+    if (!pending) {
+      pending = devServerModuleHref(config, file, 'build').then(
+        href => import(href) as Promise<Record<string, unknown>>,
+      )
+      modules.set(file, pending)
+    }
+    return pending
+  }
+  const ensureStaticSource = async (file: string): Promise<EnsureStaticSource> => ({
+    value: ((await load(file)).ensureStatic ?? 'auto') as EnsureStatic,
+    file,
+  })
+  for (const route of routes) {
+    if (route.kind !== 'page' || route.interception) continue
+    const files = new Set<string>()
+    const dirs = new Set<string>()
+    const add = (file: string) => {
+      files.add(file)
+      let dir = path.dirname(file)
+      while (dir === config.appPath || dir.startsWith(config.appPath + path.sep)) {
+        dirs.add(dir)
+        const layout = slotConventionFile(dir, 'layout')
+        if (layout) files.add(layout)
+        dir = path.dirname(dir)
+      }
+    }
+    add(route.file)
+    const segments = route.route.split('/').filter(Boolean)
+    for (const dir of dirs) {
+      for (const slot of slotDirectoriesIn(dir)) {
+        const remaining = segments.slice(consumedSegments(config.appPath, dir))
+        const file = matchSegments(slot, remaining)?.file ?? slotConventionFile(slot, 'default')
+        if (file) add(file)
+      }
+    }
+    const format = ({ value, file }: EnsureStaticSource) =>
+      `export const ensureStatic = ${JSON.stringify(value)}\n    (from: ${file})`
+    const fixes =
+      '\n\n Possible fixes:\n - Remove one of the `ensureStatic` exports\n - Change one of the  `ensureStatic` exports to match the other'
+    const leaves: Record<string, unknown>[] = []
+    const policy = async (file: string | undefined, inherited: Record<string, unknown>) => {
+      if (!file) return inherited
+      const module = await load(file)
+      const generate = module.unstable_generateParamMatching as (() => unknown) | undefined
+      const fragment =
+        typeof generate === 'function' ? await generate() : module.unstable_paramMatching
+      return { ...inherited, ...(fragment as Record<string, unknown> | undefined) }
+    }
+    const resolve = async (
+      dir: string,
+      inherited: Record<string, unknown>,
+    ): Promise<EnsureStaticSource> => {
+      const layout = slotConventionFile(dir, 'layout')
+      let parent = layout ? await ensureStaticSource(layout) : { value: 'auto' as const, file: dir }
+      const currentPolicy = await policy(layout, inherited)
+      const children: [string, EnsureStaticSource][] = []
+      const page = [...files].find(
+        file => path.dirname(file) === dir && /^(?:page|default)\./.test(path.basename(file)),
+      )
+      if (page) {
+        children.push(['children', await ensureStaticSource(page)])
+        leaves.push(await policy(page, currentPolicy))
+      }
+      for (const child of dirs) {
+        if (path.dirname(child) === dir)
+          children.push([
+            path.basename(child).startsWith('@') ? path.basename(child) : 'children',
+            await resolve(child, currentPolicy),
+          ])
+      }
+      if (children.length === 0) leaves.push(currentPolicy)
+      let result: [string, EnsureStaticSource] | undefined
+      for (const child of children) {
+        if (!result || result[1].value === 'auto') result = child
+        else if (compareEnsureStatic(child[1].value, result[1].value) !== 0) {
+          throw new PnextBuildValidationError(
+            `Parallel slots cannot have incompatible \`ensureStatic\`.\n  ${result[0]}: \n    ${format(result[1])}\n\n  ${child[0]}: \n    ${format(child[1])}${fixes}`,
+          )
+        }
+      }
+      if (result) {
+        const comparison = compareEnsureStatic(result[1].value, parent.value)
+        if (comparison < 0 || Number.isNaN(comparison)) {
+          throw new PnextBuildValidationError(
+            `A child segment cannot override a parent segment with ${Number.isNaN(comparison) ? 'an incompatible' : 'a less-constrained'} \`ensureStatic\`.\n  Parent has: \n    ${format(parent)}\n  Child has: \n    ${format(result[1])}${fixes}`,
+          )
+        }
+        if (parent.value === 'auto' || comparison > 0) parent = result[1]
+      }
+      return parent
+    }
+    const resolved = await resolve(config.appPath, {})
+    if (resolved.value === 'navigation') {
+      navigationStaticRoutes.add(route.file)
+      const resolvedModules = await Promise.all([...files].map(load))
+      validateNavigationStaticParams(route, resolvedModules, leaves)
+      navigationRoutes.push({ pattern: route.pattern, page: nextPagePath(route) })
+    }
+  }
+  setNavigationPrerenderRoutes(navigationRoutes)
+}
+
+function validateNavigationStaticParams(
+  route: RouteManifestEntry,
+  modules: Record<string, unknown>[],
+  policies: Record<string, unknown>[],
+): void {
+  const page = nextPagePath(route)
+  const required = routeParamKeys(route)
+  const matching: Record<string, string> = {}
+  for (const name of required) {
+    const modes = new Set(policies.map(policy => policy[name]).filter(mode => mode !== undefined))
+    if (modes.size > 1)
+      throw new PnextBuildValidationError(
+        `Route "${page}" has conflicting parallel parameter matching modes for parameter "${name}".`,
+      )
+    const mode = [...modes][0]
+    if (mode === 'fallback' || mode === 'dynamic') {
+      throw new PnextBuildValidationError(
+        `Route "${page}" cannot configure parameter "${name}" as "${mode}" with \`ensureStatic = "navigation"\`. Use "blocking" or "not-found" parameter matching, or remove the navigation constraint.`,
+      )
+    }
+    // Like Next, a navigation-static page renders every unlisted param blocking.
+    matching[name] = mode === 'not-found' ? mode : 'blocking'
+  }
+  if (required.length) route.paramMatching = { ...matching, ...route.paramMatching }
+  const hasGenerator = modules.some(
+    module =>
+      typeof module.generateStaticParams === 'function' || typeof module.params === 'function',
+  )
+  if (hasGenerator) route.hasStaticParams = true
+  if (required.length && !hasGenerator) {
+    throw new PnextBuildValidationError(
+      `Page "${page}": \`ensureStatic = "navigation"\` requires an exported \`generateStaticParams()\` function.\nLearn more: https://nextjs.org/docs/messages/generate-static-params#with-ensurestatic`,
+    )
+  }
+}
+
+function applyInstantAliases(config: ResolvedConfig, routes: RouteManifestEntry[]): void {
+  for (const route of routes) {
+    for (const file of [route.file, ...layoutChain(config.appPath, route.file)]) {
+      const source = readSource(file)
+      const match =
+        source &&
+        /^\s*export\s+const\s+(?:instant|unstable_instant)\s*=\s*(true|false|\{)/m.exec(
+          stripComments(source),
+        )
+      if (!match) continue
+      route.segmentConfig = {
+        ...route.segmentConfig,
+        unstableInstant: match[1] !== 'false',
+      }
+      break
+    }
+  }
 }
 
 function validateInstantStaticShells(config: ResolvedConfig, routes: RouteManifestEntry[]): void {
@@ -84,12 +495,17 @@ function validateInstantStaticShells(config: ResolvedConfig, routes: RouteManife
   for (const route of routes) {
     if (route.kind !== 'page') continue
     const pageSource = readSource(route.file)
-    if (!pageSource || !/\bexport\s+const\s+unstable_instant\s*=\s*false\b/.test(pageSource))
+    if (
+      !pageSource ||
+      !/\bexport\s+const\s+(?:instant|unstable_instant)\s*=\s*false\b/.test(pageSource)
+    )
       continue
     if (!/\bconnection\s*\(/.test(pageSource)) continue
     const staticParent = layoutChain(config.appPath, route.file).some(file => {
       const source = readSource(file)
-      return Boolean(source && /\bexport\s+const\s+unstable_instant\s*=\s*true\b/.test(source))
+      return Boolean(
+        source && /\bexport\s+const\s+(?:instant|unstable_instant)\s*=\s*true\b/.test(source),
+      )
     })
     if (!staticParent) continue
     throw new PnextBuildValidationError(
@@ -101,8 +517,7 @@ function validateInstantStaticShells(config: ResolvedConfig, routes: RouteManife
 function validateUseCacheHangingInputs(routes: RouteManifestEntry[]): void {
   if (!cacheComponentsIsEnabled()) return
   const failures: string[] = []
-  const timeout =
-    'Filling a cache during prerender timed out, likely because request-specific arguments such as params, searchParams, cookies() or dynamic data were used inside "use cache".'
+  const timeout = USE_CACHE_HANGING_MESSAGE
   for (const route of routes) {
     if (route.kind !== 'page') continue
     const source = readSource(route.file)
@@ -152,7 +567,7 @@ function validateUseCacheHangingInputs(routes: RouteManifestEntry[]): void {
     // function's call sites. A value produced by ANOTHER cached function resolves from the cache
     // during the prerender, so only calls into uncached code count.
     const cachedNames = new Set(scoped.map(scope => scope.name).filter(name => name !== ''))
-    // A REQUEST-BOUND promise (`cookies()`, `headers()`, a `next/root-params` accessor) is not a
+    // A REQUEST-BOUND or stage promise (`cookies()`, a `next/root-params` accessor, `prefetch()`) is not a
     // hanging input either: such a page never statically prerenders - the request API postpones the
     // boundary and the route builds as runtime-prefetchable/dynamic - so the fill resolves from
     // request data instead of hanging.
@@ -165,14 +580,13 @@ function validateUseCacheHangingInputs(routes: RouteManifestEntry[]): void {
     )
     if (!hangs && !receivesUncachedPromise) continue
     failures.push(
-      `${timeout}\nError occurred prerendering page "${routePath}". Read more: https://nextjs.org/docs/messages/prerender-error`,
+      `Route "${routePath}": ${timeout}\nError occurred prerendering page "${routePath}". Read more: https://nextjs.org/docs/messages/prerender-error`,
     )
   }
   if (failures.length > 0) throw new PnextBuildValidationError(failures.join('\n\n'))
 }
 
 function validateUseCacheSearchParams(routes: RouteManifestEntry[]): void {
-  if (!cacheComponentsIsEnabled()) return
   const failures: string[] = []
   for (const route of routes) {
     if (route.kind !== 'page') continue
@@ -183,22 +597,19 @@ function validateUseCacheSearchParams(routes: RouteManifestEntry[]): void {
     // prerenders and evaluated per-request), and an await outside any cache
     // body is an ordinary dynamic read.
     const scoped = useCacheScopedSource(source).filter(scope => scope.kind !== 'private')
-    // Awaiting `searchParams` that is the cached function's OWN parameter is the
-    // legal runtime-prefetch pattern (the page passes the searchParams promise
-    // into `publicCache(searchParams)` as a vary key). Only a closed-over
-    // page-level `searchParams` read is the E842 violation.
+    // An own `searchParams` param is a legal vary key, except a page segment's request prop.
+    const segments = segmentNames(source, route.file)
     const violates = scoped.some(scope => {
       const params = new Set(scope.params)
       return awaitedIdentifiers(scope.body).some(
-        ident => ident === 'searchParams' && !params.has(ident),
+        ident => ident === 'searchParams' && (!params.has(ident) || !!segments?.has(scope.name)),
       )
     })
     if (!violates) continue
     const routePath = route.route || '/'
     failures.push(
-      `Route ${routePath} used \`searchParams\` inside "use cache". Accessing dynamic request data inside a cache scope is not supported. ` +
-        'If you need some search params inside a cached function await `searchParams` outside of the cached function and pass only the required search params as arguments to the cached function. ' +
-        'See more info here: https://nextjs.org/docs/messages/next-request-in-use-cache\n' +
+      useCacheSearchParamsMessage(routePath) +
+        '\n' +
         `Error occurred prerendering page "${routePath}"`,
     )
   }
@@ -210,9 +621,9 @@ function validateClientSegmentConfigs(config: ResolvedConfig, routes: RouteManif
     if (route.kind !== 'page') continue
     const source = readSource(route.file)
     if (!source || !hasDirective(source, 'use client')) continue
-    if (/\bexport\s+const\s+unstable_instant\b/.test(source)) {
+    if (/\bexport\s+const\s+(?:instant|unstable_instant)\b/.test(source)) {
       throw new PnextBuildValidationError(
-        `"unstable_instant" is a route segment config and can only be used when the segment is a Server Component module. Remove the "use client" directive`,
+        `"instant" is a route segment config and can only be used when the segment is a Server Component module. Remove the "use client" directive`,
       )
     }
     if (
@@ -259,7 +670,7 @@ function validateStaticImageImports(config: ResolvedConfig, routes: RouteManifes
         if (!specifier.startsWith('.')) continue
         if (existsSync(path.resolve(path.dirname(file), specifier))) continue
         throw new PnextBuildValidationError(
-          `Module not found: Can't resolve '${specifier}'\n./app/${appDirRelativeFile(config, file)}`,
+          `Module not found: Can't resolve '${specifier}'\n./${appPath(config, file)}`,
         )
       }
     }
@@ -315,37 +726,20 @@ function hasBabelConfig(root: string): boolean {
 }
 
 function warnMultipleLockfiles(root: string): void {
-  // A configured `outputFileTracingRoot` is authoritative — Next stays silent.
-  if (typeof getNextConfig().outputFileTracingRoot === 'string') return
-  const lockfiles: string[] = []
-  let current = root
-  while (true) {
-    for (const name of [
-      'package-lock.json',
-      'yarn.lock',
-      'pnpm-lock.yaml',
-      'bun.lock',
-      'bun.lockb',
-    ]) {
-      const file = path.join(current, name)
-      if (existsSync(file)) lockfiles.push(file)
-    }
-    // A `pnpm-workspace.yaml` marks the definitive workspace root: stop the walk
-    // there (nothing above it belongs to this project), but still report what was
-    // collected — a lockfile written between the app and the workspace root is
-    // exactly the ambiguity Next warns about.
-    if (existsSync(path.join(current, 'pnpm-workspace.yaml'))) break
-    const parent = path.dirname(current)
-    if (parent === current) break
-    current = parent
+  const { lockfiles, boundary } = workspaceRootInfo(root)
+  if (boundary) {
+    const reason =
+      boundary.type === 'repository'
+        ? `it is outside the current Git repository (${boundary.directory})`
+        : `it would include your home directory (${boundary.directory})`
+    console.warn(
+      `Warning: Next.js ignored ${path.basename(boundary.marker)} in ${path.dirname(boundary.marker)} because ${reason}.\n` +
+        ' To use this directory, set `outputFileTracingRoot` in your Next.js config.\n',
+    )
   }
-  // The ambiguity is about DIRECTORIES: two lockfiles side by side in one
-  // directory still name a single root.
-  const dirs = [...new Set(lockfiles.map(file => path.dirname(file)))]
-  if (dirs.length < 2) return
-  // Next selects the closest lockfile's directory as the root and lists the rest.
-  const selected = dirs[0]
-  const additional = lockfiles.filter(file => path.dirname(file) !== selected)
+  if (lockfiles.length < 2) return
+  const selected = lockfiles[lockfiles.length - 1]
+  const additional = lockfiles.slice(0, -1)
   console.warn(
     '⚠ Warning: Next.js inferred your workspace root, but it may not be correct.\n' +
       ` We detected multiple lockfiles and selected the directory of ${selected} as the root directory.\n` +
@@ -509,15 +903,15 @@ function validateCacheComponentsSegmentConfigs(
         for (const other of routes) {
           if (other.kind !== 'page') continue
           if (!other.sourceFiles.includes(file)) continue
-          importers.add(`./app/${appDirRelativeFile(config, other.file)}`)
+          importers.add(`./${appPath(config, other.file)}`)
         }
-        const layoutRel = `./app/${appDirRelativeFile(config, file)}`
+        const layoutRel = `./${appPath(config, file)}`
         for (const importer of [...importers].sort()) {
           trace += `\n\nImport trace for requested module:\n${importer}\n${layoutRel}`
         }
       }
       failures.push(
-        `./app/${appDirRelativeFile(config, file)}\n` +
+        `./${appPath(config, file)}\n` +
           incompatibleCacheComponentsSegmentConfigMessage(earliest.key) +
           trace,
       )
@@ -623,13 +1017,13 @@ function validateUseCacheDirectives(config: ResolvedConfig, routes: RouteManifes
       for (const directive of useCacheDirectives(source)) {
         if (!enabled) {
           throw new PnextBuildValidationError(
-            useCacheNotEnabledBuildError(`./app/${appDirRelativeFile(config, file)}`, source),
+            useCacheNotEnabledBuildError(`./${appPath(config, file)}`, source),
           )
         }
         const kind = directive.kind
         if (!kinds.has(kind)) {
           throw new PnextBuildValidationError(
-            unknownCacheKindBuildError(`./app/${appDirRelativeFile(config, file)}`, source, kind),
+            unknownCacheKindBuildError(`./${appPath(config, file)}`, source, kind),
           )
         }
       }
@@ -650,7 +1044,7 @@ function isProjectSourceFile(projectRoot: string, file: string): boolean {
 export function useCacheDirectives(source: string): { kind: string }[] {
   const directives = [
     ...directivePrologue(source, 0),
-    ...functionBodies(source).flatMap(offset => directivePrologue(source, offset)),
+    ...functionScopes(source).flatMap(scope => directivePrologue(source, scope.offset)),
   ]
   return directives.flatMap(value => {
     const match = /^use cache(?:\s*:\s*([\w-]+))?$/.exec(value)
@@ -790,7 +1184,7 @@ function isUncachedPromiseExpression(
 function requestApiNames(source: string): Set<string> {
   const names = new Set<string>()
   const imports = source.matchAll(
-    /\bimport\s*\{([^}]*)\}\s*from\s*['"]next\/(?:headers|root-params)['"]/g,
+    /\bimport\s*\{([^}]*)\}\s*from\s*['"]next\/(?:headers|root-params|cache)['"]/g,
   )
   for (const match of imports) {
     for (const clause of match[1]!.split(',')) {
@@ -857,6 +1251,188 @@ function functionBodyEnd(source: string, offset: number): number {
     else if (current === '}' && --depth === 0) return cursor
   }
   return source.length
+}
+
+interface StaticParamsLiteral {
+  expressionIndex: number
+  entries?: string[]
+  type?: string
+}
+
+function staticParamsLiteral(source: string): StaticParamsLiteral | undefined {
+  const declaration =
+    /\bexport\s+(?:async\s+)?function\s+generateStaticParams(?:\s*<[^>{}]*>)?\s*\([^)]*\)\s*(?::\s*[^={]+)?\s*\{/.exec(
+      source,
+    )
+  if (declaration?.index === undefined) return undefined
+  const bodyStart = declaration.index + declaration[0].length
+  const body = source.slice(bodyStart, functionBodyEnd(source, bodyStart))
+  const returned = /\breturn\s+([^;]+)/.exec(body)
+  if (returned?.index === undefined) return undefined
+  let expression = returned[1]!.trim()
+  let expressionIndex = bodyStart + returned.index + returned[0].indexOf(returned[1]!)
+  if (/^[A-Za-z_$][\w$]*$/.test(expression)) {
+    const binding = new RegExp(
+      `\\b(?:const|let|var)\\s+${escapeRegExp(expression)}(?:\\s*:[^=;]+)?\\s*=\\s*(\\[[^;]*\\])`,
+    ).exec(body.slice(0, returned.index))
+    if (binding?.index === undefined) return undefined
+    // Any other use (push, reassignment, spread) means the literal is not what returns.
+    const uses = body.match(new RegExp(`\\b${escapeRegExp(expression)}\\b`, 'g'))?.length ?? 0
+    if (uses > 2) return undefined
+    expression = binding[1]!
+    expressionIndex = bodyStart + binding.index + binding[0].indexOf(binding[1]!)
+  }
+  if (expression.startsWith('[')) {
+    const contents = balancedFrom(expression, 0, '[', ']')
+    if (contents === undefined) return undefined
+    // `[...].map(...)` returns something else: only a complete literal is classified here.
+    if (!/^(?:\s*(?:as|satisfies)\b.*)?$/.test(expression.slice(contents.length + 2)))
+      return undefined
+    return {
+      expressionIndex,
+      entries: contents.trim() === '' ? [] : splitTopLevelCommas(contents),
+    }
+  }
+  const type = staticExpressionType(expression)
+  return type ? { expressionIndex, type } : undefined
+}
+
+function staticExpressionType(expression: string): string | undefined {
+  if (/^null\b/.test(expression)) return 'null'
+  if (expression.startsWith('{')) return 'object'
+  if (expression.startsWith("'") || expression.startsWith('"') || expression.startsWith('`'))
+    return 'string'
+  if (/^(?:true|false)\b/.test(expression)) return 'boolean'
+  if (/^(?:NaN|[-+]?\d)/.test(expression)) return 'number'
+  if (/^undefined\b/.test(expression)) return 'undefined'
+  return undefined
+}
+
+function staticObjectKeys(expression: string): Set<string> | undefined {
+  const trimmed = expression.trim()
+  if (!trimmed.startsWith('{') || balancedFrom(trimmed, 0, '{', '}') === undefined) {
+    return undefined
+  }
+  const keys = new Set<string>()
+  for (const field of splitTopLevelCommas(balancedFrom(trimmed, 0, '{', '}')!)) {
+    const key = /^\s*(?:['"]([^'"]+)['"]|([A-Za-z_$][\w$]*))\s*:/.exec(field)
+    if (!key) return undefined
+    keys.add(key[1] ?? key[2]!)
+  }
+  return keys
+}
+
+function validateNonEmptyStaticParams(config: ResolvedConfig, routes: RouteManifestEntry[]): void {
+  if (!cacheComponentsIsEnabled()) return
+  for (const route of routes) {
+    if (!route.hasStaticParams) continue
+    const source = readSource(route.file)
+    if (!source) continue
+    const literal = staticParamsLiteral(source)
+    if (!literal || literal.entries?.length !== 0) continue
+    const declaration = /\bexport\s+(async\s+)?function\s+generateStaticParams/.exec(source)
+    const literalArray = /\breturn\s*\[\s*\]/.test(source)
+    const index = literalArray
+      ? literal.expressionIndex
+      : (declaration?.index ?? 0) + (declaration?.[1] ? 'export '.length : 0)
+    const before = source.slice(0, index)
+    const line = before.split('\n').length
+    const column = index - before.lastIndexOf('\n')
+    const displayPath = appPath(config, route.file)
+    throw new PnextBuildValidationError(
+      'When using Cache Components, all `generateStaticParams` functions must return at least one result. ' +
+        'This is to ensure that we can perform build-time validation that there is no other dynamic accesses that would cause a runtime error.\n\n' +
+        'Learn more: https://nextjs.org/docs/messages/empty-generate-static-params\n' +
+        `    at generateStaticParams (webpack:///${displayPath}:${line}:${column})\n` +
+        babelCodeFrame(source, line, column) +
+        '\n\n> ',
+    )
+  }
+}
+
+export function validateGeneratedStaticParams(
+  config: ResolvedConfig,
+  route: RouteManifestEntry,
+  source: string,
+  result: unknown,
+  checkComplete = true,
+): asserts result is Record<string, unknown>[] {
+  const page = nextPagePath(route)
+  if (!Array.isArray(result)) {
+    if (getNextConfig().output !== 'export') return
+    throw new PnextBuildValidationError(
+      generatedStaticParamsInvalidValueMessage(page, generatedStaticParamsValueType(result)),
+    )
+  }
+  if (result.length === 0) {
+    if (cacheComponentsIsEnabled()) {
+      const literal = staticParamsLiteral(source)
+      const declaration = /\bexport\s+(async\s+)?function\s+generateStaticParams/.exec(source)
+      const index =
+        literal?.entries?.length === 0 && /\breturn\s*\[\s*\]/.test(source)
+          ? literal.expressionIndex
+          : (declaration?.index ?? 0) + (declaration?.[1] ? 'export '.length : 0)
+      const before = source.slice(0, index)
+      const line = before.split('\n').length
+      const column = index - before.lastIndexOf('\n')
+      const displayPath = appPath(config, route.file)
+      throw new PnextBuildValidationError(
+        'When using Cache Components, all `generateStaticParams` functions must return at least one result. ' +
+          'This is to ensure that we can perform build-time validation that there is no other dynamic accesses that would cause a runtime error.\n\n' +
+          'Learn more: https://nextjs.org/docs/messages/empty-generate-static-params\n' +
+          `    at generateStaticParams (webpack:///${displayPath}:${line}:${column})\n` +
+          babelCodeFrame(source, line, column) +
+          '\n\n> ',
+      )
+    }
+    if (getNextConfig().output === 'export') {
+      throw new PnextBuildValidationError(generatedStaticParamsEmptyMessage(page))
+    }
+  }
+  if (checkComplete && navigationStaticRoutes.has(route.file)) {
+    const required = routeParamKeys(route)
+    for (const params of result) {
+      const values = params as Record<string, unknown> | null | undefined
+      const missing = required.filter(name => values?.[name] === undefined)
+      if (missing.length) {
+        throw new PnextBuildValidationError(
+          `Page "${page}": \`generateStaticParams()\` returned incomplete params. Routes using \`ensureStatic = "navigation"\` must return every dynamic route parameter. Missing: ${missing.map(name => JSON.stringify(name)).join(', ')}.\nLearn more: https://nextjs.org/docs/messages/generate-static-params#with-ensurestatic`,
+        )
+      }
+    }
+  }
+  if (getNextConfig().output !== 'export' || !checkComplete) return
+  const required = routeParamKeys(route)
+  for (const [index, params] of result.entries()) {
+    if (!params || typeof params !== 'object' || Array.isArray(params)) {
+      throw new PnextBuildValidationError(
+        generatedStaticParamsInvalidEntryMessage(
+          page,
+          index,
+          generatedStaticParamsValueType(params),
+        ),
+      )
+    }
+    const missing = required.filter(name => (params as Record<string, unknown>)[name] === undefined)
+    if (missing.length > 0) {
+      throw new PnextBuildValidationError(generatedStaticParamsIncompleteMessage(page, missing))
+    }
+  }
+}
+
+function babelCodeFrame(source: string, line: number, column: number): string {
+  const lines = source.split('\n')
+  const first = Math.max(1, line - 2)
+  const last = Math.min(lines.length, line + 3)
+  const width = String(last).length
+  const out: string[] = []
+  for (let n = first; n <= last; n++) {
+    out.push(
+      `${n === line ? '>' : ' '} ${String(n).padStart(width)} |${lines[n - 1] ? ` ${lines[n - 1]}` : ''}`,
+    )
+    if (n === line) out.push(`${' '.repeat(width + 2)} | ${' '.repeat(column - 1)}^`)
+  }
+  return out.join('\n')
 }
 
 /**
@@ -957,10 +1533,6 @@ function directivePrologue(source: string, offset: number): string[] {
     }
     directives.push(value)
   }
-}
-
-function functionBodies(source: string): number[] {
-  return functionScopes(source).map(scope => scope.offset)
 }
 
 /**
@@ -1266,7 +1838,7 @@ function pageExtensions(): string[] {
 
 function validateAppPagesConflict(config: ResolvedConfig): void {
   const pagesDir = pagesDirFor(config)
-  if (!pagesDir || !existsSync(pagesDir)) return
+  if (!existsSync(pagesDir)) return
   const pagePaths = collectPagesRouterPaths(pagesDir)
   if (pagePaths.size === 0) return
   const appPaths = collectAppRouterPaths(path.join(config.root, 'app'))
@@ -1283,7 +1855,7 @@ function validateAppPagesConflict(config: ResolvedConfig): void {
 }
 
 /** The pages/ directory sibling to the resolved app/ directory, if any. */
-function pagesDirFor(config: ResolvedConfig): string | undefined {
+function pagesDirFor(config: ResolvedConfig): string {
   return path.join(config.root, 'pages')
 }
 
@@ -1378,81 +1950,6 @@ function routeGroupLabel(config: ResolvedConfig, route: RouteManifestEntry): str
   return dir === '.' ? '/' : `/${dir}`
 }
 
-// --- missing named-slot default on non-leaf segments -----------------------
-
-function validateMissingSlotDefaults(config: ResolvedConfig, routes: RouteManifestEntry[]): void {
-  const failures: string[] = []
-  const interceptedTargets = interceptedTargetDirs(routes)
-  const visit = (dir: string): void => {
-    for (const entry of readDirEntries(dir)) {
-      if (!entry.isDirectory()) continue
-      const child = path.join(dir, entry.name)
-      if (isSlotDir(entry.name)) continue
-      visit(child)
-    }
-
-    if (!hasNormalChildRoute(dir)) return
-    if (interceptedTargets.has(dir)) return
-    for (const slot of readDirEntries(dir)) {
-      if (!slot.isDirectory() || !isNamedSlotDir(slot.name)) continue
-      const slotDir = path.join(dir, slot.name)
-      if (hasConventionFile(slotDir, 'default')) continue
-      // A catch-all page inside the slot (`[...x]`/`[[...x]]`) matches any
-      // otherwise-unmatched path, so it doubles as the slot's fallback and
-      // Next does not require an explicit default.js (parallel-slot catch-all).
-      if (slotHasCatchAllPage(slotDir)) continue
-      failures.push(missingDefaultParallelRouteMessage(appPath(config, slotDir), slot.name))
-    }
-  }
-
-  visit(config.appPath)
-  if (failures.length > 0) throw new PnextBuildValidationError(failures.join('\n\n'))
-}
-
-function interceptedTargetDirs(routes: RouteManifestEntry[]): Set<string> {
-  const patterns = new Set(
-    routes.filter(route => route.kind === 'page' && route.interception).map(route => route.pattern),
-  )
-  return new Set(
-    routes
-      .filter(route => route.kind === 'page' && !route.interception && patterns.has(route.pattern))
-      .map(route => path.dirname(route.file)),
-  )
-}
-
-function hasNormalChildRoute(dir: string, depth = 0): boolean {
-  for (const entry of readDirEntries(dir)) {
-    if (!entry.isDirectory() || isSlotDir(entry.name)) continue
-    const child = path.join(dir, entry.name)
-    const nextDepth = isGroupDir(entry.name) ? depth : depth + 1
-    if (
-      nextDepth > 0 &&
-      (hasConventionFile(child, 'page') || hasConventionFile(child, 'default'))
-    ) {
-      return true
-    }
-    if (hasNormalChildRoute(child, nextDepth)) return true
-  }
-  return false
-}
-
-// Whether a slot subtree contains a catch-all page segment (`[...x]` or the
-// optional `[[...x]]`) that can serve as the slot's fallback. Group dirs
-// (`(group)`) and nested normal segments are walked; other slot dirs are not.
-function slotHasCatchAllPage(dir: string): boolean {
-  for (const entry of readDirEntries(dir)) {
-    if (!entry.isDirectory()) continue
-    const child = path.join(dir, entry.name)
-    if (/^\[\[?\.\.\..+\]\]?$/.test(entry.name) && hasConventionFile(child, 'page')) return true
-    if (slotHasCatchAllPage(child)) return true
-  }
-  return false
-}
-
-function hasConventionFile(dir: string, name: string): boolean {
-  return pageExtensions().some(ext => existsSync(path.join(dir, `${name}.${ext}`)))
-}
-
 function readDirEntries(dir: string) {
   try {
     return readdirSync(dir, { withFileTypes: true })
@@ -1461,16 +1958,28 @@ function readDirEntries(dir: string) {
   }
 }
 
-function isSlotDir(name: string): boolean {
-  return name.startsWith('@')
-}
-
-function isNamedSlotDir(name: string): boolean {
-  return isSlotDir(name) && name !== '@children'
-}
-
 function isGroupDir(name: string): boolean {
   return name.startsWith('(') && name.endsWith(')')
+}
+
+// --- legacy (loose route matching) check: a slot with neither a page nor a default ---------
+
+function validateMissingSlotDefaults(config: ResolvedConfig, routes: RouteManifestEntry[]): void {
+  const failures = new Set<string>()
+  for (const route of routes) {
+    // Catch-all routes with an unrenderable slot are pruned at scan time instead;
+    // a `default.*`-derived entry is not a URL Next serves.
+    if (route.kind !== 'page' || route.interception || route.catchAll) continue
+    if (path.basename(route.file).startsWith('default.')) continue
+    for (const gap of unrenderableSlots(config.appPath, route.route)) {
+      // Children falls back to Next's built-in default.
+      if (gap.slot === 'children') continue
+      failures.add(
+        missingDefaultParallelRouteMessage(appPath(config, path.join(gap.dir, gap.slot)), gap.slot),
+      )
+    }
+  }
+  if (failures.size > 0) throw new PnextBuildValidationError([...failures].join('\n\n'))
 }
 
 function appPath(config: ResolvedConfig, file: string): string {
@@ -1564,14 +2073,10 @@ function validateSearchParamsSuspense(
     // This shape uses useSyncExternalStore's server snapshot to render a stable
     // shell, then fills the URLSearchParams instance after hydration.
     if (/\buseSyncExternalStore\s*\(/.test(stripped)) continue
-    if (!usesSearchParamsHook(stripped)) continue
+    if (!/\buseSearchParams\s*\(/.test(stripped)) continue
     if (fileTreeHasSuspense(config, route)) continue
     throw new PnextBuildValidationError(missingSuspenseWithCsrBailoutMessage(route.route || '/'))
   }
-}
-
-function usesSearchParamsHook(searchable: string): boolean {
-  return /\buseSearchParams\s*\(/.test(searchable)
 }
 
 /**
@@ -1671,16 +2176,46 @@ function validateExportMode(config: ResolvedConfig, routes: RouteManifestEntry[]
         missingGenerateStaticParamsForExportMessage(nextPagePath(route)),
       )
     }
+    if (route.kind === 'page' && isDynamicRoute && route.hasStaticParams) {
+      validateStaticParamsForExport(route)
+    }
   }
 }
 
-// Whether any route's source graph declares server actions ('use server' as a
+function validateStaticParamsForExport(route: RouteManifestEntry): void {
+  const source = readSource(route.file)
+  const literal = source && staticParamsLiteral(source)
+  if (!literal) return
+  const page = nextPagePath(route)
+  if (literal.type) {
+    throw new PnextBuildValidationError(
+      generatedStaticParamsInvalidValueMessage(page, literal.type),
+    )
+  }
+  const entries = literal.entries!
+  if (entries.length === 0) {
+    throw new PnextBuildValidationError(generatedStaticParamsEmptyMessage(page))
+  }
+  // Completeness is checked on the merged result (a parent layout may generate some keys).
+  for (const [index, entry] of entries.entries()) {
+    if (!staticObjectKeys(entry)) {
+      const type = staticExpressionType(entry)
+      if (!type) return
+      throw new PnextBuildValidationError(
+        generatedStaticParamsInvalidEntryMessage(page, index, type),
+      )
+    }
+  }
+}
+
+// Whether any app or workspace module declares server actions ('use server' as a
 // module prologue or an inline function directive).
 function routesUseServerActions(routes: RouteManifestEntry[]): boolean {
   const seen = new Set<string>()
   for (const route of routes) {
     for (const file of route.sourceFiles ?? []) {
-      if (seen.has(file)) continue
+      if (seen.has(file) || isPNextRuntimeFile(file) || /[\\/]node_modules[\\/]/.test(file))
+        continue
       seen.add(file)
       const source = readSource(file)
       if (source === undefined) continue

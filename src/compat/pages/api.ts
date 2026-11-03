@@ -3,7 +3,7 @@
 // ../register/pages-api.ts, which wires the exports below into the extension registries.
 
 import { type Dirent, existsSync, readFileSync, readdirSync } from 'node:fs'
-import { Writable } from 'node:stream'
+import { Readable, Writable } from 'node:stream'
 import path from 'node:path'
 import {
   devServerModuleHref,
@@ -12,14 +12,15 @@ import {
 } from '../../runtime/load'
 import { productionRelease } from '../../runtime/production'
 import type { ResolvedConfig } from '../../config'
-import { getRequestExtensions, type RequestInterceptor } from '../../extensions'
+import { getRequestExtensions, withRouteRuntime, type RequestInterceptor } from '../../extensions'
 import { getRequestRuntime } from '../../routing/request-environment'
 import { selectRouteForRequest } from '../../routing/match'
 import { setWorkUnitRoute } from '../../request/context'
+import { getRenderSpanExtensions } from '../../render/hooks'
 import { canonicalUrlHref } from '../next/canonical-url'
 import { markPathRevalidated, normalizeRevalidatePath } from '../cache/revalidate'
-import { withPagesApiHandlerSpan } from '../otel/tracer'
 import { toNextRequest } from '../../api/server'
+import { decodePagesParams, PAGES_LAYOUT } from './router-state'
 
 type PagesApiHandler = (req: unknown, res: PagesApiResponse) => Promise<unknown>
 
@@ -83,7 +84,7 @@ export const pagesDataInterceptor: RequestInterceptor = async request => {
   )) as PagesDataModule
 
   setWorkUnitRoute('data', 'dynamic')
-  const params = selection.params ?? {}
+  const params = decodePagesParams(selection.params)
   const query = { ...Object.fromEntries(url.searchParams), ...params }
   if (typeof module.getServerSideProps === 'function') {
     const result = await module.getServerSideProps({
@@ -175,6 +176,16 @@ export function isMaterializedPagesRoute(config: ResolvedConfig, file: string): 
   }
 }
 
+const generatedLayouts = new Map<string, boolean>()
+
+/** Whether `file` is the root layout materialized for an app without one. */
+export function isGeneratedPagesLayout(file: string): boolean {
+  if (!file.includes('pnext-pages-compat')) return false
+  if (!generatedLayouts.has(file))
+    generatedLayouts.set(file, existsSync(file) && readFileSync(file, 'utf8') === PAGES_LAYOUT)
+  return generatedLayouts.get(file)!
+}
+
 /** The materialized pages-router wrappers of a pages-compat app, root-relative, for its release. */
 export function pagesRouteFacts(config: ResolvedConfig): string[] {
   if (!config.appPath.includes('pnext-pages-compat')) return []
@@ -252,8 +263,12 @@ export const pagesApiInterceptor: RequestInterceptor = async (request, { config 
   // handlers get the IncomingMessage-shaped shim.
   const handlerRequest =
     runtime === 'edge' ? toNextRequest(request) : createPagesApiRequest(request, url)
-  const finished = withPagesApiHandlerSpan(url.pathname, () =>
-    Promise.resolve(imported.default!(handlerRequest, responder.res)),
+  // The handler observes its declared runtime (NEXT_RUNTIME + the edge globals), as app route
+  // handlers do through the serve pipeline's withRouteRuntime.
+  const finished = withRouteRuntime(runtime, () =>
+    getRenderSpanExtensions().withPagesApiSpan(url.pathname, () =>
+      Promise.resolve(imported.default!(handlerRequest, responder.res)),
+    ),
   ).catch(error => responder.fail(error))
   // A handler that starts writing (res.write / pipeline) streams: the response returns at the first write
   // and the body flows through until end or disconnect - a client disconnect destroys `res`, surfacing as
@@ -323,21 +338,15 @@ function apiRuntime(file: string): string | undefined {
 
 function createPagesApiRequest(request: Request, url: URL) {
   const nextRequest = toNextRequest(request)
-  return {
-    ...nextRequest,
+  const readable = request.body ? Readable.fromWeb(request.body as never) : Readable.from([])
+  return Object.assign(readable, {
     method: request.method,
     url: `${url.pathname}${url.search}`,
     headers: Object.fromEntries(request.headers),
     query: Object.fromEntries(url.searchParams),
     cookies: cookiesFromHeader(request.headers.get('cookie')),
     nextUrl: nextRequest.nextUrl,
-    text() {
-      return request.text()
-    },
-    json() {
-      return request.json()
-    },
-  }
+  })
 }
 
 function createPagesApiResponse(request: Request) {

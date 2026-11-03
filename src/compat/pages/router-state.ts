@@ -6,6 +6,7 @@
 // shim reads the same values after hydration and after soft navigations.
 
 import type { RouteParamValue } from '../../types'
+import { safeDecode } from '../../utils/decode'
 
 export interface PagesRouterSsrState {
   /** Pages-route pattern, e.g. `/blog/[slug]`. */
@@ -15,6 +16,9 @@ export interface PagesRouterSsrState {
   /** Rewrite-destination search params merged with dynamic route params. */
   query: Record<string, string | string[]>
 }
+
+export const PAGES_LAYOUT =
+  'export default function PagesLayout({ children }) {\n  return <html><body>{children}</body></html>\n}\n'
 
 const STATE_KEY = Symbol.for('pnext.pagesRouterState')
 const REQUEST_STORAGE = Symbol.for('pnext.requestStorage')
@@ -91,4 +95,11 @@ export function currentPagesRouterState(): PagesRouterSsrState | undefined {
 /** Serialize state for the inline JSON node (script-safe: `<` escaped). */
 export function serializePagesRouterState(state: PagesRouterSsrState): string {
   return JSON.stringify(state).replace(/</g, '\\u003c')
+}
+
+/** Pages data functions read decoded params; app-router page params stay encoded. */
+export function decodePagesParams(params: Record<string, RouteParamValue> = {}) {
+  const decode = (value: RouteParamValue) =>
+    Array.isArray(value) ? value.map(safeDecode) : safeDecode(value)
+  return Object.fromEntries(Object.entries(params).map(([key, value]) => [key, decode(value)]))
 }

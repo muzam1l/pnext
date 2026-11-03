@@ -1,5 +1,6 @@
 import { options, type VNode } from 'preact'
 import { useCallback, useRef, useState } from 'preact/hooks'
+import { startTransition as transition } from './use'
 
 // React 19 hooks (use, useActionState, useOptimistic, useTransition) implemented directly on
 // preact/hooks so a suspense-free client bundle can ship them without preact/compat. The full shim
@@ -44,7 +45,7 @@ export function useTransition(): [boolean, (callback: () => void | Promise<void>
     const mpaBefore = (globalThis as { __pnextMpaNavigation?: number }).__pnextMpaNavigation ?? 0
     let result: void | Promise<void>
     try {
-      result = callback()
+      result = transition(callback)
     } catch {
       return
     }

@@ -27,7 +27,7 @@ import {
   cacheRuntimeErrorFrames,
   formatCacheRuntimeErrorStack,
   RSC_REDACTED_RUNTIME_MESSAGE,
-} from '../validation/prerender-diagnostics'
+} from '../validation/errors'
 import { servedBuildFlags } from './build-flags'
 
 /** Already-funneled errors carry this tag: a nested cache scope reshapes once. */

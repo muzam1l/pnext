@@ -64,6 +64,7 @@ export async function lookupBuildCache(
   config: ResolvedConfig,
   options: BuildCacheOptions,
 ): Promise<BuildCacheSession> {
+  if (config.output === 'export') return { enabled: false }
   if (!cacheEnabled(options)) return { enabled: false }
   const record = await readRecord(config.outPath)
   const inputs = await inputRecords(config, record?.inputs)
@@ -93,6 +94,7 @@ export async function writeBuildCache(
   options: BuildCacheOptions,
   session: BuildCacheSession,
 ) {
+  if (config.output === 'export') return
   if (!session.enabled || !session.context || !cacheEnabled(options)) return
   const inputs = await inputRecords(config, session.inputs)
   const output = await outputSnapshot(config.outPath)

@@ -11,6 +11,7 @@
 
 import type { Plugin } from 'esbuild'
 import type { ResolvedConfig } from '../../config'
+import { cssModuleSourceFromMap } from '../../css/assets'
 import { getNextConfig } from '../next/config-loader'
 import { compileSassCss, isSassFile, isSassModuleFile, sassModuleMapping } from './sass'
 
@@ -52,8 +53,7 @@ export function sassLoadCssModuleForClient(config: ResolvedConfig) {
   return (file: string): string | undefined => {
     if (!isSassFile(file)) return undefined
     if (isSassModuleFile(file)) {
-      const map = sassModuleMapping(file, config.root, sassIncludePaths())
-      return `export default ${JSON.stringify(map)};`
+      return cssModuleSourceFromMap(sassModuleMapping(file, config.root, sassIncludePaths()))
     }
     // Global (non-module) sass carries no class map; the css bytes ship via the
     // CSS chunk, so the client import is a side-effect-only empty module.

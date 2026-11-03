@@ -12,7 +12,9 @@
 
 import type { RouteManifestEntry, RouteParamValue } from '../../types'
 import { getRequestRuntime } from '../../routing/request-environment'
+import { closedParams, paramSetMatches } from '../static-params'
 import { getNextConfig } from './config-loader'
+import { currentResponseVaryParams, SEARCH_PARAMS_SENTINEL } from '../segment/vary-params'
 
 interface RouteState {
   route: string
@@ -27,6 +29,8 @@ interface RouteState {
    * route needs its own prefetch.
    */
   runtimePrefetch?: boolean
+  /** Some param only admits build-time values: the route exists only per value, so never predict it. */
+  closedParams?: boolean
   /**
    * The vary set of the BAKED SHELL these bytes came from (renderer's
    * `bakedShellPageVary`). Passed straight through by the spread below: the
@@ -34,6 +38,8 @@ interface RouteState {
    * document's static stage across the route's params.
    */
   pageVary?: string[]
+  /** The body read searchParams: a same-pathname sibling differing only in search has its own static data. */
+  search?: boolean
 }
 
 /**
@@ -123,10 +129,7 @@ function paramsPrerendered(
   if (Object.keys(params).length !== (route.params ?? []).length) return false
   return sets.some(set => {
     const names = Object.keys(set)
-    return (
-      names.length === Object.keys(params).length &&
-      names.every(name => String(set[name]) === String(params[name]))
-    )
+    return names.length === Object.keys(params).length && paramSetMatches(set, params, names)
   })
 }
 
@@ -147,13 +150,16 @@ export function nextClientRouteState(
     | 'segmentConfig'
     | 'prerenderedParams'
     | 'params'
+    | 'catchAll'
+    | 'paramMatching'
     | 'stream'
   >,
   state: RouteState,
 ): RouteState {
+  const closed = closedParams(route).length > 0 ? { closedParams: true } : {}
   const pattern = state.route.split('/').filter(Boolean)
   const routes = getRequestRuntime()?.routes
-  if (!routes) return state
+  if (!routes) return { ...state, ...closed }
   const staticChildrenBySegment = staticSiblingNamesBySegment(routes, pattern)
   const staticChildren = staticSiblingNames(routes, pattern)
   // Global `partialPrefetching: 'unstable_eager'` makes every route without a
@@ -171,18 +177,40 @@ export function nextClientRouteState(
   const prefetchKind =
     declared === 'unstable_eager' ||
     (declared === undefined &&
-      (globalEager || (route.hasStaticParams && !route.usesRequest && !partiallyEnumerated)))
+      (globalEager ||
+        // A Partial Prefetching route skips the per-link Speculative phase unless declared eager.
+        (route.hasStaticParams &&
+          !route.usesRequest &&
+          !partiallyEnumerated &&
+          !routeRuntimePrefetch(route))))
       ? 'eager'
       : declared === 'allow-runtime' || declared === 'partial'
         ? 'shell'
         : undefined
+  const segments = currentResponseVaryParams()?.segments
+  const search = segments && [...segments].some(a => a.varyParams.has(SEARCH_PARAMS_SENTINEL))
   return {
     ...state,
+    ...(search ? { search: true } : {}),
     ...(staticChildren.length > 0 ? { staticChildren } : {}),
     ...(Object.keys(staticChildrenBySegment).length > 0 ? { staticChildrenBySegment } : {}),
     ...(prefetchKind ? { prefetchKind } : {}),
-    // Only `allow-runtime` shells are request-sampled per URL; a `partial` shell
+    // Only runtime-prefetched shells are request-sampled per URL; a `partial` shell
     // is a static prerender the whole route shares.
-    ...(declared === 'allow-runtime' ? { runtimePrefetch: true } : {}),
+    ...(routeRuntimePrefetch(route) ? { runtimePrefetch: true } : {}),
+    ...closed,
   }
+}
+
+/**
+ * True when the route is runtime-prefetched (`next-router-prefetch: 2`): Partial Prefetching (`prefetch =
+ * 'partial'` or global `partialPrefetching`), `prefetch = 'allow-runtime'`, or legacy `unstable_instant`.
+ * A leaf-most `instant = false` opts back out.
+ */
+export function routeRuntimePrefetch(route: Pick<RouteManifestEntry, 'segmentConfig'>): boolean {
+  const config = route.segmentConfig
+  if (config?.unstableInstant === false) return false
+  if (config?.prefetch === 'allow-runtime' || config?.prefetch === 'partial') return true
+  if (config?.unstableInstant === true && !config.stableInstant) return true
+  return (getNextConfig() as { partialPrefetching?: unknown }).partialPrefetching === true
 }

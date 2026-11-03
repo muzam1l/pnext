@@ -20,10 +20,15 @@ import {
   registerRequestInterceptors,
   setRequestExtensions,
   type RequestInterceptor,
+  reportRequestError,
 } from '../../extensions'
 import { nextCompatEnabled } from '../aliases'
 import { getNextConfig } from '../next/config-loader'
-import { instrumentationReady, loadInstrumentation } from '../lifecycle/instrumentation'
+import {
+  hasInstrumentation,
+  instrumentationReady,
+  loadInstrumentation,
+} from '../lifecycle/instrumentation'
 import { installUnhandledRejectionGuard, reportRequestErrorToUser } from '../lifecycle/error-funnel'
 import { activateTestProxy, installTestProxyFetch } from '../lifecycle/testmode'
 import { recordRequestPath } from '../lifecycle/after-scope'
@@ -42,7 +47,16 @@ export function registerLifecycleBootHooks(config: ResolvedConfig): void {
 
   // The user's onRequestError hook (once instrumentation has loaded) receives
   // every real request error; control-flow errors are filtered in the funnel.
-  setRequestExtensions({ onRequestError: reportRequestErrorToUser })
+  setRequestExtensions({
+    onRequestError: reportRequestErrorToUser,
+    ...(hasInstrumentation(config) ? { beforeProxy: () => instrumentationReady() } : {}),
+    onResponseBodyError: (error, requestInfo, context) =>
+      reportRequestError(
+        new Error('failed to pipe response', { cause: error }),
+        requestInfo,
+        context,
+      ),
+  })
 
   // Keep the server alive when an SSR error escapes as an unhandled rejection
   // (a client component that throws during server render — preact resolves the
@@ -50,13 +64,14 @@ export function registerLifecycleBootHooks(config: ResolvedConfig): void {
   // crashes and every later request in the shared harness server fails.
   installUnhandledRejectionGuard()
 
-  // Load instrumentation and patch fetch at server start. The fetch patch is a no-op until a request
-  // activates the test proxy. Instrumentation register() must NOT run during a build: Next only detects
-  // the file at build and runs register() at server boot, so build prerenders see a noop tracer - a live
-  // TracerProvider at build would bake real span ids into the static shell and 'use cache' entries.
+  // Load instrumentation and patch fetch at server start. Instrumentation register() must NOT run
+  // during a build: Next only detects the file at build and runs register() at server boot, so build
+  // prerenders see a noop tracer - a live TracerProvider at build would bake real span ids into the
+  // static shell and 'use cache' entries.
   registerInitHooks((cfg, context) => {
     if (!context.build) loadInstrumentation(cfg)
-    installTestProxyFetch()
+    // Gated as in Next; node:http alone costs boot ~3ms.
+    if (testProxyEnabled()) installTestProxyFetch()
   })
 }
 

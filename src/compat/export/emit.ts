@@ -5,6 +5,7 @@ import type { BuildManifest, RouteManifestEntry } from '../../types'
 import { listFiles, toPosixPath } from '../../utils/fs'
 import type { BuildStepLogger } from '../../extensions'
 import { getNextConfig } from '../next/config-loader'
+import { routeRuntimePrefetch } from '../next/route-state'
 import { emitStandalone } from './standalone'
 
 interface EmitStaticExportContext {
@@ -34,15 +35,25 @@ const RUNTIME_ASSET_DIR = '_next/static/chunks'
 // Marks an exported document as "served without a pnext server" for the client
 // router: it switches to fetching the flat artifacts written beside each page
 // instead of negotiating with a server. See ./client.ts. Injected only into the
-// export tree — `pnext start` serves the same build unchanged.
-const EXPORT_MODE_SCRIPT = '<script>window.__PNEXT_OUTPUT_EXPORT__=true;</script>'
+// export tree — `pnext start` serves the same build unchanged. Its build id (Next's
+// generateBuildId; null means a fresh one) lets the router spot another deployment's document.
+async function exportModeScript(): Promise<string> {
+  const generate = getNextConfig().generateBuildId
+  const id = typeof generate === 'function' ? await (generate as () => unknown)() : null
+  if (id !== null && typeof id !== 'string')
+    throw new Error('generateBuildId did not return a string')
+  const b = id?.trim() ?? crypto.randomUUID()
+  return `<script>window.__PNEXT_OUTPUT_EXPORT__=${JSON.stringify({ b })};</script>`
+}
 
 export async function emitStaticExport({ config, manifest, log }: EmitStaticExportContext) {
   // Every compat build serves `/_next/static/<buildId>/_buildManifest.js` (and `_ssgManifest.js`) from
   // the running server - client runtime code fetches it unconditionally, and Next's own asset-404 tests
   // probe it as "a known valid asset path". Export mode additionally snapshots a standalone `out/` tree
   // below; the manifest files it needs are the same bytes, so write the server-served copy first.
-  await log.step('build manifest', () => writeBuildManifests(path.join(config.outPath, 'static')))
+  await log.step('build manifest', () =>
+    writeBuildManifests(path.join(config.outPath, 'static'), manifest.routes),
+  )
   const output = getNextConfig().output
   if (output === 'standalone') {
     await emitStandalone({ config, manifest, log })
@@ -58,11 +69,12 @@ async function writeExportTree(config: ResolvedConfig, manifest: BuildManifest):
   await mkdir(outDir, { recursive: true })
 
   const assets = await copyRuntimeAssets(config, outDir)
-  await copyPublicTree(config, outDir, assets)
-  await writeBuildManifests(outDir)
+  const marker = await exportModeScript()
+  await copyPublicTree(config, outDir, assets, marker)
+  await writeBuildManifests(outDir, manifest.routes)
 
   const pages = exportPages(config, manifest)
-  for (const page of pages) await writePageArtifacts(page, assets)
+  for (const page of pages) await writePageArtifacts(page, assets, marker)
   await writeNotFoundArtifacts(config, outDir)
 }
 
@@ -90,6 +102,7 @@ async function copyPublicTree(
   config: ResolvedConfig,
   outDir: string,
   assets: ReadonlySet<string>,
+  marker: string,
 ): Promise<void> {
   const publicDir = path.join(config.outPath, 'static')
   for (const file of await listFiles(publicDir)) {
@@ -98,7 +111,7 @@ async function copyPublicTree(
     const target = path.join(outDir, ...relative.split('/'))
     await mkdir(path.dirname(target), { recursive: true })
     if (relative.endsWith('.html')) {
-      await writeFile(target, exportDocument(await readFile(file, 'utf8'), assets))
+      await writeFile(target, exportDocument(await readFile(file, 'utf8'), assets, marker))
     } else {
       await copyFile(file, target)
     }
@@ -109,7 +122,7 @@ async function copyPublicTree(
  * An exported copy of a prerendered document: runtime references repointed at
  * `_next/static/chunks/`, and the export-mode marker for the client router.
  */
-function exportDocument(html: string, assets: ReadonlySet<string>): string {
+function exportDocument(html: string, assets: ReadonlySet<string>, marker: string): string {
   // Only references that name a copied asset move; `_next/static/media/` and
   // the build manifests keep their Next-shaped paths. Any `?`/`#` suffix rides
   // along rather than defeating the lookup.
@@ -121,17 +134,21 @@ function exportDocument(html: string, assets: ReadonlySet<string>): string {
   // Before any module script runs, so the first navigation already sees it. A
   // fragment with neither <head> nor <body> takes the marker up front.
   const anchor = /<head[^>]*>|<body[^>]*>/.exec(repointed)
-  if (!anchor) return EXPORT_MODE_SCRIPT + repointed
+  if (!anchor) return marker + repointed
   const at = anchor.index + anchor[0].length
-  return `${repointed.slice(0, at)}${EXPORT_MODE_SCRIPT}${repointed.slice(at)}`
+  return `${repointed.slice(0, at)}${marker}${repointed.slice(at)}`
 }
 
-async function writeBuildManifests(outDir: string): Promise<void> {
+async function writeBuildManifests(outDir: string, routes: RouteManifestEntry[]): Promise<void> {
   const dir = path.join(outDir, '_next', 'static', BUILD_ID)
   await mkdir(dir, { recursive: true })
+  // The client sends `next-router-prefetch: 2` for body prefetches of these route patterns.
+  const runtime = routes
+    .filter(route => route.kind === 'page' && routeRuntimePrefetch(route))
+    .map(route => route.route)
   await writeFile(
     path.join(dir, '_buildManifest.js'),
-    'self.__BUILD_MANIFEST={};self.__BUILD_MANIFEST_CB&&self.__BUILD_MANIFEST_CB();\n',
+    `self.__BUILD_MANIFEST={};${runtime.length ? `self.__PNEXT_RUNTIME_PREFETCH__=${JSON.stringify(runtime)};` : ''}self.__BUILD_MANIFEST_CB&&self.__BUILD_MANIFEST_CB();\n`,
   )
   await writeFile(path.join(dir, '_ssgManifest.js'), 'self.__SSG_MANIFEST=new Set();\n')
 }
@@ -196,8 +213,8 @@ function exportPathsForHtml(config: ResolvedConfig, relative: string) {
   }
 }
 
-async function writePageArtifacts(page: ExportPage, assets: ReadonlySet<string>): Promise<void> {
-  const html = exportDocument(await readFile(page.htmlFile, 'utf8'), assets)
+async function writePageArtifacts(page: ExportPage, assets: ReadonlySet<string>, marker: string) {
+  const html = exportDocument(await readFile(page.htmlFile, 'utf8'), assets, marker)
   await mkdir(path.dirname(page.outPageTxt), { recursive: true })
   await writeFile(page.outPageTxt, html)
   await writeSegmentFiles(page.segmentDir, page.route, html)

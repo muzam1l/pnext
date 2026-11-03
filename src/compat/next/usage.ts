@@ -35,8 +35,6 @@ const opaquePlaceholder = /\bplaceholder\s*[=:]\s*(?!\{?\s*['"`])/
  */
 const opaqueProps = /\{\s*\.\.\.|export\s[^;]*from\s*['"]next\/(?:legacy\/)?image/
 
-const cache = new Map<string, boolean>()
-
 /**
  * Roots to scan: the app, plus the workspace's own packages when the app sits in one - a linked
  * `@scope/ui` is first-party source that compiles into the same client graph, so a `placeholder="blur"`
@@ -58,13 +56,7 @@ function scanRoots(root: string) {
   return roots
 }
 
-export function appUsesBlurPlaceholder(root: string) {
-  const cached = cache.get(root)
-  if (cached !== undefined) return cached
-  const used = scanFirstPartySource(root, blurSource)
-  cache.set(root, used)
-  return used
-}
+export const appUsesBlurPlaceholder = appUses('blur')
 
 function blurSource(source: string): boolean {
   // The common case is one `test` and out: almost no file in an app names an
@@ -73,9 +65,32 @@ function blurSource(source: string): boolean {
   return literalBlur.test(source) || opaquePlaceholder.test(source) || opaqueProps.test(source)
 }
 
-/** Walk the app's first-party source (plus workspace packages) until `match`. */
-export function scanFirstPartySource(root: string, match: (source: string) => boolean): boolean {
-  return scanRoots(root).some(dir => scan(dir, match))
+type Fact = 'blur' | 'legacyLink' | 'runtimePrefetch'
+const scanned = new Map<string, Set<Fact>>()
+
+// One walk per root answers every fact, so each file is read once.
+function appUses(fact: Fact) {
+  return (root: string) => {
+    let used = scanned.get(root)
+    if (!used) scanned.set(root, (used = scanFacts(root)))
+    return used.has(fact)
+  }
+}
+
+function scanFacts(root: string) {
+  const facts: [Fact, (source: string) => boolean][] = [
+    ['blur', blurSource],
+    ['legacyLink', source => legacyProp.test(source) || reexportedLink.test(source)],
+    ['runtimePrefetch', source => runtimePrefetchExport.test(source)],
+  ]
+  const used = new Set<Fact>()
+  scanRoots(root).some(dir =>
+    scan(dir, source => {
+      for (const [fact, match] of facts) if (!used.has(fact) && match(source)) used.add(fact)
+      return used.size === facts.length
+    }),
+  )
+  return used
 }
 
 function scan(dir: string, match: (source: string) => boolean): boolean {
@@ -120,15 +135,11 @@ const legacyProp = /\blegacyBehavior\b/
  * back to `next/link`, so treat the re-export itself as usage. */
 const reexportedLink = /export\s[^;]*from\s*['"]next\/link['"]/
 
-const legacyLinkCache = new Map<string, boolean>()
+export const appUsesLegacyLink = appUses('legacyLink')
 
-export function appUsesLegacyLink(root: string) {
-  const cached = legacyLinkCache.get(root)
-  if (cached !== undefined) return cached
-  const used = scanFirstPartySource(
-    root,
-    source => legacyProp.test(source) || reexportedLink.test(source),
-  )
-  legacyLinkCache.set(root, used)
-  return used
-}
+/** A segment export that runtime-prefetches its route, in routes.ts's own segment-config form. */
+const runtimePrefetchExport =
+  /^\s*export\s+const\s+(?:prefetch\s*=\s*['"](?:allow-runtime|partial)['"]|(?:unstable_)?instant\s*=)/m
+
+/** Build-time app fact: can any route be runtime-prefetched? Only then does the client ship that protocol. */
+export const appUsesRuntimePrefetch = appUses('runtimePrefetch')

@@ -15,6 +15,9 @@ exports.permanentRedirect = noop
 exports.notFound = noop
 exports.forbidden = noop
 exports.unauthorized = noop
+exports.unstable_rethrow = noop
+exports.unstable_isUnrecognizedActionError = () => false
+exports.ReadonlyURLSearchParams = URLSearchParams
 exports.useRouter = () => router
 exports.usePathname = () => null
 exports.useSearchParams = () => new URLSearchParams()

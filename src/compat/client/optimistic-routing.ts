@@ -13,6 +13,7 @@
 //     sibling URL somewhere else entirely, or vary on search params.
 
 import type { RouteParamValue } from '../../types'
+import { decodeSegment, documentRouteState, restampSharedParams, sameParams } from './segment-cache'
 
 interface RouteState {
   // Bracket-free colon form: `:id` for a dynamic segment, `:slug*` for a
@@ -26,28 +27,15 @@ interface RouteState {
   prefetchKind?: 'shell' | 'eager'
   /** `prefetch = 'allow-runtime'`: the shell is request-sampled PER URL. */
   runtimePrefetch?: boolean
+  closedParams?: boolean
 }
 
 interface PredictedShell {
   html: string
   route: RouteState
   prefetch?: 'shell' | 'eager'
-  /**
-   * True when the predicted shell belongs to an `allow-runtime` route. Its content is derived from the
-   * sampled request's params, so a cached shell of ONE param value says nothing about another - the
-   * router must still prefetch every unseen URL of the route (a `partial` shell, being static, is shared).
-   *
-   * ...UNLESS `experimental.appShells` is on: there the runtime prefetch of a non-eager route renders
-   * with its `params` HANGING, so the cached shell IS the route's shared App Shell and says the same
-   * thing for every param. Revealing another link of the route then has nothing to fetch.
-   */
+  /** A runtime-prefetched route: its shell content belongs to the URL it was sampled for. */
   runtimePrefetch?: boolean
-}
-
-/** `experimental.appShells`, stamped into the document by register-render. */
-function appShellsEnabled(): boolean {
-  if (!process.browser && typeof window === 'undefined') return false
-  return (window as { __PNEXT_APP_SHELLS__?: boolean }).__PNEXT_APP_SHELLS__ === true
 }
 
 export function predictNextLoadingShell(
@@ -56,40 +44,39 @@ export function predictNextLoadingShell(
 ): PredictedShell | undefined {
   // Most recently stored shells first (Map preserves insertion order).
   for (const [pathname, html] of [...shells.entries()].reverse()) {
-    const state = routeStateFromShell(html)
-    if (!state) continue
+    const state = documentRouteState(html) as RouteState | null
+    // A closed param decides whether the route exists at all: the server must resolve the URL.
+    if (
+      typeof state?.route !== 'string' ||
+      typeof state.params !== 'object' ||
+      !state.params ||
+      state.closedParams
+    )
+      continue
     // A shell's own URL must fit its route pattern before it can teach the
     // route trie. This catches rewrites, including a dynamic response served
     // for a known static sibling.
-    if (!matchRoute(state, pathname)) continue
+    const storedParams = matchRoute(state, pathname)
+    if (
+      !storedParams ||
+      (Object.keys(state.params).length > 0 && !sameParams(storedParams, state.params))
+    )
+      continue
     const params = matchRoute(state, url.pathname)
     if (params) {
       return {
-        html: reifyShellParams(html, state.params, params),
+        html: restampSharedParams(html, params),
         route: {
           route: state.route,
           params,
           ...(state.catchAllOptional ? { catchAllOptional: true } : {}),
         },
         ...(state.prefetchKind ? { prefetch: state.prefetchKind } : {}),
-        ...(state.runtimePrefetch && !appShellsEnabled() ? { runtimePrefetch: true } : {}),
+        ...(state.runtimePrefetch ? { runtimePrefetch: true } : {}),
       }
     }
   }
   return undefined
-}
-
-function routeStateFromShell(html: string): RouteState | undefined {
-  const raw = /window\.__PNEXT_ROUTE__=(\{.*?\});<\/script>/.exec(html)?.[1]
-  if (!raw) return undefined
-  try {
-    const state = JSON.parse(raw) as RouteState
-    return typeof state.route === 'string' && state.params && typeof state.params === 'object'
-      ? state
-      : undefined
-  } catch {
-    return undefined
-  }
 }
 
 function matchRoute(
@@ -118,7 +105,7 @@ function matchRoute(
       if (state.catchAllOptional) {
         // `[[...slug]]`: matches the base path plus any nested tail.
         const rest = target.slice(cursor)
-        if (rest.length > 0) params[name] = rest
+        if (rest.length > 0) params[name] = rest.map(encodeURIComponent)
         return params
       }
       // `[...slug]`: a catch-all learned from a parallel slot must not predict a
@@ -127,85 +114,13 @@ function matchRoute(
       if (!Array.isArray(state.params[name])) return undefined
       const rest = target.slice(cursor)
       if (rest.length === 0) return undefined
-      params[name] = rest
+      params[name] = rest.map(encodeURIComponent)
       return params
     }
     const value = target[cursor++]
     if (value === undefined) return undefined
-    if (dynamic) params[dynamic[1]!] = value
+    if (dynamic) params[dynamic[1]!] = encodeURIComponent(value)
     else if (segment !== value) return undefined
   }
   return cursor === target.length ? params : undefined
-}
-
-function reifyShellParams(
-  html: string,
-  previous: Record<string, RouteParamValue>,
-  params: Record<string, RouteParamValue>,
-): string {
-  if (typeof DOMParser === 'undefined') return html
-  const doc = new DOMParser().parseFromString(html, 'text/html')
-  materializeClientMarkers(doc)
-  for (const root of doc.querySelectorAll<HTMLElement>('[data-pnext-params]')) {
-    const raw = root.getAttribute('data-pnext-params')
-    if (!raw) continue
-    try {
-      const scoped = JSON.parse(raw) as Record<string, RouteParamValue>
-      if (sameParams(scoped, previous))
-        root.setAttribute('data-pnext-params', JSON.stringify(params))
-    } catch {
-      // A malformed island scope cannot safely be reified.
-    }
-  }
-  return `<!doctype html>${doc.documentElement.outerHTML}`
-}
-
-function materializeClientMarkers(doc: Document): void {
-  const comments: Comment[] = []
-  const walker = doc.createTreeWalker(doc, NodeFilter.SHOW_COMMENT)
-  while (walker.nextNode()) comments.push(walker.currentNode as Comment)
-  for (const start of comments.reverse()) {
-    const match = /^(pnext-client|pnext-static-children|pnext-page):([^>]*)$/.exec(start.data)
-    const kind = match?.[1]
-    const encoded = match?.[2]
-    if (!kind || !encoded || !start.parentNode) continue
-    const container = doc.createElement('div')
-    const tag = kind === 'pnext-page' ? 'div' : kind
-    container.innerHTML = `<${tag} ${encoded}></${tag}>`
-    const island = container.firstElementChild
-    if (!island) continue
-    let node = start.nextSibling
-    while (node && !(node.nodeType === Node.COMMENT_NODE && node.nodeValue === `/${kind}`)) {
-      const next = node.nextSibling
-      island.append(node)
-      node = next
-    }
-    if (!node) continue
-    start.replaceWith(island)
-    node.remove()
-  }
-}
-
-function sameParams(
-  left: Record<string, RouteParamValue>,
-  right: Record<string, RouteParamValue>,
-): boolean {
-  const leftKeys = Object.keys(left)
-  const rightKeys = Object.keys(right)
-  if (leftKeys.length !== rightKeys.length) return false
-  return leftKeys.every(key => {
-    const a = left[key]
-    const b = right[key]
-    return Array.isArray(a)
-      ? Array.isArray(b) && a.length === b.length && a.every((value, index) => value === b[index])
-      : a === b
-  })
-}
-
-function decodeSegment(segment: string) {
-  try {
-    return decodeURIComponent(segment)
-  } catch {
-    return segment
-  }
 }

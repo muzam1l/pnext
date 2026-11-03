@@ -13,13 +13,22 @@
 // at request time.
 
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import path from 'node:path'
+import type { ResolvedConfig } from '../../config'
+import type { BuildManifest } from '../../types'
+import { nextRoutePattern } from '../../routing/match'
 import {
   getRequestExtensions,
   type PrerenderSidecarContext,
   type PrerenderSidecarExtension,
 } from '../../extensions'
-import { pathRevalidatedSince, tagsRevalidatedSince, tagsStaleSince } from './revalidate'
+import {
+  currentRenderCacheMeta,
+  pathRevalidatedSince,
+  tagsRevalidatedSince,
+  tagsStaleSince,
+} from './revalidate'
 import {
   beginUseCacheRdcCapture,
   collectUseCacheRdcRecords,
@@ -44,6 +53,8 @@ export interface ResumeDataArtifact {
    * stale the prebuilt shell.
    */
   tags?: string[]
+  /** The shell baked a cached value no record can replay (a rendered tree). */
+  partial?: true
 }
 
 function isArtifact(value: unknown): value is ResumeDataArtifact {
@@ -87,6 +98,66 @@ async function readArtifact(
   }
 }
 
+function serializeFlightData(value: UseCacheRdcRecord['value']): string {
+  // RDC records contain plain data; Flight reserves dollar-prefixed strings for references.
+  const model = JSON.stringify(value, (_key, item: unknown) =>
+    typeof item === 'string' && item.startsWith('$') ? `$${item}` : item,
+  )
+  return `0:${model}\n`
+}
+
+export async function emitResumeDataCacheMetadata(config: ResolvedConfig, manifest: BuildManifest) {
+  for (const route of manifest.routes) {
+    if (!route.ppr) continue
+    const artifact = await readArtifact({
+      outPath: config.outPath,
+      routeId: route.id,
+      routePath: route.route,
+    })
+    if (!artifact || !(artifact.useCache.length || artifact.fetch.length || artifact.tags)) continue
+    const file = path.join(
+      config.root,
+      '.next/server/app',
+      `${nextRoutePattern(route.route, route.catchAllOptional).replace(/^\/+/, '') || 'index'}.meta`,
+    )
+    if (!existsSync(file)) continue
+    const meta = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>
+    if (!meta.postponed) continue
+    const store = {
+      cache: Object.fromEntries(
+        artifact.useCache.map(record => [
+          record.key,
+          {
+            entry: {
+              value: Buffer.from(serializeFlightData(record.value)).toString('base64'),
+              tags: record.tags,
+              timestamp: record.storedAt,
+              stale: record.staleSeconds ?? 300,
+              revalidate: record.revalidateSeconds ?? 900,
+              expire: record.expireSeconds ?? 31536000,
+            },
+          },
+        ]),
+      ),
+      fetch: Object.fromEntries(
+        artifact.fetch.map(record => [
+          record.key,
+          {
+            kind: 'FETCH',
+            data: { ...record.snapshot, headers: Object.fromEntries(record.snapshot.headers) },
+            revalidate: record.revalidateSeconds ?? false,
+          },
+        ]),
+      ),
+      encryptedBoundArgs: {},
+    }
+    // Build-only: node:zlib costs dev boot ~1.5ms and 1.6MB.
+    const { deflateSync } = await import('node:zlib')
+    meta.postponed = `4:null${deflateSync(JSON.stringify({ store })).toString('base64')}`
+    await writeFile(file, JSON.stringify(meta))
+  }
+}
+
 export const resumeDataCacheExtension: PrerenderSidecarExtension = {
   begin() {
     beginUseCacheRdcCapture()
@@ -95,13 +166,17 @@ export const resumeDataCacheExtension: PrerenderSidecarExtension = {
   async collect() {
     const useCache = await collectUseCacheRdcRecords()
     const fetch = await collectFetchRdcRecords()
-    const tags = await collectUseCacheRdcTags()
-    if (useCache.length === 0 && fetch.length === 0 && tags.length === 0) return undefined
+    const tags = [
+      ...new Set([...(await collectUseCacheRdcTags()), ...(currentRenderCacheMeta()?.tags ?? [])]),
+    ]
+    if (useCache.length === 0 && fetch.length === 0 && tags.length === 0 && !useCache.partial)
+      return undefined
     return {
       v: 1,
-      useCache,
+      useCache: [...useCache],
       fetch,
       ...(tags.length > 0 ? { tags } : {}),
+      ...(useCache.partial ? { partial: true } : {}),
     } satisfies ResumeDataArtifact
   },
   async persist(context, artifact) {
@@ -112,9 +187,10 @@ export const resumeDataCacheExtension: PrerenderSidecarExtension = {
   },
   async seed(context) {
     const artifact = await readArtifact(context)
-    if (!artifact) return
+    if (!artifact) return true
     seedUseCacheRdcRecords(artifact.useCache, context.routePath)
     seedFetchRdcRecords(artifact.fetch, context.routePath, artifact.tags ?? [])
+    return artifact.partial !== true
   },
   async isStale(context) {
     const freshnessAt = await sidecarFreshnessAt(context)

@@ -191,10 +191,23 @@ async function writeServerFunction(
     path.join(functionPath, 'index.mjs'),
     `import { createRequestHandler } from './server/entry.js';
 
-const handlerPromise = createRequestHandler({ root: import.meta.dirname });
+// Per-phase Server-Timing on every response; PNEXT_SERVER_TIMING=0 turns it off.
+process.env.PNEXT_SERVER_TIMING ??= '1';
+
+// \`warm\`: page modules import in the background, off the instance's first page request.
+const handlerPromise = createRequestHandler({ root: import.meta.dirname, warm: true });
 
 async function handler(request) {
-  return (await handlerPromise)(request);
+  const started = performance.now();
+  const handle = await handlerPromise;
+  const boot = performance.now() - started;
+  const response = await handle(request);
+  if (boot >= 1 && process.env.PNEXT_SERVER_TIMING === '1') {
+    try {
+      response.headers.append('server-timing', \`boot;dur=\${boot.toFixed(1)}\`);
+    } catch {}
+  }
+  return response;
 }
 
 // Callable for the Node-style launcher, \`fetch\` for the Bun runtime.

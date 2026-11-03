@@ -1,6 +1,6 @@
 {
   "name": "@wular/pnext",
-  "version": "0.1.12",
+  "version": "0.2.0",
   "description": "A fast little framework for server-first React apps, fully compatible with Next.js",
   "type": "module",
   "bin": {
@@ -93,6 +93,6 @@
     "next-font": "^2.0.2",
     "sass": "^1.80.0",
     "satori": "^0.12.0",
-    "sharp": "^0.34.0"
+    "sharp": "^0.35.5"
   }
 }

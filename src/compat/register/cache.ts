@@ -15,6 +15,7 @@ import { nextCompatEnabled } from '../../compat/aliases'
 import {
   registerBundledSourceTransforms,
   registerInitHooks,
+  registerRequestInterceptors,
   registerServerSourceTransforms,
   setRenderExtensions,
   setRequestExtensions,
@@ -32,9 +33,12 @@ import {
 import { setBuildFlagsOutPath } from '../cache/build-flags'
 import { installCompatFetchCache } from '../cache/fetch-patch'
 import { installCustomCacheHandler } from '../cache/custom-handler'
-import { installModernCacheHandlers } from '../cache/modern-handler'
+import { installModernCacheHandlers, pendingModernCacheInstall } from '../cache/modern-handler'
 import { rewriteUseCacheSource } from '../cache/use-cache-transform'
 import { resumeDataCacheExtension } from '../cache/resume-data-cache'
+import { staleTimeSecondsFor } from '../segment/serve'
+
+const SETTLED = Promise.resolve(undefined)
 
 export function registerCacheExtensions(config: ResolvedConfig): void {
   // Render cache-meta collection scope (tags/revalidate/no-store) wrapped
@@ -44,6 +48,7 @@ export function registerCacheExtensions(config: ResolvedConfig): void {
     // Peek (never consume) the render's aggregated cacheLife stale window, so
     // the document can inline its own reuse window for hard loads.
     currentCacheStaleSeconds: () => currentRenderCacheMeta()?.staleSeconds,
+    defaultStaticStaleTimeSeconds: () => staleTimeSecondsFor(true),
     prerenderSidecar: resumeDataCacheExtension,
   })
 
@@ -71,15 +76,19 @@ export function registerCacheExtensions(config: ResolvedConfig): void {
   // Prerenders + runtime renders must observe Next fetch-cache options
   // (force-cache, next: { revalidate, tags }). Idempotent; next-compat only.
   if (nextCompatEnabled(config)) {
-    registerInitHooks(cfg => {
+    registerInitHooks(async cfg => {
       installCompatFetchCache()
       // Where `pnext start` reads the build's --debug-prerender flag back from
       // (the runtime 'use cache' error funnel shapes its log around it).
       setBuildFlagsOutPath(cfg.outPath)
+      // Started first so early requests wait on it (init hooks are not awaited).
+      const modern = installModernCacheHandlers(cfg.root)
       // Load + instantiate the configured `cacheHandler` (next.config) and
       // install it into the core cache seam so the data cache defers to it.
-      installCustomCacheHandler(cfg.root)
-      installModernCacheHandlers(cfg.root)
+      await installCustomCacheHandler(cfg.root)
+      await modern
     })
+    // Like Next's per-request handler registration: wait for it, and fail the request if it failed.
+    registerRequestInterceptors(() => pendingModernCacheInstall() ?? SETTLED)
   }
 }

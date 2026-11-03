@@ -22,6 +22,7 @@ import type { Plugin } from 'esbuild'
 import type { ResolvedConfig } from '../../config'
 import { getBundlerExtensions, setBundlerExtensions, setCssExtensions } from '../../extensions'
 import { nextCompatEnabled } from '../../render/hooks'
+import { cssModuleSourceFromMap } from '../../css/assets'
 import {
   sassChunkPlugin,
   sassLoadCssModuleForClient,
@@ -99,18 +100,10 @@ function sassModuleLoaderPlugin(config: ResolvedConfig): Plugin {
       build.onLoad({ filter: /\.(?:scss|sass)$/ }, ({ path: file }) => {
         if (!isSassFile(file)) return null
         const contents = isSassModuleFile(file)
-          ? `export default ${JSON.stringify(sassModuleMapping(file, config.root, sassIncludePathsFor(config)))};`
+          ? cssModuleSourceFromMap(sassModuleMapping(file, config.root))
           : 'export default undefined;'
         return { contents, loader: 'js' }
       })
     },
   }
-}
-
-// Local include-paths read kept here to avoid importing sass-plugin internals;
-// the JS-graph loader rarely needs includePaths (module maps resolve from the
-// file itself), so an empty list is acceptable — the CSS-chunk plugin
-// (sass-plugin.ts) threads the real sassOptions.includePaths.
-function sassIncludePathsFor(_config: ResolvedConfig): string[] {
-  return []
 }

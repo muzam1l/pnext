@@ -1,0 +1,15 @@
+# A maintainer's `ok-to-test` label runs the native suite on a guest PR.
+name: ok-to-test
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  checks: write
+
+jobs:
+  tests:
+    if: github.event.label.name == 'ok-to-test'
+    uses: ./.github/workflows/tests.yml
+    secrets: inherit

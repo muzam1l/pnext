@@ -16,6 +16,7 @@ const parseSync: typeof import('oxc-parser').parseSync = (...args) =>
   loadNative(() => require('oxc-parser') as typeof import('oxc-parser')).parseSync(...args)
 import { loadNative } from '../utils/native-require'
 import { spliceSource } from '../runtime/module-transform'
+import path from 'node:path'
 
 // `Bun` through globalThis: pnext ships TypeScript source, so app compilers without
 // bun-types typecheck this file and a bare `Bun` identifier would fail them.
@@ -75,6 +76,8 @@ export interface ImportStatement {
 export interface RewriteFacts {
   edges: SpecifierEdge[]
   imports: ImportStatement[]
+  /** `export … from` statements; a binding's `local` is its exported name, `export * from` binds none. */
+  reexports: ImportStatement[]
   importMetas: { start: number; end: number }[]
   /** `import()` calls whose argument is not a plain string literal. */
   computedImports: { start: number; end: number }[]
@@ -147,6 +150,7 @@ const emptyFacts: ScanFacts = {
 const emptyRewriteFacts: RewriteFacts = {
   edges: [],
   imports: [],
+  reexports: [],
   importMetas: [],
   computedImports: [],
   unreliable: false,
@@ -320,8 +324,9 @@ function parseFacts(file: string, source: string, lang: ParserLang) {
     })
   }
 
-  // One `export { a, b } from 'x'` reports the same moduleRequest per entry.
-  const seenExportRequests = new Set<number>()
+  // One `export { a, b } from 'x'` repeats its request per entry, `export { a }` repeats an import's.
+  const seenExportRequests = new Set<number>(edges.map(edge => edge.start))
+  const reexports: ImportStatement[] = []
   for (const statement of result.module.staticExports) {
     for (const entry of statement.entries) {
       const request = entry.moduleRequest
@@ -332,6 +337,18 @@ function parseFacts(file: string, source: string, lang: ParserLang) {
         start: request.start,
         end: request.end,
         kind: 'export',
+      })
+      reexports.push({
+        specifier: request.value,
+        start: statement.start,
+        end: statement.end,
+        specifierStart: request.start,
+        specifierEnd: request.end,
+        bindings: statement.entries.flatMap(({ importName, exportName, isType }) =>
+          exportName.name
+            ? [{ imported: importName.name ?? '*', local: exportName.name, type: isType }]
+            : [],
+        ),
       })
     }
   }
@@ -425,6 +442,7 @@ function parseFacts(file: string, source: string, lang: ParserLang) {
     rewrite: {
       edges,
       imports: importStatements,
+      reexports,
       importMetas: result.module.importMetas.map(meta => ({ start: meta.start, end: meta.end })),
       computedImports,
       unreliable: result.errors.length > 0,
@@ -722,6 +740,139 @@ export function requireResolveRefs(file: string, source: string): LiteralSpan[] 
   visit(parseSync(file, source, { lang }).program)
   requireResolveMemo.set(key, spans)
   return spans
+}
+
+/** Static cwd-relative filesystem reads needed by a relocated server. */
+export function fileReadPaths(file: string, source: string, root: string): string[] {
+  if (!source.includes('readFile')) return []
+  type Binding =
+    'fs' | 'promises' | 'path' | 'readFile' | 'readFileSync' | 'join' | 'resolve' | null
+  interface Scope {
+    parent?: Scope
+    bindings: Map<string, Binding>
+    function?: boolean
+  }
+  const paths = new Set<string>()
+  const calls: { node: AstNode; scope: Scope }[] = []
+  const bindPattern = (node: AstNode | undefined, scope: Scope): void => {
+    if (!node) return
+    if (node.type === 'Identifier') scope.bindings.set(node.name as string, null)
+    else if (node.type === 'RestElement') bindPattern(child(node, 'argument'), scope)
+    else if (node.type === 'AssignmentPattern') bindPattern(child(node, 'left'), scope)
+    else if (node.type === 'ObjectPattern')
+      for (const property of node.properties as AstNode[])
+        bindPattern(property.type === 'RestElement' ? property : child(property, 'value'), scope)
+    else if (node.type === 'ArrayPattern')
+      for (const element of node.elements as (AstNode | undefined)[]) bindPattern(element, scope)
+  }
+  const collect = (value: unknown, scope: Scope): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) collect(item, scope)
+      return
+    }
+    if (!isNode(value)) return
+    if (value.type === 'FunctionDeclaration' || value.type === 'ClassDeclaration')
+      bindPattern(child(value, 'id'), scope)
+    const fn = /^(?:FunctionDeclaration|FunctionExpression|ArrowFunctionExpression)$/.test(
+      value.type,
+    )
+    if (
+      fn ||
+      /^(?:BlockStatement|CatchClause|ForStatement|ForInStatement|ForOfStatement|SwitchStatement|ClassExpression)$/.test(
+        value.type,
+      )
+    ) {
+      scope = { parent: scope, bindings: new Map(), function: fn }
+      if (fn) {
+        bindPattern(child(value, 'id'), scope)
+        for (const param of value.params as AstNode[]) bindPattern(param, scope)
+      }
+      if (value.type === 'CatchClause') bindPattern(child(value, 'param'), scope)
+      if (value.type === 'ClassExpression') bindPattern(child(value, 'id'), scope)
+    }
+    if (value.type === 'VariableDeclaration') {
+      let target = scope
+      if (value.kind === 'var') while (target.parent && !target.function) target = target.parent
+      for (const declaration of value.declarations as AstNode[])
+        bindPattern(child(declaration, 'id'), target)
+    }
+    if (value.type === 'ImportDeclaration') {
+      const specifier = stringValue(child(value, 'source'))?.replace(/^node:/, '')
+      for (const entry of value.specifiers as AstNode[]) {
+        const local = child(entry, 'local')!.name as string
+        const imported = child(entry, 'imported')
+        const name = imported?.name ?? stringValue(imported)
+        let binding: Binding = null
+        if (entry.type === 'ImportDefaultSpecifier' || entry.type === 'ImportNamespaceSpecifier') {
+          if (specifier === 'fs') binding = 'fs'
+          if (specifier === 'fs/promises') binding = 'promises'
+          if (specifier === 'path') binding = 'path'
+        } else {
+          if ((specifier === 'fs' || specifier === 'fs/promises') && name === 'readFile')
+            binding = 'readFile'
+          if (specifier === 'fs' && name === 'readFileSync') binding = 'readFileSync'
+          if (specifier === 'fs' && name === 'promises') binding = 'promises'
+          if (specifier === 'path' && (name === 'join' || name === 'resolve')) binding = name
+        }
+        scope.bindings.set(local, binding)
+      }
+    }
+    if (value.type === 'CallExpression') calls.push({ node: value, scope })
+    for (const key in value) {
+      if (key !== 'start' && key !== 'end' && key !== 'type') collect(value[key], scope)
+    }
+  }
+  collect(parseSync(file, source, { lang: langForFile(file) }).program, {
+    bindings: new Map(),
+    function: true,
+  })
+  const lookup = (name: string, scope: Scope): Binding | undefined => {
+    for (let current: Scope | undefined = scope; current; current = current.parent)
+      if (current.bindings.has(name)) return current.bindings.get(name)
+    return undefined
+  }
+  const bindingOf = (node: AstNode | undefined, scope: Scope): Binding | undefined => {
+    if (node?.type === 'Identifier') return lookup(node.name as string, scope)
+    if (node?.type !== 'MemberExpression' || node.computed) return undefined
+    const owner = bindingOf(child(node, 'object'), scope)
+    const name = child(node, 'property')?.name
+    if ((owner === 'fs' || owner === 'promises') && name === 'readFile') return 'readFile'
+    if (owner === 'fs' && name === 'readFileSync') return 'readFileSync'
+    if (owner === 'fs' && name === 'promises') return 'promises'
+    if (owner === 'path' && (name === 'join' || name === 'resolve')) return name
+    return undefined
+  }
+  const evaluate = (node: AstNode | undefined, scope: Scope): string | undefined => {
+    const literal = stringValue(node)
+    if (literal !== undefined) return literal
+    if (node?.type !== 'CallExpression') return undefined
+    const callee = child(node, 'callee')
+    const args = node.arguments as AstNode[]
+    if (
+      callee?.type === 'MemberExpression' &&
+      !callee.computed &&
+      child(callee, 'object')?.name === 'process' &&
+      child(callee, 'property')?.name === 'cwd' &&
+      lookup('process', scope) === undefined &&
+      args.length === 0
+    )
+      return root
+    const name = bindingOf(callee, scope)
+    if (name !== 'join' && name !== 'resolve') return undefined
+    const parts = args.map(arg => evaluate(arg, scope))
+    if (parts.some(part => part === undefined)) return undefined
+    return name === 'join'
+      ? path.join(...(parts as string[]))
+      : path.resolve(root, ...(parts as string[]))
+  }
+  for (const { node, scope } of calls) {
+    const name = bindingOf(child(node, 'callee'), scope)
+    if (name === 'readFile' || name === 'readFileSync') {
+      const target = evaluate((node.arguments as AstNode[])[0], scope)
+      if (target !== undefined) paths.add(path.resolve(root, target))
+    }
+  }
+  return [...paths]
 }
 
 /**

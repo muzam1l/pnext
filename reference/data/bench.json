@@ -462,38 +462,74 @@
       }
     },
     {
-      "id": "js-gzip",
-      "label": "First-page client JS (gzip)",
+      "id": "js-total-gzip",
+      "label": "First-page client JS incl. deferred (gzip)",
       "category": "payload",
       "phase": "static",
       "rows": {
         "hello": [
-          6.64,
-          "6.64 KB",
+          39.89,
+          "39.89 KB",
           130.38,
           "130.38 KB",
-          19.64
+          3.27
         ],
         "ssr": [
-          13.19,
-          "13.19 KB",
+          46.45,
+          "46.45 KB",
           130.64,
           "130.64 KB",
-          9.9
+          2.81
         ],
         "dashboard": [
-          26.09,
-          "26.09 KB",
+          62.64,
+          "62.64 KB",
           134.58,
           "134.58 KB",
-          5.16
+          2.15
         ],
         "visible": [
-          2.8,
-          "2.80 KB",
+          9.26,
+          "9.26 KB",
+          132.8,
+          "132.80 KB",
+          14.34
+        ]
+      }
+    },
+    {
+      "id": "js-gzip",
+      "label": "First-paint client JS (gzip)",
+      "category": "payload",
+      "phase": "static",
+      "rows": {
+        "hello": [
+          6.76,
+          "6.76 KB",
+          130.38,
+          "130.38 KB",
+          19.29
+        ],
+        "ssr": [
+          13.41,
+          "13.41 KB",
+          130.64,
+          "130.64 KB",
+          9.74
+        ],
+        "dashboard": [
+          26.14,
+          "26.14 KB",
+          134.58,
+          "134.58 KB",
+          5.15
+        ],
+        "visible": [
+          2.85,
+          "2.85 KB",
           132.32,
           "132.32 KB",
-          47.28
+          46.43
         ]
       }
     },
@@ -504,61 +540,61 @@
       "phase": "static",
       "rows": {
         "hello": [
-          15.19,
-          "15.19 KB",
+          15.76,
+          "15.76 KB",
           442.5,
           "442.50 KB",
-          29.13
+          28.08
         ],
         "ssr": [
-          32.31,
-          "32.31 KB",
+          32.94,
+          "32.94 KB",
           442.81,
           "442.81 KB",
-          13.71
+          13.44
         ],
         "dashboard": [
-          112.05,
-          "112.05 KB",
+          112.63,
+          "112.63 KB",
           503.6,
           "503.60 KB",
-          4.49
+          4.47
         ],
         "visible": [
-          6.74,
-          "6.74 KB",
+          6.86,
+          "6.86 KB",
           447.18,
           "447.18 KB",
-          66.34
+          65.19
         ]
       }
     },
     {
       "id": "js-deferred-gzip",
-      "label": "Deferred client JS (gzip)",
+      "label": "Deferred client JS, idle or on demand (gzip)",
       "category": "payload",
       "phase": "static",
       "rows": {
         "hello": [
-          32.92,
-          "32.92 KB",
+          33.13,
+          "33.13 KB",
           0,
           "0.00 KB",
-          0
+          0.0
         ],
         "ssr": [
-          32.81,
-          "32.81 KB",
+          33.04,
+          "33.04 KB",
           0,
           "0.00 KB",
-          0
+          0.0
         ],
         "dashboard": [
-          36.01,
-          "36.01 KB",
+          36.5,
+          "36.50 KB",
           0,
           "0.00 KB",
-          0
+          0.0
         ],
         "visible": [
           6.41,
@@ -590,18 +626,18 @@
           1.5
         ],
         "dashboard": [
-          6,
-          "6",
+          5,
+          "5",
           9,
           "9",
-          1.5
+          1.8
         ],
         "visible": [
           1,
           "1",
           6,
           "6",
-          6
+          6.0
         ]
       }
     },
@@ -612,18 +648,18 @@
       "phase": "static",
       "rows": {
         "hello": [
-          15.19,
-          "15.19 KB",
+          15.76,
+          "15.76 KB",
           442.5,
           "442.50 KB",
-          29.13
+          28.08
         ],
         "ssr": [
-          15.82,
-          "15.82 KB",
+          16.38,
+          "16.38 KB",
           442.5,
           "442.50 KB",
-          27.96
+          27.01
         ]
       }
     }
@@ -660,9 +696,9 @@
       "value": "2.1\u20134.3\u00d7"
     },
     {
-      "label": "First-page client JS (gzip)",
+      "label": "Client JS incl. deferred (gzip)",
       "direction": "less",
-      "value": "5.2\u201347\u00d7"
+      "value": "2.1\u201314\u00d7"
     },
     {
       "label": "Framework install size",
@@ -673,16 +709,39 @@
   ],
   "clientRuntimes": [
     {
-      "name": "router-prefetch-only",
-      "raw": "473 B",
-      "gzip": "346 B",
-      "brotli": "283 B"
+      "name": "server page",
+      "raw": "0 B",
+      "gzip": "0 B",
+      "brotli": "0 B",
+      "deferred": "0 B"
     },
     {
-      "name": "combined-router-hydrator",
-      "raw": "10.47 KB",
-      "gzip": "4.48 KB",
-      "brotli": "4.07 KB"
+      "name": "server page + Link",
+      "raw": "2.91 KB",
+      "gzip": "1.56 KB",
+      "brotli": "1.31 KB",
+      "deferred": "21.03 KB"
+    },
+    {
+      "name": "island (Preact)",
+      "raw": "21.28 KB",
+      "gzip": "8.45 KB",
+      "brotli": "7.66 KB",
+      "deferred": "0 B"
+    },
+    {
+      "name": "island (compat.react)",
+      "raw": "39.45 KB",
+      "gzip": "15.03 KB",
+      "brotli": "13.64 KB",
+      "deferred": "0 B"
+    },
+    {
+      "name": "island (compat.next)",
+      "raw": "32.85 KB",
+      "gzip": "13.32 KB",
+      "brotli": "12.03 KB",
+      "deferred": "33.01 KB"
     }
   ]
 }

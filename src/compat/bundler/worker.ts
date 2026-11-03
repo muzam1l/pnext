@@ -16,6 +16,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, statSync } from 'node:fs'
 import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 import type { Plugin } from 'esbuild'
 import { build } from '../../utils/esbuild'
@@ -50,7 +51,16 @@ function resolveWorkerEntry(
   specifier: string,
   configuredExtensions: readonly string[] | undefined,
 ): string | undefined {
-  if (!specifier.startsWith('.')) return undefined
+  if (!specifier.startsWith('.')) {
+    try {
+      const resolved = createRequire(path.join(importerDir, '__pnext_worker_resolve__.js')).resolve(
+        specifier,
+      )
+      return isFile(resolved) ? resolved : undefined
+    } catch {
+      return undefined
+    }
+  }
   const base = path.resolve(importerDir, specifier)
   if (path.extname(base) && isFile(base)) return base
   for (const extension of configuredExtensions ?? workerSpecifierExtensions) {

@@ -9,13 +9,13 @@
 // extensions; everything else falls through.
 
 import { setAssetExtensions } from '../../extensions'
-import { staticImageModule } from '../next/image/static-metadata'
 
 export function registerStaticImageExtensions(): void {
   setAssetExtensions({
     staticAssetPublicPrefixes: () => ['/__pnext/static/media/', '/_next/static/media/'],
     staticAssetRelativePath: ({ base, hash, ext }) =>
       ['_next', 'static', 'media', `${base}.${hash}${ext}`].join('/'),
-    staticAssetModule: staticImageModule,
+    staticAssetModule: context =>
+      import('../next/image/static-metadata').then(m => m.staticImageModule(context)),
   })
 }

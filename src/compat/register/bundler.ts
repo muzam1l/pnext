@@ -20,7 +20,13 @@ import path from 'node:path'
 import type { OnLoadResult, Plugin } from 'esbuild'
 import type { ResolvedConfig } from '../../config'
 import type { ServerEsbuildPluginOptions } from '../../extensions'
-import { compatAliases, nextCompatEnabled, rewriteNextFontSource } from '../../compat/aliases'
+import {
+  compatAliases,
+  nextCompatEnabled,
+  nextRequireAliases,
+  reactServerLayerAliases,
+  rewriteNextFontSource,
+} from '../../compat/aliases'
 import {
   getBundlerExtensions,
   getCompatModeExtensions,
@@ -47,6 +53,8 @@ import {
   setTsConfigPath,
 } from '../../resolve/imports'
 import { setServerBundleConditions } from '../../runtime/load'
+import { getNextConfig } from '../next/config-loader'
+import { hasInstrumentationClient } from '../lifecycle/instrumentation-client'
 import { escapeRegex, specifierSniffTokens } from '../../utils/code'
 import {
   cacheComponentsEnabled,
@@ -59,7 +67,6 @@ import {
   relayCompilerConfig,
   removeConsoleTargets,
   resolveExtensions,
-  builtInServerExternalPackages,
   serverExternalPackages,
   swcEnvUsageMode,
   tsconfigPath,
@@ -106,13 +113,35 @@ import {
   webpackLoaderRuleModule,
   webpackLoaderRulesPlugin,
 } from '../bundler/webpack-loaders'
-import { rewriteStaticCompatImports } from '../bundler/static-imports'
+import {
+  nextDefaultImportSpecifiers,
+  rewriteNextCallableRequires,
+  rewriteNextDefaultImports,
+  rewriteStaticCompatImports,
+} from '../bundler/static-imports'
 import { createClientWorkerTransform } from '../bundler/worker'
 import { rewriteStyledJsxSource } from '../css/styled-jsx'
 import { getImagesConfig } from '../next/image/config'
-import { appUsesBlurPlaceholder, appUsesLegacyLink } from '../next/usage'
+import { appUsesBlurPlaceholder, appUsesLegacyLink, appUsesRuntimePrefetch } from '../next/usage'
 import { rewriteLegacyLinkValidation } from '../next/link-transform'
 import { pagesClientModulePlugin } from '../pages/client-plugin'
+
+const routerIndex = path.join('client', 'router', 'index.ts')
+// pnext's own client runtime never imports an optimizePackageImports barrel.
+const frameworkSource = path.resolve(import.meta.dirname, '../..') + path.sep
+
+// The router facade's runtime import resolves to compat's nav policies, which re-export the runtime:
+// they always load together, so they ship as one chunk.
+const routerRuntimeWithNavPoliciesPlugin: Plugin = {
+  name: 'pnext-compat-router-runtime',
+  setup(build) {
+    build.onResolve({ filter: /^\.\/runtime-entry$/ }, args =>
+      args.importer.endsWith(routerIndex)
+        ? { path: path.resolve(args.importer, '../../../compat/client/nav-runtime.ts') }
+        : undefined,
+    )
+  },
+}
 
 export function registerBundlerExtensions(config: ResolvedConfig): void {
   // The alias registries (setImportAliasExtensions + setModuleAliases) are boot
@@ -157,11 +186,10 @@ export function registerBundlerExtensions(config: ResolvedConfig): void {
   setExternalPackagePolicy({
     external: name => externals.has(name),
     transpile: name =>
-      !externals.has(name) && (transpile.has(name) || isLinkedWorkspacePackage(config, name)),
+      transpile.has(name) || (!externals.has(name) && isLinkedWorkspacePackage(config, name)),
     // Linked workspace packages are deliberately absent: esbuild resolves their
     // symlinks to real paths, so they never reach a filter as node_modules.
-    transpiled: () => [...transpile].filter(name => !externals.has(name)),
-    releaseExternal: name => builtInServerExternalPackages().has(name) && !transpile.has(name),
+    transpiled: () => [...transpile],
     esmExternals,
   })
   setExternalLoadResolver(({ root, fromFile, specifier, target }) => {
@@ -247,17 +275,28 @@ export function registerBundlerExtensions(config: ResolvedConfig): void {
   registerServerSourceTransforms(withSniff(["'bun", '"bun'], rewriteBunBuiltinExternals))
   // Materialized fixtures can re-import original sources outside esbuild's
   // alias graph. Keep their static compat imports on the registered facades.
-  // Leave React entrypoints for the resolver: RSC/proxy/middleware needs the
-  // stricter react-server-layer overrides instead of the ordinary shims.
+  // Layer-dependent entries must reach the resolver before any base alias is baked into source.
   const staticServerAliases = compatAliases(config, 'server')
-  delete staticServerAliases.react
-  delete staticServerAliases['react-dom']
+  for (const specifier of Object.keys(reactServerLayerAliases(config))) {
+    delete staticServerAliases[specifier]
+  }
   // The CJS facades live in compat/next, one level up from this register dir.
   const nextRoot = path.resolve(import.meta.dirname, '..', 'next')
   const requireAliases = {
-    'next/navigation': path.join(nextRoot, 'navigation.cjs'),
+    ...nextRequireAliases(),
     'next/router': path.join(nextRoot, 'router.cjs'),
   }
+  registerClientSourceTransforms(
+    withSniff(
+      specifierSniffTokens(
+        [...nextDefaultImportSpecifiers, 'next/head', 'next/link'].flatMap(specifier => [
+          specifier,
+          `${specifier}.js`,
+        ]),
+      ),
+      (source, file) => rewriteNextCallableRequires(rewriteNextDefaultImports(source, file), file),
+    ),
+  )
   registerServerSourceTransforms(
     withSniff(
       specifierSniffTokens([...Object.keys(staticServerAliases), ...Object.keys(requireAliases)]),
@@ -384,6 +423,10 @@ export function registerBundlerExtensions(config: ResolvedConfig): void {
       __PNEXT_IMAGE_BLUR__: String(appUsesBlurPlaceholder(config.root)),
       // Same one-sided source scan for `<Link legacyBehavior>` (usage.ts).
       __PNEXT_LINK_LEGACY__: String(appUsesLegacyLink(config.root)),
+      // Runtime and Partial Prefetching client code ships only to an app with a runtime-prefetched route.
+      __PNEXT_RUNTIME_PREFETCHING__: String(
+        getNextConfig().partialPrefetching === true || appUsesRuntimePrefetch(config.root),
+      ),
       // next.config `images` only ever reached the server global, so the client
       // fell back to the defaults — config-dependent props (path, qualities,
       // sizes) mismatched on hydration. Inlining the resolved config also drops
@@ -391,7 +434,23 @@ export function registerBundlerExtensions(config: ResolvedConfig): void {
       __PNEXT_IMAGE_CONFIG_INLINE__: JSON.stringify(getImagesConfig()),
       __PNEXT_IMAGE_CONFIG_INLINED__: 'true',
       // Next's router policies replace core's scroll and refresh ones, so client bundles drop those.
-      ...(nextCompatEnabled(config) ? { __PNEXT_NEXT_ROUTER__: 'true' } : {}),
+      ...(nextCompatEnabled(config)
+        ? {
+            __PNEXT_NEXT_ROUTER__: 'true',
+            __PNEXT_INSTRUMENTATION_CLIENT__: String(hasInstrumentationClient(config)),
+            __PNEXT_ROUTER_POLICY_SETTERS__: 'true',
+            __PNEXT_STATIC_EXPORT__: String(getNextConfig().output === 'export'),
+            // Same switch render.ts stamps as the document's segment-scheduler flag.
+            __PNEXT_CACHE_COMPONENTS__: String(
+              (getNextConfig() as { cacheComponents?: unknown }).cacheComponents === true,
+            ),
+          }
+        : {}),
+      __PNEXT_HAS_BASE_PATH__: String(Boolean(config.basePath)),
+      __PNEXT_CONCURRENT_ROUTER_QUEUE__: String(
+        (getNextConfig().experimental as { concurrentRouterQueue?: unknown } | undefined)
+          ?.concurrentRouterQueue === true,
+      ),
       // publicRuntimeConfig inlined the same way; omitted entirely when unset so an app that
       // never configures it adds zero bytes (unlike images, there is no default to drop).
       ...(Object.keys(publicRuntimeConfig()).length > 0
@@ -407,6 +466,7 @@ export function registerBundlerExtensions(config: ResolvedConfig): void {
       { name: polyfillsChunkFileName(), contents: POLYFILLS_NOMODULE_SOURCE },
     ],
     clientEsbuildPlugins: (cfg: ResolvedConfig): Plugin[] => [
+      routerRuntimeWithNavPoliciesPlugin,
       ...webpackLoaderPlugins(cfg, 'client'),
       pagesClientModulePlugin(cfg),
       wasmModulePlugin(cfg),
@@ -568,6 +628,7 @@ function firstPartyClientOptimizeImportsLoadPlugin(
     setup(build) {
       build.onLoad({ filter: /\.tsx?$/, namespace: 'file' }, args =>
         args.path.includes(`${path.sep}node_modules${path.sep}`) ||
+        args.path.startsWith(frameworkSource) ||
         roots.some(root => args.path.startsWith(root))
           ? undefined
           : rewriteFile(args.path),

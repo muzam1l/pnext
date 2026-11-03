@@ -8,6 +8,7 @@ import { maybeLightningcssTransform } from './lightningcss'
 import { escapeRegex } from '../../utils/code'
 import { cssModuleScopePath } from '../../utils/fs'
 import { productionRelease } from '../../runtime/production'
+import { cssModuleSourceFromMap } from '../../css/assets'
 
 interface ComposeRef {
   names: string[]
@@ -82,9 +83,7 @@ export function nextCssResolveModule(config: ResolvedConfig) {
 
 export function nextCssLoadModuleForClient(config: ResolvedConfig) {
   return (file: string): string | undefined =>
-    isCssModuleFile(file)
-      ? `export default ${JSON.stringify(cssModuleMapping(file, config.root))};`
-      : undefined
+    isCssModuleFile(file) ? cssModuleSourceFromMap(cssModuleMapping(file, config.root)) : undefined
 }
 
 export function nextCssResolveDependency(config: ResolvedConfig) {

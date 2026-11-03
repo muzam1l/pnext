@@ -32,7 +32,15 @@ export interface PostcssOptions {
 const postcssProcessors = new Map<string, Promise<LoadedPostcss | undefined>>()
 
 interface PostcssProcessor {
-  process(css: string, options: { from: string; to: string }): PromiseLike<{ css: string }>
+  process(
+    css: string,
+    options: { from: string; to: string; pnextDependencies?: string[] },
+  ): PromiseLike<{ css: string }>
+}
+
+interface PostcssResult {
+  opts: { from?: string; pnextDependencies?: string[] }
+  messages: { type: string; plugin: string; file: string; parent?: string }[]
 }
 
 /** A processor plus the `@source not` directives to append for it (if any). */
@@ -129,6 +137,7 @@ export async function runPostcss(
   cssFile: string,
   options: PostcssOptions,
   fromSource?: string,
+  dependencies?: string[],
 ) {
   const loaded = await loadPostcss(root, options)
   if (!loaded) return
@@ -143,9 +152,21 @@ export async function runPostcss(
   // report against the real source; `@source` is order-independent to Tailwind.
   const result = await loaded.processor.process(
     css + keptExclusions(loaded.sources, css, from, loaded.partitionedTailwindScan),
-    { from, to: cssFile },
+    { from, to: cssFile, pnextDependencies: dependencies },
   )
   await writeFile(cssFile, result.css)
+}
+
+// A bundle is labelled with its first source's path, and Tailwind (<=4.3.1) reuses its compile until
+// `from` or a declared dependency changes mtime: declare every bundled file.
+const declareBundledSources = {
+  postcssPlugin: 'pnext-bundled-sources',
+  Once(_root: unknown, { result }: { result: PostcssResult }) {
+    const files = result.opts.pnextDependencies ?? []
+    for (const file of files) {
+      result.messages.push({ type: 'dependency', plugin: 'pnext', file, parent: result.opts.from })
+    }
+  },
 }
 
 async function createPostcssProcessor(root: string, options: PostcssOptions) {
@@ -168,7 +189,7 @@ async function createPostcssProcessor(root: string, options: PostcssOptions) {
     ([specifier, pluginOptions]) => specifier === '@tailwindcss/postcss' && pluginOptions !== false,
   )
   return {
-    processor: postcss(plugins),
+    processor: postcss([declareBundledSources, ...plugins]),
     sources: tailwind ? scanExclusions(root, appRequire, options) : '',
     partitionedTailwindScan,
   }

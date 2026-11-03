@@ -16,7 +16,7 @@ import {
   takeDeferredInstalls,
 } from './hub'
 import type { LinkClickTarget } from './hub'
-import type { PrefetchOptions, SoftNavigateOptions } from './types'
+import type { NavigationApi, PrefetchOptions, SoftNavigateOptions } from './types'
 
 export {
   blockJavascriptUrl,
@@ -42,7 +42,7 @@ export type {
   StylesheetReconciler,
 } from './types'
 
-type RouterRuntime = typeof import('./runtime')
+type RouterRuntime = typeof import('./runtime-entry')
 
 let runtime: Promise<RouterRuntime> | undefined
 
@@ -55,11 +55,20 @@ function withRouter<T>(use: (module: RouterRuntime) => T): Promise<Awaited<T>> {
   // Deferred installers land with the runtime chunk, before anything reads a
   // policy. Drained inside the chain (not at call time) so an installer any
   // entry registers after the first facade call still runs.
-  runtime ??= import('./runtime').then(async module => {
-    await Promise.all(takeDeferredInstalls().map(install => install()))
+  runtime ??= import('./runtime-entry').then(async module => {
+    await Promise.all(takeDeferredInstalls().map(install => install(module)))
     return module
   })
-  return runtime.then(use) as Promise<Awaited<T>>
+  // Any first use installs the full router, so it binds to the hard load before navigating away.
+  return runtime.then(module => {
+    if (hubInstalled) {
+      hubInstalled = false
+      document.removeEventListener('click', hubLinkClick)
+      window.removeEventListener('popstate', hubPopState)
+      module.installRouterFull()
+    }
+    return use(module)
+  }) as Promise<Awaited<T>>
 }
 
 export function softNavigate(href: string, options?: SoftNavigateOptions) {
@@ -94,15 +103,9 @@ export function rearmVisiblePrefetches() {
   return withRouter(module => module.rearmVisiblePrefetches())
 }
 
-// A click intercepted before the runtime lands waits for it. The wait is
-// bounded: a chunk that never arrives (offline, a failed deploy) must still
-// navigate, so the queued click falls back to a real browser navigation rather
-// than leaving the user on a dead link.
-const QUEUED_CLICK_TIMEOUT_MS = 3_000
-
-let pendingClicks: LinkClickTarget[] = []
+const pendingClicks: LinkClickTarget[] = []
 let pendingPop = false
-let installedFull = false
+let hubInstalled = false
 let hardNavTimer: ReturnType<typeof setTimeout> | undefined
 
 function hubLinkClick(event: MouseEvent) {
@@ -110,10 +113,11 @@ function hubLinkClick(event: MouseEvent) {
   if (!target) return
   event.preventDefault()
   pendingClicks.push(target)
+  // A runtime that never lands (offline, a failed deploy) still navigates, as a hard load after 3s.
   hardNavTimer ??= setTimeout(() => {
     const queued = pendingClicks[0]
     if (queued) location.href = queued.url.href
-  }, QUEUED_CLICK_TIMEOUT_MS)
+  }, 3_000)
   void loadRuntime()
 }
 
@@ -128,17 +132,9 @@ function hubPopState() {
 
 function loadRuntime() {
   return withRouter(module => {
-    if (!installedFull) {
-      installedFull = true
-      document.removeEventListener('click', hubLinkClick)
-      window.removeEventListener('popstate', hubPopState)
-      module.installRouterFull()
-    }
+    // The hub's listeners are gone by now, so nothing queues behind this drain.
     clearTimeout(hardNavTimer)
-    hardNavTimer = undefined
-    const clicks = pendingClicks
-    pendingClicks = []
-    for (const click of clicks) module.commitLinkNavigation(click)
+    for (const click of pendingClicks.splice(0)) module.commitLinkNavigation(click)
     if (pendingPop) {
       pendingPop = false
       module.onPopState()
@@ -146,23 +142,28 @@ function loadRuntime() {
   })
 }
 
-function whenIdle(run: () => void) {
-  if (typeof requestIdleCallback === 'function') requestIdleCallback(() => run(), { timeout: 1000 })
-  else setTimeout(run, 1)
+export function whenIdle(run: () => void) {
+  // Without requestIdleCallback (Safari), setTimeout reads the options object as a zero delay.
+  const idle: (callback: () => void, options: object) => unknown =
+    globalThis.requestIdleCallback ?? setTimeout
+  idle(run, { timeout: 1000 })
 }
 
 export function installRouter() {
   if ((!process.browser && typeof window === 'undefined') || window.__PNEXT_ROUTER_INSTALLED__)
     return
   window.__PNEXT_ROUTER_INSTALLED__ = true
-  if ('scrollRestoration' in history) history.scrollRestoration = 'manual'
+  history.scrollRestoration = 'manual'
   // Seed the bfcache departing key with the hard-loaded route so the first
   // navigation away stashes this route's island state under the right key.
   // `locationKey()` IS `bfRouteKey(location.pathname, location.search)` — the
   // hub's own definition — and it is already on the first-paint graph.
   routerState.activeRouteKey = locationKey()
+  // Lets the runtime tell a Back/Forward that landed before this listener from later history writes.
+  routerState.hubEntry = (window as { navigation?: NavigationApi }).navigation?.currentEntry
 
+  hubInstalled = true
   document.addEventListener('click', hubLinkClick)
   window.addEventListener('popstate', hubPopState)
-  whenIdle(() => void loadRuntime())
+  whenIdle(loadRuntime)
 }

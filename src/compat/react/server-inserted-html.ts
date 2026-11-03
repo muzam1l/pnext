@@ -13,11 +13,15 @@
 // renderServerInsertedHTML() renders each callback's vnode to a string and concatenates it. CSS-in-JS
 // registries clear their emitted rules per call.
 
-import { h, Fragment } from 'preact'
+import { h, Fragment, createContext } from 'preact'
 import type { ComponentChildren, VNode } from 'preact'
 import renderToString from 'preact-render-to-string'
 
 type InsertCallback = () => ComponentChildren
+
+export const ServerInsertedHTMLContext = /* @__PURE__ */ createContext<
+  ((callback: InsertCallback) => void) | null
+>(null)
 
 interface Holder {
   __PNEXT_SERVER_INSERTED_HTML__?: InsertCallback[]

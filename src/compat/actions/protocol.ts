@@ -123,3 +123,22 @@ export const MASKED_ACTION_ERROR =
 export interface ActionSuccessBody {
   data: unknown
 }
+
+export const ACTION_FLIGHT_CONTENT_TYPE = 'text/x-component'
+
+/** Marker key naming a temporary-reference id in the args / return wire. */
+export const TEMP_REF_MARKER = '$$pnext_temp_ref'
+export const ACTION_ELEMENT_MARKER = '$$pnext_element'
+/**
+ * Marker carrying the SERVER-RENDERED HTML of a React element tree an action returned (host elements /
+ * async server components - NOT a client-reference element, which uses ACTION_ELEMENT_MARKER). The
+ * client revives it into a renderable node for useActionState.
+ */
+export const ACTION_ELEMENT_HTML_MARKER = '$$pnext_element_html'
+
+/**
+ * Response content-type/marker for a streamed action return. The client detects
+ * this and returns the response body as a ReadableStream from the call instead
+ * of parsing JSON.
+ */
+export const ACTION_STREAM_CONTENT_TYPE = 'x-component/pnext-stream'

@@ -129,6 +129,11 @@ export function useRouter(): PagesRouter {
   return currentRouter(ready)
 }
 
+export function useCompatRouter(): PagesRouter | null {
+  const router = useRouter()
+  return pagesRouterState(process.browser || typeof window !== 'undefined') ? router : null
+}
+
 export const Router = { events: routerEvents }
 export default Router
 

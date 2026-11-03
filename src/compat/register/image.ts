@@ -16,7 +16,7 @@ import {
   type RequestInterceptor,
 } from '../../extensions'
 import { getImagesConfig, type ResolvedImagesConfig } from '../next/image/config'
-import { isImageOptimizerRequest, serveImageOptimizer } from '../next/image/optimizer'
+import { isImageOptimizerRequest } from '../next/image/optimizer'
 import { manifestLocalPatterns } from '../next/image/patterns'
 import { getDocumentScriptExtensions, setDocumentScriptExtensions } from '../../render/hooks'
 import { setWorkUnitRoute } from '../../request/context'
@@ -69,6 +69,7 @@ const imageOptimizerInterceptor: RequestInterceptor = async (request, ctx) => {
   // asset so the app-router finalizers (Vary token merge, x-nextjs-* stamps)
   // leave them untouched. Next serves /_next/image outside the router too.
   setWorkUnitRoute('static-asset')
+  const { serveImageOptimizer } = await import('../image-optimizer/optimize')
   return serveImageOptimizer(request, config)
 }
 

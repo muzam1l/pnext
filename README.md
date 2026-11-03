@@ -28,7 +28,7 @@ Or by hand: `bun add -d @wular/pnext`, then `pnext dev`.
 
 ## Incremental by design
 
-Server-rendered pages ship **0 KB** of JavaScript, or **~1 KB gzip** if you want client-side navigation and prefetching. Interactive pages hydrate on Preact for **~7.5 KB** of framework, **~12.5 KB** with React compatibility. Everything is instant, the first page in dev renders **10–12× faster** than Next.js on **3.5–4× less memory**, and production builds run **7–9× faster**. See [Performance](./reference/performance.md).
+Server-rendered pages ship **0 KB** of JavaScript. A `<Link>` adds **~1.6 KB gzip** and loads the navigation runtime (~21 KB) on idle. Interactive pages hydrate on Preact for **~8.5 KB gzip** of framework, **~15 KB** with React compatibility. Everything is instant, the first page in dev renders **10–12× faster** than Next.js on **3.5–4× less memory**, and production builds run **7–9× faster**. See [Performance](./reference/performance.md).
 
 Core pnext is pure Preact. `compat.react` runs React components and libraries on it, and `compat.next` runs a whole Next.js App Router app unchanged. Start anywhere on that ladder and move when it suits you. The App Router compatibility is validated against Next's own test suite (4,400+ assertions passing). The `pages/` folder or private internal utilities of Next.js or React are mostly not supported. See [Compatibility](./reference/compat.md).
 
@@ -73,7 +73,7 @@ export function Counter({ initial }: { initial: number }) {
 }
 ```
 
-Client Components hydrate on Preact for ~7.5 KB of framework, or ~12.5 KB with [`compat.react`](./reference/compat.md) if you want to run React components and libraries unchanged. Offscreen islands can stay out of the initial bundle entirely with `dynamic({ load: 'visible' })`.
+Client Components hydrate on Preact for ~8.5 KB gzip of framework, or ~15 KB with [`compat.react`](./reference/compat.md) if you want to run React components and libraries unchanged. Offscreen islands can stay out of the initial bundle entirely with `dynamic({ load: 'visible' })`.
 
 ### Streaming
 

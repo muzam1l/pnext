@@ -63,7 +63,18 @@ export function sourceEntries(files: string[]): SourceEntry[] | undefined {
   return entries
 }
 
+// Routes share most sources: one synchronous facts walk hashes each file once.
+const tickEntries = new Map<string, SourceEntry | undefined>()
+
 export function sourceEntry(file: string): SourceEntry | undefined {
+  if (tickEntries.has(file)) return tickEntries.get(file)
+  if (tickEntries.size === 0) queueMicrotask(() => tickEntries.clear())
+  const entry = readSourceEntry(file)
+  tickEntries.set(file, entry)
+  return entry
+}
+
+function readSourceEntry(file: string): SourceEntry | undefined {
   try {
     const source = readFileSync(file, 'utf8')
     // Stat AFTER the read: a file that changes between the two records the

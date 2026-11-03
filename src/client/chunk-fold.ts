@@ -12,6 +12,11 @@ import { build, type BuildOptions, type Metafile } from 'esbuild'
 import { clientProfile } from './profile'
 import { readText, writeText } from '../utils/fs'
 import { escapeRegex } from '../utils/code'
+import { loadNative } from '../utils/native-require'
+
+const parseSync: typeof import('oxc-parser').parseSync = (...args) =>
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  loadNative(() => require('oxc-parser') as typeof import('oxc-parser')).parseSync(...args)
 
 /** Unlinking an artifact a concurrent build already removed is not news. */
 function ignoreMissing() {
@@ -21,7 +26,7 @@ function ignoreMissing() {
 /** Import/export forms the rewrite understands; anything else vetoes the fold. */
 const namedClause = String.raw`\{([^}]*)\}`
 
-interface FoldOptions {
+export interface FoldOptions {
   outDir: string
   metafile: Metafile
   /** esbuild flags of the build being folded, so the merge is emitted the same way. */
@@ -35,8 +40,7 @@ interface FoldOptions {
 export async function foldInitialChunks(options: FoldOptions): Promise<Metafile> {
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   if (process.env.PNEXT_CHUNK_FOLD === '0') return options.metafile
-  // The cost this removes is compressed-transfer only (a gzip header and
-  // dictionary reset per chunk), so the pass rides the minify flag.
+  // The cost this removes is compressed-transfer only, so the pass rides the minify flag.
   if (!options.buildOptions.minify) return options.metafile
   return foldChunks(options)
 }
@@ -48,15 +52,16 @@ export async function foldInitialChunks(options: FoldOptions): Promise<Metafile>
  */
 async function foldChunks({ outDir, metafile, buildOptions }: FoldOptions): Promise<Metafile> {
   let folded = metafile
-  const groups = clientProfile.time('foldGroups', () => coLoadGroups(metafile))
-  clientProfile.count('foldGroup#', groups.length)
+  const coLoad = clientProfile.time('foldGroups', () => coLoadGroups(metafile))
+  const tiny = tinyChunkGroups(metafile, coLoad)
+  clientProfile.count('foldGroup#', coLoad.length)
   clientProfile.count('foldOutput#', Object.keys(metafile.outputs).length)
-  if (groups.length === 0) return folded
+  if (coLoad.length === 0 && tiny.size === 0) return folded
   // Output text is read once and kept in step with what each group writes, and
   // the same state indexes specifiers — so a group visits only the files naming
   // one of its members instead of re-reading and re-filtering every output.
   const state = await clientProfile.timeAsync('foldRead', () => createFoldState(outDir, metafile))
-  for (const group of groups) {
+  for (const group of withTinyChunks(coLoad, tiny, state)) {
     const mutation = { started: false }
     try {
       folded = await foldGroup({ outDir, metafile: folded, buildOptions }, group, mutation, state)
@@ -67,6 +72,22 @@ async function foldChunks({ outDir, metafile, buildOptions }: FoldOptions): Prom
     }
   }
   return folded
+}
+
+/** Each side-effect-free tiny chunk joins its parent's group, so one merge build covers both. */
+function withTinyChunks(coLoad: string[][], tiny: Map<string, string[]>, state: FoldState) {
+  const groups = coLoad.map(group => [...group])
+  for (const [parent, members] of tiny) {
+    const pure = members.filter(file => {
+      const text = state.outputs.get(path.resolve(file))?.text
+      return text !== undefined && sideEffectFree(text)
+    })
+    if (pure.length === 0) continue
+    const group = groups.find(candidate => candidate.includes(parent))
+    if (group) group.push(...pure)
+    else groups.push([parent, ...pure])
+  }
+  return groups.map(group => group.sort())
 }
 
 function reportFoldFailure(group: string[], error: unknown) {
@@ -160,18 +181,7 @@ async function foldGroup(
  * what a lazily loaded island's CSS/runtime seam resolves against.
  */
 function coLoadGroups(metafile: Metafile) {
-  const dynamicTargets = new Set<string>()
-  for (const output of Object.values(metafile.outputs)) {
-    for (const imported of output.imports ?? []) {
-      if (imported.kind === 'dynamic-import') dynamicTargets.add(imported.path)
-    }
-  }
-  // esbuild records an `entryPoint` for the chunk behind every `import()` too,
-  // so dynamic targets have to be subtracted before what is left counts as a
-  // route entry.
-  const entries = Object.keys(metafile.outputs).filter(
-    file => metafile.outputs[file]?.entryPoint && !dynamicTargets.has(file),
-  )
+  const { entries, dynamicTargets } = loadRoots(metafile)
   if (entries.length === 0) return []
 
   const available = availability(metafile, entries, dynamicTargets)
@@ -195,6 +205,184 @@ function coLoadGroups(metafile: Metafile) {
         entries.some(entry => available.get(entry)!.has(group[0]!)),
     )
     .map(group => [...group].sort())
+}
+
+/** First-paint framework chunks under this many bytes are tiny and may merge into a parent. */
+const TINY_CHUNK_BYTES = 2048
+/** Tiny bytes merged per parent: the most a route that loads the parent alone can over-fetch. */
+const TINY_PARENT_BUDGET = 3072
+
+const frameworkSrc = path.resolve(import.meta.dirname, '..') + path.sep
+
+/**
+ * Tiny initial-tier framework chunks, each grouped with the largest chunk loaded by every root that
+ * loads it, smallest first within the parent's budget, when at least half the parent's routes load it. Each merge saves a request and a gzip stream on
+ * routes that load both. Only side-effect-free chunks qualify, so a module evaluating on a route that
+ * never imported it changes nothing, and only chunks whose own imports the parent already brings.
+ */
+function tinyChunkGroups(metafile: Metafile, coLoad: string[][]) {
+  const groups = new Map<string, string[]>()
+  const { entries, dynamicTargets } = loadRoots(metafile)
+  if (entries.length === 0) return groups
+  const available = availability(metafile, entries, dynamicTargets)
+  const roots = [...available.values()]
+  const outputs = metafile.outputs
+  const grouped = new Set(coLoad.flat())
+  const shared = Object.keys(outputs).filter(
+    file => file.endsWith('.js') && !entries.includes(file) && !dynamicTargets.has(file),
+  )
+  // A co-load group merges into one chunk, so its members count as that chunk's size.
+  const unitBytes = (file: string) =>
+    (coLoad.find(group => group.includes(file)) ?? [file]).reduce(
+      (sum, member) => sum + outputs[member]!.bytes,
+      0,
+    )
+  const loading = (chunk: string) => entries.filter(entry => available.get(entry)!.has(chunk))
+  const budget = new Map<string, number>()
+  for (const file of [...shared].sort((a, b) => outputs[a]!.bytes - outputs[b]!.bytes)) {
+    const output = outputs[file]!
+    if (output.bytes >= TINY_CHUNK_BYTES || grouped.has(file) || !isFrameworkChunk(output)) continue
+    if (loading(file).length === 0) continue
+    const loaders = roots.filter(set => set.has(file))
+    const parent = shared
+      .filter(other => other !== file && unitBytes(other) >= TINY_CHUNK_BYTES)
+      .filter(other => loaders.every(set => set.has(other)))
+      .sort((a, b) => unitBytes(b) - unitBytes(a))[0]
+    if (!parent) continue
+    const left = budget.get(parent) ?? TINY_PARENT_BUDGET
+    if (output.bytes > left) continue
+    // Most routes loading the parent must already load the chunk, or the merge mostly over-fetches.
+    if (loading(file).length * 2 < loading(parent).length) continue
+    const brought = staticClosure(metafile, parent)
+    const imports = (output.imports ?? []).filter(item => item.kind === 'import-statement')
+    if (imports.some(item => !brought.has(item.path))) continue
+    budget.set(parent, left - output.bytes)
+    ;(groups.get(parent) ?? groups.set(parent, []).get(parent)!).push(file)
+  }
+  return groups
+}
+
+function isFrameworkChunk(output: Metafile['outputs'][string]) {
+  const inputs = Object.keys(output.inputs)
+  // An empty chunk (a shared module tree-shaken to nothing) is only a request.
+  return (
+    (inputs.length > 0 || output.bytes === 0) &&
+    inputs.every(input => {
+      const file = path.resolve(input)
+      return (
+        file.startsWith(frameworkSrc) ||
+        file.includes(`${path.sep}node_modules${path.sep}preact${path.sep}`)
+      )
+    })
+  )
+}
+
+interface AstNode {
+  type: string
+  [key: string]: unknown
+}
+
+/** Top level holds only declarations whose evaluation cannot be observed. */
+function sideEffectFree(source: string) {
+  let program: { body: AstNode[] }
+  try {
+    const result = parseSync('chunk.js', source, { sourceType: 'module' })
+    if (result.errors.length > 0) return false
+    program = result.program as unknown as { body: AstNode[] }
+  } catch {
+    return false
+  }
+  return program.body.every(statement => {
+    if (statement.type === 'ImportDeclaration') return true
+    if (statement.type === 'ExportNamedDeclaration')
+      return !statement.declaration || pureStatement(statement.declaration as AstNode)
+    return pureStatement(statement)
+  })
+}
+
+function pureStatement(node: AstNode): boolean {
+  if (node.type === 'FunctionDeclaration') return true
+  if (node.type === 'ClassDeclaration') return pureClass(node)
+  if (node.type === 'VariableDeclaration') {
+    return (node.declarations as AstNode[]).every(
+      declaration => !declaration.init || pureExpression(declaration.init as AstNode),
+    )
+  }
+  return false
+}
+
+function pureClass(node: AstNode): boolean {
+  if (node.superClass && (node.superClass as AstNode).type !== 'Identifier') return false
+  return ((node.body as AstNode).body as AstNode[]).every(member => {
+    if (member.type === 'StaticBlock') return false
+    if (member.computed) return false
+    if (member.type === 'PropertyDefinition' && member.static && member.value)
+      return pureExpression(member.value as AstNode)
+    return true
+  })
+}
+
+const PURE_CONSTRUCTORS = new Set(['Set', 'Map', 'WeakMap', 'WeakSet'])
+
+function pureExpression(node: AstNode): boolean {
+  switch (node.type) {
+    case 'Literal':
+    case 'Identifier':
+    case 'ArrowFunctionExpression':
+    case 'FunctionExpression':
+      return true
+    case 'ClassExpression':
+      return pureClass(node)
+    case 'TemplateLiteral':
+      return (node.expressions as AstNode[]).every(pureExpression)
+    case 'UnaryExpression':
+      return node.operator !== 'delete' && pureExpression(node.argument as AstNode)
+    case 'ArrayExpression':
+      return (node.elements as (AstNode | null)[]).every(item => !item || pureExpression(item))
+    case 'ObjectExpression':
+      return (node.properties as AstNode[]).every(
+        property =>
+          property.type === 'Property' &&
+          !property.computed &&
+          pureExpression(property.value as AstNode),
+      )
+    case 'NewExpression':
+      return (
+        (node.callee as AstNode).type === 'Identifier' &&
+        PURE_CONSTRUCTORS.has((node.callee as AstNode).name as string) &&
+        (node.arguments as AstNode[]).length === 0
+      )
+    case 'CallExpression': {
+      // Symbol.for("…") and Symbol("…") create symbols and nothing else.
+      const callee = node.callee as AstNode
+      const symbol =
+        (callee.type === 'Identifier' && callee.name === 'Symbol') ||
+        (callee.type === 'MemberExpression' &&
+          (callee.object as AstNode).type === 'Identifier' &&
+          (callee.object as AstNode).name === 'Symbol' &&
+          (callee.property as AstNode).name === 'for')
+      return symbol && (node.arguments as AstNode[]).every(argument => argument.type === 'Literal')
+    }
+    default:
+      return false
+  }
+}
+
+/** Route entries, and the chunks behind every `import()`. */
+function loadRoots(metafile: Metafile) {
+  const dynamicTargets = new Set<string>()
+  for (const output of Object.values(metafile.outputs)) {
+    for (const imported of output.imports ?? []) {
+      if (imported.kind === 'dynamic-import') dynamicTargets.add(imported.path)
+    }
+  }
+  // esbuild records an `entryPoint` for the chunk behind every `import()` too,
+  // so dynamic targets have to be subtracted before what is left counts as a
+  // route entry.
+  const entries = Object.keys(metafile.outputs).filter(
+    file => metafile.outputs[file]?.entryPoint && !dynamicTargets.has(file),
+  )
+  return { entries, dynamicTargets }
 }
 
 /**
@@ -398,17 +586,33 @@ function memberRewriter(
       .split(path.sep)
       .join('/')
     const href = mergedHref.startsWith('.') ? mergedHref : `./${mergedHref}`
-    return (
-      source
-        .replace(
-          namedImport,
-          (_all, keyword: string, clause: string, spec: string) =>
-            `${keyword}{${rename(clause, nameOf(spec))}}from"${href}"`,
-        )
-        // Side-effect-only imports of a member collapse onto the merged chunk.
-        .replace(sideEffectImport, () => `import"${href}"`)
-    )
+    const rewritten = source
+      .replace(
+        namedImport,
+        (_all, keyword: string, clause: string, spec: string) =>
+          `${keyword}{${rename(clause, nameOf(spec))}}from"${href}"`,
+      )
+      // Side-effect-only imports of a member collapse onto the merged chunk.
+      .replace(sideEffectImport, () => `import"${href}"`)
+    return singleImport(rewritten, href)
   }
+}
+
+const IMPORT_SLOT = '\0pnext-import\0'
+
+/** One import statement per merged chunk: the members' imports join at the first one's position. */
+function singleImport(source: string, href: string): string {
+  const clauses: string[] = []
+  const statement = new RegExp(
+    String.raw`import\s*(?:\{([^}]*)\}\s*from\s*)?"${escapeRegex(href)}";?`,
+    'g',
+  )
+  const slotted = source.replace(statement, (_all, clause?: string) => {
+    if (clause?.trim()) clauses.push(clause)
+    return IMPORT_SLOT
+  })
+  const joined = clauses.length ? `import{${clauses.join(',')}}from"${href}";` : `import"${href}";`
+  return slotted.replace(IMPORT_SLOT, joined).replaceAll(IMPORT_SLOT, '')
 }
 
 /** Stands in for the merged chunk's final (content-hashed) name. */

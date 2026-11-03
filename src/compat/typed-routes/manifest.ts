@@ -8,6 +8,7 @@ import path from 'node:path'
 import type { ResolvedConfig } from '../../config'
 import type { RouteManifestEntry } from '../../types'
 import { toPosixPath } from '../../utils/fs'
+import { pagesDirectory } from '../pages/router'
 
 /** path-to-regexp group info, mirroring Next's `getRouteRegex().groups`. */
 export interface Group {
@@ -311,7 +312,7 @@ export async function buildRouteTypesManifest({
   }
 
   // Pages Router: pages/*.{ext} (non-api) -> pageRoutes; pages/api/** -> pageApiRoutes.
-  const pagesDir = path.join(config.root, 'pages')
+  const pagesDir = pagesDirectory(config.root)
   for (const file of await walkFiles(pagesDir)) {
     const relative = toPosixPath(path.relative(pagesDir, file))
     if (!PAGE_EXTENSIONS.some(ext => relative.endsWith(`.${ext}`))) continue

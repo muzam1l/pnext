@@ -9,7 +9,7 @@
 // Everything is inert unless @opentelemetry/api resolves from the app AND a work unit is active.
 
 import { getWorkUnit, queueAfterTask, type WorkUnit } from '../../request/context'
-import { getOtelApi, type OtelApi, type OtelContext, type OtelSpan } from './api'
+import { edgeSandbox, getOtelApi, type OtelApi, type OtelContext, type OtelSpan } from './api'
 
 // next.span_type taxonomy (exact strings Next emits; asserted verbatim).
 export const SPAN_TYPE = {
@@ -24,6 +24,9 @@ export const SPAN_TYPE = {
   startResponse: 'NextNodeServer.startResponse',
   clientComponentLoading: 'NextNodeServer.clientComponentLoading',
   middleware: 'Middleware.execute',
+  prepareRouteModule: 'RouteModule.prepare',
+  loadRouteModule: 'LoadComponents.loadRouteModule',
+  loadUserland: 'AppRouteRouteModule.loadUserland',
   getRequestHandler: 'NextServer.getRequestHandler',
   nodeRunHandler: 'Node.runHandler',
   renderDocument: 'Render.renderDocument',
@@ -52,6 +55,18 @@ const EDGE_SANDBOX_SPAN_TYPES: ReadonlySet<string> = new Set([
 
 // Per-WorkUnit otel state (stashed on the compat scratch map).
 const OTEL_STATE = Symbol.for('pnext.compat.otel.state')
+const CLIENT_LOADS = Symbol.for('pnext.compat.otel.clientLoads')
+
+interface ClientLoads {
+  used: Set<string>
+  start?: number
+  end?: number
+  duration: number
+  pending: number
+  report?: () => void
+  sealed?: boolean
+  queued?: boolean
+}
 
 interface OtelState {
   api: OtelApi
@@ -61,6 +76,13 @@ interface OtelState {
   rootSpan: OtelSpan
   /** Guard so the root span is ended exactly once. */
   rootEnded: boolean
+  responseStatus?: number
+  rootErrored?: boolean
+  middlewareRequest?: boolean
+  middlewareInvoked?: boolean
+  traceparent?: string | null
+  /** The middleware-invoke request's state, whose root span parents this render pass. */
+  bubble?: OtelState
   /** Request method, kept for the pattern-rename span name. */
   method: string
   /** Whether this was an RSC request, kept for the pattern-rename span name. */
@@ -122,6 +144,16 @@ interface OtelState {
     spanContext: OtelContext
     ended: boolean
   }
+  handlerSpan?: {
+    span: OtelSpan
+    spanType: string
+    edge: boolean
+    errored: boolean
+  }
+  /** A route handler threw: Next never reaches `start response` on that path. */
+  handlerErrored?: boolean
+  /** Layout `generateMetadata` spans of this render, replayed when the error document renders. */
+  layoutMetadata?: { name: string; attributes: Record<string, unknown> }[]
 }
 
 /** The runtime label for a child span of the given next.span_type. */
@@ -156,13 +188,16 @@ export function startRootSpan(input: {
   target: string
   rsc: boolean
   headers: Headers
+  middleware?: boolean
 }): void {
   const a = api()
   if (!a) return
   const unit = getWorkUnit()
   if (!unit) return
   unit.compat ??= {}
-  if (unit.compat[OTEL_STATE]) return
+  const previous = stateOf(unit)
+  if (previous && (!previous.middlewareRequest || previous.bubble || input.middleware)) return
+  if (previous && !previous.middlewareInvoked) return
 
   // Extract incoming context (traceparent + any custom propagators, e.g. the
   // test's x-custom sampler entry). The carrier is a plain header record.
@@ -170,18 +205,22 @@ export function startRootSpan(input: {
   input.headers.forEach((value, key) => {
     carrier[key] = value
   })
-  const incomingContext = a.propagation.extract(a.context.active(), carrier, headerGetter)
+  const overridden = previous && input.headers.get('traceparent') !== previous.traceparent
+  const incomingContext = overridden
+    ? a.propagation.extract(a.ROOT_CONTEXT, carrier, headerGetter)
+    : (previous?.incomingContext ??
+      a.propagation.extract(a.context.active(), carrier, headerGetter))
 
-  const spanName = `${input.rsc ? 'RSC ' : ''}${input.method} ${input.target}`
+  const spanName = input.method
   const tracer = a.trace.getTracer('next.js', '0.0.1')
   // NEXT_OTEL_VERBOSE=1: Next additionally emits the NextServer.getRequestHandler
   // wrapper span between the incoming context and handleRequest. The verbose
   // suite asserts its span_type + that it parents directly on the incoming
   // traceparent while everything else nests below.
-  let verboseSpan: OtelSpan | undefined
-  let rootParentCtx = incomingContext
+  let verboseSpan: OtelSpan | undefined = previous?.verboseSpan
+  let rootParentCtx = previous && !overridden ? previous.rootContext : incomingContext
   // eslint-disable-next-line turbo/no-undeclared-env-vars
-  if (process.env.NEXT_OTEL_VERBOSE === '1') {
+  if (!previous && process.env.NEXT_OTEL_VERBOSE === '1') {
     verboseSpan = tracer.startSpan(
       SPAN_TYPE.getRequestHandler,
       {
@@ -201,7 +240,7 @@ export function startRootSpan(input: {
       kind: a.SpanKind.SERVER,
       attributes: {
         'http.method': input.method,
-        'http.target': input.target,
+        'http.target': previous?.target ?? input.target,
         'next.rsc': input.rsc,
         'next.span_name': spanName,
         'next.span_type': SPAN_TYPE.handleRequest,
@@ -217,10 +256,13 @@ export function startRootSpan(input: {
     rootEnded: false,
     method: input.method,
     rsc: input.rsc,
-    target: input.target,
+    target: previous?.target ?? input.target,
     incomingContext,
+    traceparent: input.headers.get('traceparent'),
     ...(verboseSpan ? { verboseSpan } : {}),
     currentContext: rootContext,
+    ...(input.middleware || previous?.middlewareRequest ? { middlewareRequest: true } : {}),
+    ...(previous ? { bubble: previous } : {}),
   }
   unit.compat[OTEL_STATE] = state
 }
@@ -245,11 +287,6 @@ export function setRootSpanRoute(
   if (!state) return
   state.route = route
   const { rootSpan } = state
-  const name = `${state.rsc ? 'RSC ' : ''}${state.method} ${route}`
-  rootSpan.setAttribute('next.route', route)
-  rootSpan.setAttribute('http.route', route)
-  rootSpan.setAttribute('next.span_name', name)
-  rootSpan.updateName(name)
   if (!options.edge) return
   state.edgeMode = options.kind === 'handler' ? 'handler' : 'page'
   if (state.edgeMode !== 'page') return
@@ -284,31 +321,68 @@ export function endRootSpan(status: number): void {
   if (!state || state.rootEnded) return
   state.rootEnded = true
   const { api: a, rootSpan } = state
+  const name = `${state.rsc ? 'RSC ' : ''}${state.method}${state.route ? ` ${state.route}` : ''}`
+  rootSpan.updateName(name)
+  rootSpan.setAttribute('next.span_name', name)
+  if (state.route) {
+    rootSpan.setAttribute('next.route', state.route)
+    rootSpan.setAttribute('http.route', state.route)
+  }
   rootSpan.setAttribute('http.status_code', status)
   if (status >= 500) {
     rootSpan.setAttribute('error.type', String(status))
     rootSpan.setStatus({ code: a.SpanStatusCode.ERROR })
-  } else {
+  } else if (!state.rootErrored) {
     rootSpan.setStatus({ code: a.SpanStatusCode.UNSET })
   }
   endSpan(rootSpan, state.edgeMode === 'page' ? 'edge' : 'nodejs')
+  if (state.bubble) endBubbleSpan(state.bubble, status)
   if (state.verboseSpan) {
     state.verboseSpan.setStatus({ code: a.SpanStatusCode.UNSET })
     endSpan(state.verboseSpan, 'nodejs')
   }
 }
 
-/**
- * Fallback close for the error path: core's synchronous-500 catch returns a bare Response WITHOUT
- * running responseFinalizers, so endRootSpan(status) never fires there. The error funnel, which DOES run
- * on that path, calls this to end the root span with the fallback status. Idempotent: on the streaming
- * path the finalizer already ended the span, so this no-ops - the funnel must NOT downgrade an
- * already-ended 200 span to 500.
- */
+/** Close the middleware-invoke span: Next's invoke pass ends with its own status before the render pass. */
+function endBubbleSpan(bubble: OtelState, status: number): void {
+  if (bubble.rootEnded) return
+  bubble.rootEnded = true
+  bubble.rootSpan.setAttribute('http.status_code', status)
+  bubble.rootSpan.setStatus({
+    code: status >= 500 ? bubble.api.SpanStatusCode.ERROR : bubble.api.SpanStatusCode.UNSET,
+  })
+  endSpan(bubble.rootSpan, 'nodejs')
+}
+
+/** Close abandoned requests after their work unit drains. */
 export function endRootSpanIfUnclosed(fallbackStatus: number): void {
   const state = stateOf(getWorkUnit())
   if (!state || state.rootEnded) return
-  endRootSpan(fallbackStatus)
+  endRootSpan(state.responseStatus ?? fallbackStatus)
+}
+
+export function recordResponseStatus(status: number): void {
+  const state = stateOf(getWorkUnit())
+  if (state) state.responseStatus = status
+}
+
+export function markRootSpanError(error: unknown): void {
+  const state = stateOf(getWorkUnit())
+  if (!state || state.rootEnded) return
+  state.rootErrored = true
+  markSpanError(state.api, state.rootSpan, error)
+}
+
+export function forwardRootTraceHeaders(headers: Headers): void {
+  const state = stateOf(getWorkUnit())
+  if (!state) return
+  const carrier: Record<string, string> = {}
+  state.api.propagation.inject(state.rootContext, carrier, carrierSetter)
+  if (!carrier.traceparent) return
+  headers.set('traceparent', carrier.traceparent)
+  if (carrier.tracestate) headers.set('tracestate', carrier.tracestate)
+  else headers.delete('tracestate')
+  state.traceparent = carrier.traceparent
 }
 
 /** The active root span's spanContext. */
@@ -331,6 +405,33 @@ export function activeOtelContext(): { api: OtelApi; context: OtelContext } | un
   const state = stateOf(getWorkUnit())
   if (!state) return undefined
   return { api: state.api, context: state.api.context.active() }
+}
+
+function runSettled<T>(
+  fn: () => T,
+  onResult: (value: unknown) => void,
+  onError: (error: unknown) => void,
+): T {
+  try {
+    const result = fn()
+    if (isThenable(result)) {
+      return (result as PromiseLike<unknown>).then(
+        value => {
+          onResult(value)
+          return value
+        },
+        error => {
+          onError(error)
+          throw error
+        },
+      ) as T
+    }
+    onResult(result)
+    return result
+  } catch (error) {
+    onError(error)
+    throw error
+  }
 }
 
 /**
@@ -367,6 +468,11 @@ export function withChildSpan<T>(
   )
   const childContext = a.trace.setSpan(parentContext, span)
   state.currentContext = childContext
+  if (
+    spanType === SPAN_TYPE.generateMetadata &&
+    String(attributes['next.page']).endsWith('/layout')
+  )
+    (state.layoutMetadata ??= []).push({ name, attributes })
   const settle = (error?: unknown) => {
     // Restore the enclosing context so siblings parent correctly.
     state.currentContext = parentContext
@@ -381,26 +487,11 @@ export function withChildSpan<T>(
     }
     endSpan(span, childRuntime(state, spanType))
   }
-  try {
-    const result = a.context.with(childContext, fn)
-    if (isThenable(result)) {
-      return (result as PromiseLike<unknown>).then(
-        value => {
-          settle()
-          return value
-        },
-        error => {
-          settle(error)
-          throw error
-        },
-      ) as T
-    }
-    settle()
-    return result
-  } catch (error) {
-    settle(error)
-    throw error
-  }
+  return runSettled(
+    () => a.context.with(childContext, fn),
+    () => settle(),
+    settle,
+  )
 }
 
 export function withRenderBodySpan<T>(
@@ -463,7 +554,8 @@ export function withRenderBodySpan<T>(
           return value
         },
         error => {
-          finish(error)
+          markRenderSpanError(error)
+          if (!queued) finish(error)
           throw error
         },
       ) as T
@@ -471,7 +563,8 @@ export function withRenderBodySpan<T>(
     if (!queued) finish()
     return result
   } catch (error) {
-    finish(error)
+    markRenderSpanError(error)
+    if (!queued) finish(error)
     throw error
   }
 }
@@ -482,6 +575,22 @@ export function markRenderSpanError(error: unknown): void {
   if (!state || !render || render.ended) return
   render.errored = true
   markSpanError(state.api, render.span, error)
+}
+
+/**
+ * Mark the active route-handler span when dispatch converts its throw to a 500 response. A NODE
+ * pages-api handler span (`Node.runHandler`) is the one exception: Next's node server never sees that
+ * throw, so only the request root span reports it while the handler span stays UNSET. The edge sandbox
+ * does catch it, so the edge pages-api span records the error like an app handler.
+ */
+export function markHandlerSpanError(error: unknown): void {
+  const state = stateOf(getWorkUnit())
+  const handler = state?.handlerSpan
+  if (!state || !handler || handler.errored) return
+  handler.errored = true
+  state.handlerErrored = true
+  if (handler.spanType !== SPAN_TYPE.runHandler && !handler.edge) return
+  markSpanError(state.api, handler.span, error)
 }
 
 /**
@@ -525,37 +634,24 @@ function runHandlerSpan<T>(
   )
   const spanContext = a.trace.setSpan(parentContext, span)
   const previousContext = state.currentContext
+  const previousHandlerSpan = state.handlerSpan
+  const handlerSpan = { span, spanType, edge, errored: false }
+  state.handlerSpan = handlerSpan
   state.currentContext = spanContext
   const settle = (error?: unknown) => {
     state.currentContext = previousContext
-    if (error !== undefined) {
-      span.recordException(error)
-      span.setStatus({ code: a.SpanStatusCode.ERROR, message: errorMessage(error) })
-    } else {
+    if (error !== undefined) markHandlerSpanError(error)
+    else if (!handlerSpan.errored) {
       span.setStatus({ code: a.SpanStatusCode.UNSET })
     }
     endSpan(span, edge ? 'edge' : 'nodejs')
+    if (state.handlerSpan === handlerSpan) state.handlerSpan = previousHandlerSpan
   }
-  try {
-    const result = a.context.with(spanContext, fn)
-    if (isThenable(result)) {
-      return (result as PromiseLike<unknown>).then(
-        value => {
-          settle()
-          return value
-        },
-        error => {
-          settle(error)
-          throw error
-        },
-      ) as T
-    }
-    settle()
-    return result
-  } catch (error) {
-    settle(error)
-    throw error
-  }
+  return runSettled(
+    () => a.context.with(spanContext, fn),
+    () => settle(),
+    settle,
+  )
 }
 
 /**
@@ -617,26 +713,11 @@ export function withPagesDataSpan<T>(
     }
     endSpan(span, childRuntime(state, spanType))
   }
-  try {
-    const result = fn()
-    if (isThenable(result)) {
-      return (result as PromiseLike<unknown>).then(
-        value => {
-          settle(undefined, value)
-          return value
-        },
-        (error: unknown) => {
-          settle(error ?? new Error('getServerSideProps error'), undefined)
-          throw error
-        },
-      ) as T
-    }
-    settle(undefined, result)
-    return result
-  } catch (error) {
-    settle(error ?? new Error('getServerSideProps error'), undefined)
-    throw error
-  }
+  return runSettled(
+    fn,
+    result => settle(undefined, result),
+    error => settle(error ?? new Error('getServerSideProps error'), undefined),
+  )
 }
 
 /** A pre-ended leaf span parented directly on the request root span. */
@@ -645,12 +726,14 @@ function emitRootLeafSpan(
   name: string,
   spanType: string,
   attributes: Record<string, unknown>,
+  timing?: { startTime: number; endTime: number },
 ): void {
   const { api: a } = state
   const span = a.trace.getTracer('next.js', '0.0.1').startSpan(
     name,
     {
       kind: a.SpanKind.INTERNAL,
+      startTime: timing?.startTime,
       attributes: {
         ...attributes,
         'next.span_name': name,
@@ -660,7 +743,7 @@ function emitRootLeafSpan(
     state.rootContext,
   )
   span.setStatus({ code: a.SpanStatusCode.UNSET })
-  endSpan(span, 'nodejs')
+  endSpan(span, 'nodejs', timing?.endTime)
 }
 
 /** Discard the route's open render span (see withPagesDataSpan). */
@@ -703,8 +786,17 @@ function emitPagesNotFoundFallbackSpans(state: OtelState, _route: string): void 
  */
 export function emitStartResponseSpan(): void {
   const state = stateOf(getWorkUnit())
-  if (state?.pagesFallback || state?.pagesApi) return
+  // A handler that threw never starts piping a response in Next; a render that threw still does.
+  if (state?.pagesFallback || state?.pagesApi || state?.handlerErrored) return
+  if (state?.middlewareInvoked && !state.bubble) return
   emitNodeLeafSpan('start response', SPAN_TYPE.startResponse, {})
+}
+
+/** A synchronous page error renders Next's error document, whose layouts run `generateMetadata` again. */
+export function emitErrorDocumentMetadataSpans(): void {
+  const state = stateOf(getWorkUnit())
+  for (const { name, attributes } of state?.layoutMetadata ?? [])
+    emitNodeLeafSpan(name, SPAN_TYPE.generateMetadata, attributes)
 }
 
 /**
@@ -716,8 +808,75 @@ export function emitStartResponseSpan(): void {
 export function emitClientComponentLoadingSpan(count: number): void {
   const state = stateOf(getWorkUnit())
   if (!state?.renderSpan || state.renderSpan.ended) return
-  emitNodeLeafSpan(SPAN_TYPE.clientComponentLoading, SPAN_TYPE.clientComponentLoading, {
+  emitRootLeafSpan(state, SPAN_TYPE.clientComponentLoading, SPAN_TYPE.clientComponentLoading, {
     'next.clientComponentLoadCount': count,
+  })
+}
+
+function clientLoads(): ClientLoads | undefined {
+  const unit = getWorkUnit()
+  if (!unit) return
+  unit.compat ??= {}
+  return (unit.compat[CLIENT_LOADS] ??= {
+    used: new Set(),
+    duration: 0,
+    pending: 0,
+  }) as ClientLoads
+}
+
+export function recordClientComponent(id: string): void {
+  const loads = clientLoads()
+  if (loads && !loads.sealed) loads.used.add(id)
+}
+
+export function beginClientModuleLoad(): (() => void) | undefined {
+  const loads = clientLoads()
+  if (!loads || loads.sealed) return
+  const start = performance.now()
+  loads.start ??= start
+  loads.pending++
+  return () => {
+    loads.end = performance.now()
+    loads.duration += loads.end - start
+    loads.pending--
+    if (loads.pending === 0) loads.report?.()
+  }
+}
+
+export function queueClientComponentLoadingSpan(baseCount: number): void {
+  const state = stateOf(getWorkUnit())
+  const emitSpan = Boolean(state?.renderSpan)
+  const loads = clientLoads()
+  if (!loads || loads.queued) return
+  loads.queued = true
+  queueAfterTask(() => {
+    loads.sealed = true
+    const report = () => {
+      loads.report = undefined
+      if (state && emitSpan) {
+        emitRootLeafSpan(
+          state,
+          SPAN_TYPE.clientComponentLoading,
+          SPAN_TYPE.clientComponentLoading,
+          { 'next.clientComponentLoadCount': baseCount + loads.used.size },
+          loads.start !== undefined && loads.end !== undefined
+            ? {
+                startTime: performance.timeOrigin + loads.start,
+                endTime: performance.timeOrigin + loads.end,
+              }
+            : undefined,
+        )
+      }
+      // eslint-disable-next-line turbo/no-undeclared-env-vars
+      const prefix = process.env.NEXT_OTEL_PERFORMANCE_PREFIX
+      if (prefix && loads.start !== undefined)
+        performance.measure(`${prefix}:next-client-component-loading`, {
+          start: loads.start,
+          end: loads.start + loads.duration,
+        })
+    }
+    if (loads.pending === 0) report()
+    else loads.report = report
   })
 }
 
@@ -747,17 +906,18 @@ function emitNodeLeafSpan(
   endSpan(span, 'nodejs')
 }
 
-/**
- * Run `fn` inside a `middleware <METHOD>` span (`Middleware.execute`). Unlike
- * withChildSpan this does NOT nest under the request root span: Next's
- * middleware span is a top-level trace parented under the INCOMING traceparent
- * (it runs before BaseServer.handleRequest). We extract the carrier from the
- * request headers so the span inherits the caller's trace/parent, matching
- * `parentId: rootParentId`. Inert (runs `fn` untouched) when otel-api is
- * unavailable. Does not require an open work-unit root span.
- */
-export function withMiddlewareSpan<T>(request: Request, fn: () => T): T {
-  const a = api()
+/** Run middleware under the middleware-invoke span, or the incoming context without one. */
+export function withMiddlewareSpan<T>(
+  request: Request,
+  fn: () => T,
+  continues: (result: unknown) => boolean,
+): T {
+  // The proxy runner already entered the middleware's declared runtime (edge for `middleware.*`,
+  // node for `proxy.*` / `config.runtime = 'nodejs'`); Next exports the span with that same label.
+  // eslint-disable-next-line turbo/no-undeclared-env-vars
+  const runtime: SpanRuntime = process.env.NEXT_RUNTIME === 'nodejs' ? 'nodejs' : 'edge'
+  const sandbox = runtime === 'edge' ? edgeSandbox.otel : undefined
+  const a = sandbox ?? api()
   if (!a) return fn()
   const method = request.method.toUpperCase()
   let target = ''
@@ -771,7 +931,15 @@ export function withMiddlewareSpan<T>(request: Request, fn: () => T): T {
   request.headers.forEach((value, key) => {
     carrier[key] = value
   })
-  const parentCtx = a.propagation.extract(a.context.active(), carrier, headerGetter)
+  const state = stateOf(getWorkUnit())
+  if (state?.middlewareRequest) {
+    state.middlewareInvoked = true
+    state.rootSpan.setAttribute('next.bubble', true)
+  }
+  const parentCtx =
+    state?.middlewareRequest && !sandbox
+      ? state.rootContext
+      : a.propagation.extract(sandbox ? a.ROOT_CONTEXT : a.context.active(), carrier, headerGetter)
   const name = `middleware ${method}`
   const tracer = a.trace.getTracer('next.js', '0.0.1')
   const span = tracer.startSpan(
@@ -794,31 +962,18 @@ export function withMiddlewareSpan<T>(request: Request, fn: () => T): T {
     } else {
       span.setStatus({ code: a.SpanStatusCode.UNSET })
     }
-    // Middleware always runs in the edge runtime in Next; pnext's proxy runner
-    // already wraps the handler in withRouteRuntime('edge') — the explicit tag
-    // makes the exported runtime deterministic regardless of settle timing.
-    endSpan(span, 'edge')
+    // Tagged explicitly so the exported runtime is deterministic regardless of settle timing.
+    endSpan(span, runtime)
   }
-  try {
-    const result = a.context.with(spanCtx, fn)
-    if (isThenable(result)) {
-      return (result as PromiseLike<unknown>).then(
-        value => {
-          settle()
-          return value
-        },
-        error => {
-          settle(error)
-          throw error
-        },
-      ) as T
-    }
-    settle()
-    return result
-  } catch (error) {
-    settle(error)
-    throw error
-  }
+  return runSettled(
+    () => a.context.with(spanCtx, fn),
+    result => {
+      settle()
+      // The invoke pass answers 200 when the middleware lets the request continue; the render pass follows.
+      if (state?.middlewareRequest && continues(result)) endBubbleSpan(state, 200)
+    },
+    settle,
+  )
 }
 
 // A leaf span with no work inside (e.g. resolve-segment-modules markers).
@@ -880,6 +1035,42 @@ function ensureComponentTreeSpan(state: OtelState) {
   return next
 }
 
+/**
+ * Bound Next's `build component tree` span to component-tree construction. The span is only a PARENT
+ * for the `resolve segment modules` leaves (emitSegmentSpan re-targets into it); everything else the
+ * construction awaits - generateMetadata, fetch - stays a SIBLING under the render span, matching Next.
+ * So the enclosing context is deliberately left untouched.
+ */
+export function withComponentTreeSpan<T>(fn: () => T): T {
+  const state = stateOf(getWorkUnit())
+  if (!state) return fn()
+  const previous = state.componentTreeSpan
+  const tree = ensureComponentTreeSpan(state)
+  const finish = () => {
+    if (previous !== tree) endComponentTreeSpan(state)
+  }
+  try {
+    const result = fn()
+    if (isThenable(result)) {
+      return (result as PromiseLike<unknown>).then(
+        value => {
+          finish()
+          return value
+        },
+        error => {
+          finish()
+          throw error
+        },
+      ) as T
+    }
+    finish()
+    return result
+  } catch (error) {
+    finish()
+    throw error
+  }
+}
+
 function endComponentTreeSpan(state: OtelState): void {
   const tree = state.componentTreeSpan
   if (!tree || tree.ended) return
@@ -920,14 +1111,14 @@ export function otelExportInProgress(): boolean {
   return spanEndDepth > 0
 }
 
-function endSpan(span: OtelSpan, runtime?: SpanRuntime): void {
+function endSpan(span: OtelSpan, runtime?: SpanRuntime, endTime?: number): void {
   spanEndDepth++
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   const previousRuntime = process.env.NEXT_RUNTIME
   // eslint-disable-next-line turbo/no-undeclared-env-vars
   if (runtime) process.env.NEXT_RUNTIME = runtime
   try {
-    span.end()
+    span.end(endTime)
   } finally {
     if (runtime) {
       // eslint-disable-next-line turbo/no-undeclared-env-vars

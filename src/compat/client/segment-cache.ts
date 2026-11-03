@@ -23,7 +23,6 @@
 import {
   normalizeSegmentSearch,
   segmentVaryCacheKey,
-  SEARCH_PARAMS_SENTINEL,
   VARY_KEY_SEPARATOR,
 } from '../segment/vary-key'
 import {
@@ -34,6 +33,9 @@ import {
 } from '../segment/page-slot'
 
 /** LRU bound, matching the router's own segment caches. */
+// Runtime and Partial Prefetching ship only to an app with a runtime-prefetched route (usage.ts).
+declare const __PNEXT_RUNTIME_PREFETCHING__: boolean
+
 const SEGMENT_ENTRY_LIMIT = 64
 
 /**
@@ -70,7 +72,7 @@ export interface SegmentPayloadMeta {
    * as its own param-independent entry so a navigation to another param of the
    * route paints instantly.
    */
-  shell?: { html: string; route: string }
+  shell?: { html: string; route: string; vary?: string[] }
   /**
    * Literal siblings of each DYNAMIC level of the route, keyed by segment index
    * (the server's `staticChildrenBySegment`). A pathname naming one of them is
@@ -102,6 +104,10 @@ export interface SegmentRecordInput extends SegmentPayloadMeta {
   sharedAppShell?: boolean
   /** True when the route's catch-all is optional (`[[...slug]]`). */
   catchAllOptional?: boolean
+  /** `x-pnext-runtime-needed` bits the response carried (1 shell, 2 prefetch). */
+  runtimeNeeded?: number
+  /** A static body's own verdict: would a runtime request return more? Absent for other payloads. */
+  needsRuntime?: boolean
 }
 
 interface SegmentEntry {
@@ -116,6 +122,8 @@ interface SegmentEntry {
   runtime: boolean
   postponedShell: boolean
   sharedAppShell: boolean
+  runtimeNeeded?: number
+  needsRuntime?: boolean
 }
 
 export interface SegmentHit {
@@ -128,12 +136,19 @@ export interface SegmentHit {
    * remainder.
    */
   prefetchSatisfied: boolean
+  /** The entry was fetched for another URL its vary set covers. */
+  shared: boolean
   runtime: boolean
   /**
    * The entry is an authorised static shell stage: either this URL's own
    * postponed PPR shell, or an extracted route-wide App Shell.
    */
   postponedShell: boolean
+  /** The entry is a route-wide App Shell (its params hung), not this URL's own content. */
+  appShell?: boolean
+  runtimeNeeded?: number
+  /** The static body's verdict on a follow-up runtime request; absent when it gave none. */
+  needsRuntime?: boolean
 }
 
 interface LearnedRoute {
@@ -164,6 +179,9 @@ function now(): number {
   return Date.now()
 }
 
+const isFresh = (entry: { time: number; staleTimeMs: number }) =>
+  now() - entry.time < entry.staleTimeMs
+
 // ---------------------------------------------------------------------------
 // Recording.
 // ---------------------------------------------------------------------------
@@ -184,7 +202,7 @@ export function recordSegment(input: SegmentRecordInput): void {
       complete: false,
       static: true,
       runtime: false,
-      vary: [],
+      vary: input.shell.vary ?? [],
       route: input.shell.route,
       params: input.params,
     })
@@ -250,7 +268,7 @@ export function recordAppShell(input: SegmentRecordInput): void {
     runtime: false,
     postponedShell: true,
     sharedAppShell: true,
-    vary: [],
+    vary: input.vary ?? [],
   })
 }
 
@@ -292,16 +310,10 @@ function recordOneSegment(rawInput: SegmentRecordInput): void {
   const input: SegmentRecordInput = isRewriteResponse(rawInput)
     ? { ...rawInput, route: null, vary: null }
     : rawInput
-  if (rawInput.route) {
-    // LRU-bound like `entries`: one record per distinct pathname otherwise
-    // grows without limit (memory-pressure leak-slope test).
-    resolvedRoutes.delete(input.pathname)
-    // The resolved-route record stays TRUE even for a rewrite: the server
-    // really did answer this pathname with that route, and the sibling guard
-    // in `candidateKeys` reads it to keep other routes off this URL.
-    resolvedRoutes.set(rawInput.pathname, rawInput.route)
-    trimOldest(resolvedRoutes)
-  }
+  // The resolved-route record stays TRUE even for a rewrite: the server
+  // really did answer this pathname with that route, and the sibling guard
+  // in `candidateKeys` reads it to keep other routes off this URL.
+  if (rawInput.route) recordResolvedRoute(rawInput.pathname, rawInput.route)
   const key = entryKey(input.segmentPath, input.route, input.params, input.search, input.vary, {
     pathname: input.pathname,
   })
@@ -337,12 +349,7 @@ function recordOneSegment(rawInput: SegmentRecordInput): void {
   // fallback key can arrive with the full response's zero window. Next tracks
   // shell-stage freshness independently; do not let that duplicate erase the
   // already-fresh extracted shell.
-  if (
-    sharedAppShell &&
-    input.staleTimeMs <= 0 &&
-    existing?.sharedAppShell &&
-    now() - existing.time < existing.staleTimeMs
-  ) {
+  if (sharedAppShell && input.staleTimeMs <= 0 && existing?.sharedAppShell && isFresh(existing)) {
     touch(key)
     return
   }
@@ -357,6 +364,12 @@ function recordOneSegment(rawInput: SegmentRecordInput): void {
     runtime: input.runtime,
     postponedShell: input.postponedShell === true,
     sharedAppShell,
+    ...((typeof __PNEXT_RUNTIME_PREFETCHING__ === 'boolean' ? __PNEXT_RUNTIME_PREFETCHING__ : true)
+      ? {
+          runtimeNeeded: input.runtimeNeeded,
+          needsRuntime: sharedAppShell ? undefined : input.needsRuntime,
+        }
+      : {}),
   })
   touch(key)
   trimOldest(entries)
@@ -412,7 +425,7 @@ export function takeSegment(options: {
   for (const candidate of candidateKeys(options.segmentPath, options.pathname, options.search)) {
     const entry = entries.get(candidate.key)
     if (!entry) continue
-    if (now() - entry.time >= entry.staleTimeMs) {
+    if (!isFresh(entry)) {
       entries.delete(candidate.key)
       continue
     }
@@ -462,13 +475,51 @@ export function takeSegment(options: {
       // either the payload is static, or a published vary set let `candidateKeys` produce the shared
       // match. The navigation that follows still fetches the dynamic remainder.
       prefetchSatisfied: !shared || (optimisticRoutingEnabled() && (entry.static || entry.runtime)),
+      shared,
       runtime: entry.runtime,
       // An ordinary postponed response only describes the URL it rendered, so
       // sharing clears its paint licence. An extracted App Shell was rendered
       // with route params deliberately hanging and is the server's shell stage
       // for every sibling param, so it retains that licence.
       postponedShell: entry.postponedShell && (!shared || entry.sharedAppShell),
+      appShell: entry.sharedAppShell,
+      ...((
+        typeof __PNEXT_RUNTIME_PREFETCHING__ === 'boolean' ? __PNEXT_RUNTIME_PREFETCHING__ : true
+      )
+        ? { runtimeNeeded: entry.runtimeNeeded, needsRuntime: entry.needsRuntime }
+        : {}),
     }
+  }
+  return null
+}
+
+/** Record the route the server answered `pathname` with. */
+export function recordResolvedRoute(pathname: string, route: string): void {
+  // LRU-bound like `entries`: one record per distinct pathname otherwise
+  // grows without limit (memory-pressure leak-slope test).
+  resolvedRoutes.delete(pathname)
+  resolvedRoutes.set(pathname, route)
+  trimOldest(resolvedRoutes)
+}
+
+/** Next's hasDynamicRewrite: un-learn the patterns that mispredicted `pathname`, never predict it again. */
+export function markDynamicRewrite(pathname: string): void {
+  const byRoute = learnedRoutes.get('/_index')
+  for (const [key, learned] of byRoute ?? []) {
+    if (matchRoutePattern(learned.route, pathname, learned.catchAllOptional)) byRoute!.delete(key)
+  }
+  recordResolvedRoute(pathname, '')
+}
+
+/** The most recently learned dynamic route matching `pathname` (optimistic routing only). */
+export function predictedRouteFor(pathname: string): string | null {
+  const byRoute = optimisticRoutingEnabled() ? learnedRoutes.get('/_index') : undefined
+  if (!byRoute) return null
+  for (const candidate of [...byRoute.values()].reverse()) {
+    if (!candidate.route.includes(':')) continue
+    if (matchRoutePattern(candidate.route, pathname, candidate.catchAllOptional) === null) continue
+    if (namesStaticSibling(pathname, candidate.staticSiblings)) continue
+    return candidate.route
   }
   return null
 }
@@ -513,8 +564,7 @@ export function segmentPrefetchCovered(options: {
   for (const candidate of candidateKeys(options.segmentPath, options.pathname, options.search)) {
     const entry = entries.get(candidate.key)
     if (!entry) continue
-    if (now() - entry.time >= entry.staleTimeMs) continue
-    if (entry.runtime) continue
+    if (!isFresh(entry)) continue
     // An exact-URL hit is `takeSegment`'s business (it already dedupes there);
     // this predicate exists for the SHARED case the vary set authorised.
     if (entry.url === requestedUrl || candidate.learnedKey === undefined) continue
@@ -523,56 +573,6 @@ export function segmentPrefetchCovered(options: {
     }
   }
   return null
-}
-
-// ---------------------------------------------------------------------------
-// w9-segment-split: composed lookups.
-// ---------------------------------------------------------------------------
-
-/**
- * Whether a navigation may commit a COMPOSED (layout frame + page frame)
- * document. Off by default: the split frames are recorded unconditionally (they
- * cost one extra entry and can only ever add hits), but composing them changes
- * what a navigation PAINTS, and that is the half of the split that has not been
- * validated end to end. `setSegmentSplitCommit(true)` opts in.
- */
-let segmentSplitCommit = false
-
-export function setSegmentSplitCommit(enabled: boolean): void {
-  segmentSplitCommit = enabled
-}
-
-export function segmentSplitCommitEnabled(): boolean {
-  return segmentSplitCommit
-}
-
-/**
- * A document composed from the cached LAYOUT and PAGE frames of this URL, or null when either frame
- * misses (or composition is off / the frames have no page slot to splice). This is the layout/page
- * split's payoff: a sibling URL can miss the whole-document entry (the layout read the differing
- * param) but hit the page frame, so only the layout has to come off the network.
- */
-export function takeComposedSegment(options: {
-  pathname: string
-  search: string
-}): SegmentHit | null {
-  if (!segmentSplitCommit) return null
-  const layout = takeSegment({ ...options, segmentPath: LAYOUT_FRAME_PATH })
-  if (!layout) return null
-  const page = takeSegment({ ...options, segmentPath: PAGE_FRAME_PATH })
-  if (!page) return null
-  const html = composeSegmentFrames(layout.html, page.html)
-  if (html === null) return null
-  return {
-    html,
-    // A composed document is only as committable as its weaker half.
-    networkFree: layout.networkFree && page.networkFree,
-    prefetchSatisfied: layout.prefetchSatisfied && page.prefetchSatisfied,
-    runtime: layout.runtime || page.runtime,
-    // Composed from two frames: it is the destination's own static stage only when both
-    // halves are.
-    postponedShell: layout.postponedShell && page.postponedShell,
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +641,7 @@ function cachedLayoutFrame(options: {
   if (!options.sameUrl) return null
   const frame = documentLayoutFrames.get(options.pathname + normalizeSegmentSearch(options.search))
   if (!frame) return null
-  if (now() - frame.time >= frame.staleTimeMs) return null
+  if (!isFresh(frame)) return null
   return stripStreamedContinuation(frame.html)
 }
 
@@ -709,8 +709,7 @@ export function runtimePageFrameSatisfied(options: { pathname: string; search: s
   const requestedUrl = options.pathname + normalizeSegmentSearch(options.search)
   for (const candidate of candidateKeys(PAGE_FRAME_PATH, options.pathname, options.search)) {
     const entry = entries.get(candidate.key)
-    if (!entry?.runtime) continue
-    if (now() - entry.time >= entry.staleTimeMs) continue
+    if (!entry?.runtime || !isFresh(entry)) continue
     // SHARED coverage only: a URL the client fetched for itself keeps its own
     // prefetch (a stale/incomplete entry of that URL must still refetch); this
     // rule exists for the sibling param the vary set already covers.
@@ -804,7 +803,7 @@ export function matchRoutePattern(
   for (const part of patternParts) {
     const catchAll = /^:([\w$]+)\*$/.exec(part)
     if (catchAll) {
-      const rest = pathParts.slice(cursor).map(decodeSegment)
+      const rest = pathParts.slice(cursor).map(canonicalSegment)
       if (rest.length === 0 && !optionalCatchAll) return null
       if (rest.length > 0) params[catchAll[1]!] = rest
       return params
@@ -812,7 +811,7 @@ export function matchRoutePattern(
     const dynamic = /^:([\w$]+)$/.exec(part)
     const value = pathParts[cursor++]
     if (value === undefined) return null
-    if (dynamic) params[dynamic[1]!] = decodeSegment(value)
+    if (dynamic) params[dynamic[1]!] = canonicalSegment(value)
     else if (part !== value) return null
   }
   return cursor === pathParts.length ? params : null
@@ -825,6 +824,22 @@ export function matchRoutePattern(
 /** The island prop placeholder the server fills per request (slots.tsx). */
 const PROMISE_MARKER_KEY = '__pnextPromise'
 const ISLAND_PARAMS_ATTRIBUTE = 'data-pnext-params'
+
+export function sameParams(
+  left: Record<string, string | string[]>,
+  right: Record<string, string | string[]>,
+): boolean {
+  const leftKeys = Object.keys(left)
+  const rightKeys = Object.keys(right)
+  if (leftKeys.length !== rightKeys.length) return false
+  return leftKeys.every(key => {
+    const a = left[key]
+    const b = right[key]
+    return Array.isArray(a)
+      ? Array.isArray(b) && a.length === b.length && a.every((value, index) => value === b[index])
+      : a === b
+  })
+}
 
 /**
  * Rewrite every param carrier in a payload rendered for a SIBLING URL of the
@@ -839,10 +854,13 @@ const ISLAND_PARAMS_ATTRIBUTE = 'data-pnext-params'
  * time its dynamic stage is in flight.
  *
  * The payload's own embedded route state is the source of truth for what to
- * replace: only values byte-identical to ITS params are rewritten, so app
- * content that merely happens to contain the same string is untouched.
+ * replace: only scopes equal to ITS params are rewritten, so unrelated app
+ * scopes are untouched.
  */
-function restampSharedParams(html: string, params: Record<string, string | string[]>): string {
+export function restampSharedParams(
+  html: string,
+  params: Record<string, string | string[]>,
+): string {
   const match = /(window\.__PNEXT_ROUTE__=)(\{.*?\})(;?<\/script>)/s.exec(html)
   if (!match?.[2]) return html
   let state: Record<string, unknown>
@@ -860,17 +878,34 @@ function restampSharedParams(html: string, params: Record<string, string | strin
     html.slice(0, match.index) +
     `${match[1]}${paramsJson({ ...state, params })}${match[3]}` +
     html.slice(match.index + match[0].length)
-  const replacements: [string, string][] = [
-    [islandParamsAttribute(bakedJson), islandParamsAttribute(targetJson)],
-    [promiseMarkerJson(bakedJson), promiseMarkerJson(targetJson)],
-  ]
-  return rewriteIslandMarkup(rewritten, text => {
-    let next = text
-    for (const [from, to] of replacements) {
-      next = next.split(from).join(to).split(escapeAttribute(from)).join(escapeAttribute(to))
-    }
-    return next
-  })
+  const from = promiseMarkerJson(bakedJson)
+  const to = promiseMarkerJson(targetJson)
+  return rewriteIslandMarkup(rewritten, text =>
+    text
+      .replace(
+        /\bdata-pnext-params=(["'])(.*?)\1/g,
+        (attribute, _quote: string, encoded: string) => {
+          try {
+            const json = encoded
+              .replaceAll('&quot;', '"')
+              .replaceAll('&#x27;', "'")
+              .replaceAll('&#39;', "'")
+              .replaceAll('&lt;', '<')
+              .replaceAll('&gt;', '>')
+              .replaceAll('&amp;', '&')
+            if (sameParams(JSON.parse(json) as Record<string, string | string[]>, baked))
+              return islandParamsAttribute(targetJson)
+          } catch {
+            // Malformed island metadata cannot authorize a params rewrite.
+          }
+          return attribute
+        },
+      )
+      .split(from)
+      .join(to)
+      .split(escapeAttribute(from))
+      .join(escapeAttribute(to)),
+  )
 }
 
 const islandParamsAttribute = (json: string) =>
@@ -909,11 +944,20 @@ function rewriteIslandMarkup(html: string, rewrite: (text: string) => string): s
   )
 }
 
-function decodeSegment(segment: string): string {
+export function decodeSegment(segment: string): string {
   try {
     return decodeURIComponent(segment)
   } catch {
     // A malformed escape is the route-cache identity as written; keep it.
+    return segment
+  }
+}
+
+/** Param values as the server exposes them: decoded once, then re-encoded. */
+function canonicalSegment(segment: string): string {
+  try {
+    return encodeURIComponent(decodeURIComponent(segment))
+  } catch {
     return segment
   }
 }
@@ -938,14 +982,22 @@ export function evictPageSegments(): void {
   for (const path of BODY_SEGMENT_PATHS) learnedRoutes.delete(path)
 }
 
+/** Drop the entries fetched for `url`: the router evicted its prefetch under cache pressure. */
+export function evictUrlSegments(url: string): void {
+  for (const [key, entry] of entries) if (entry.url === url) entries.delete(key)
+}
+
 /** Drop every entry (a revalidation invalidates the whole segment cache). */
-export function clearSegmentCache(): void {
+/** Drop every segment entry and layout frame; learned route trees survive (a refresh keeps them). */
+export function clearSegmentData(): void {
   entries.clear()
+  documentLayoutFrames.clear()
+}
+
+export function clearSegmentCache(): void {
+  clearSegmentData()
   learnedRoutes.clear()
   resolvedRoutes.clear()
-  // A revalidation invalidates the layouts too: a `/_page`-only navigation
-  // after one would keep painting the pre-revalidation layout chain.
-  documentLayoutFrames.clear()
 }
 
 /** Test seam: the number of live entries. */
@@ -961,7 +1013,10 @@ function touch(key: string): void {
 }
 
 // Drop insertion-order-oldest entries beyond `limit` (keys are never undefined).
-function trimOldest(map: Map<string, unknown>, limit = SEGMENT_ENTRY_LIMIT): void {
+export function trimOldest(
+  map: Map<string, unknown> | Set<string>,
+  limit = SEGMENT_ENTRY_LIMIT,
+): void {
   while (map.size > limit) map.delete(map.keys().next().value!)
 }
 
@@ -1019,7 +1074,8 @@ export function decodeSegmentPayload(
     return null
   }
   if (payload.segment !== expectedSegment || typeof payload.html !== 'string') return null
-  const payloadSiblings = staticSiblingsFromPayloadHtml(payload.html)
+  const state = documentRouteState(payload.html)
+  const payloadSiblings = state ? staticSiblingsOf(state) : undefined
   return {
     html: payload.html,
     vary: Array.isArray(payload.vary) ? payload.vary.map(String) : null,
@@ -1027,7 +1083,7 @@ export function decodeSegmentPayload(
     // stays byte-identical to the pre-split payload for every such response.
     ...(Array.isArray(payload.layoutVary) ? { layoutVary: payload.layoutVary.map(String) } : {}),
     ...(Array.isArray(payload.pageVary) ? { pageVary: payload.pageVary.map(String) } : {}),
-    route: typeof payload.route === 'string' ? payload.route : null,
+    route: typeof payload.route === 'string' && !state?.closedParams ? payload.route : null,
     params: normalizeWireParams(payload.params),
     ...(payloadSiblings ? { staticSiblings: payloadSiblings } : {}),
     ...(appShellOf(payload.shell) ? { shell: appShellOf(payload.shell)! } : {}),
@@ -1035,10 +1091,14 @@ export function decodeSegmentPayload(
 }
 
 /** The `shell` field of a segment payload, when it carries a usable one. */
-function appShellOf(value: unknown): { html: string; route: string } | null {
-  const shell = value as { html?: unknown; route?: unknown } | null | undefined
+function appShellOf(value: unknown): { html: string; route: string; vary?: string[] } | null {
+  const shell = value as { html?: unknown; route?: unknown; vary?: unknown } | null | undefined
   if (!shell || typeof shell.html !== 'string' || typeof shell.route !== 'string') return null
-  return { html: shell.html, route: shell.route }
+  return {
+    html: shell.html,
+    route: shell.route,
+    ...(Array.isArray(shell.vary) ? { vary: shell.vary.map(stringifyParam) } : {}),
+  }
 }
 
 /**
@@ -1059,7 +1119,8 @@ export function decodeDocumentSegmentMeta(html: string): SegmentPayloadMeta {
   const siblings = staticSiblingsOf(state)
   return {
     vary: Array.isArray(state.pageVary) ? state.pageVary.map(String) : null,
-    route: typeof state.route === 'string' ? state.route : null,
+    // A closed param decides whether the route exists: its payloads key on their exact URL only.
+    route: typeof state.route === 'string' && !state.closedParams ? state.route : null,
     params: normalizeWireParams(state.params),
     ...(siblings ? { staticSiblings: siblings } : {}),
   }
@@ -1071,10 +1132,11 @@ interface WireRouteState {
   pageVary?: unknown
   staticChildren?: unknown
   staticChildrenBySegment?: unknown
+  closedParams?: unknown
 }
 
 /** The `window.__PNEXT_ROUTE__` state embedded in a rendered document. */
-function documentRouteState(html: string): WireRouteState | null {
+export function documentRouteState(html: string): WireRouteState | null {
   const match = /window\.__PNEXT_ROUTE__=(\{.*?\});?<\/script>/s.exec(html)
   if (!match?.[1]) return null
   try {
@@ -1105,12 +1167,6 @@ function staticSiblingsOf(state: WireRouteState): Record<string, string[]> | und
     }
   }
   return Object.keys(siblings).length > 0 ? siblings : undefined
-}
-
-/** A framed segment payload's static siblings, read off the HTML it carries. */
-function staticSiblingsFromPayloadHtml(html: string): Record<string, string[]> | undefined {
-  const state = documentRouteState(html)
-  return state ? staticSiblingsOf(state) : undefined
 }
 
 /**
@@ -1148,9 +1204,4 @@ function normalizeWireParams(value: unknown): Record<string, string | string[]> 
 /** Wire params are strings; anything else is coerced defensively. */
 function stringifyParam(value: unknown): string {
   return typeof value === 'string' ? value : (JSON.stringify(value) ?? '')
-}
-
-/** True when a decoded vary set makes the segment query-dependent. */
-export function varyIncludesSearch(vary: readonly string[] | null): boolean {
-  return vary?.includes(SEARCH_PARAMS_SENTINEL) === true
 }

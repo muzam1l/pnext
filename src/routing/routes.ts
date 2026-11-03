@@ -19,12 +19,15 @@ import {
 } from './match'
 import {
   childrenDefaultFile,
+  declaresChildren,
   interceptionMarkerLevels,
   interceptionMarkerOf,
   isGroupSegment,
   isSlotSegment,
+  layoutParamNamesForDir,
   slotConventionFile,
   slotDirectoriesIn,
+  unrenderableSlots,
 } from './slots'
 import type {
   ClientEntryReason,
@@ -198,6 +201,8 @@ interface ScanContext {
   entryReasons: Map<string, ClientEntryReason[]>
   /** Root-layout CSS closure — itself a content walk, so it resolves with the first CSS fact. */
   globalCssImports(): Set<string>
+  /** Drop everything memoized from these files' text (a dev save), so a reset route re-reads them. */
+  forget(files: string[]): void
 }
 
 function createScanContext(
@@ -207,7 +212,7 @@ function createScanContext(
 ): ScanContext {
   const root = rootFromAppPath(appPath)
   let memo: Set<string> | undefined
-  return {
+  const context: ScanContext = {
     root,
     workspaceRoot,
     appPath,
@@ -222,7 +227,24 @@ function createScanContext(
     globalCssImports:
       globalCss ??
       (() => (memo ??= new Set(globalCssSourcesForPaths(root, appPath, workspaceRoot)))),
+    forget(files) {
+      const maps = [
+        context.sources,
+        context.edges,
+        context.requestImportUsage,
+        context.exists,
+        context.useClient,
+        context.usesLink,
+        context.usesNavigation,
+        context.entryReasons,
+      ]
+      for (const file of files) for (const map of maps) map.delete(path.resolve(file))
+      // Published-export edges are keyed on importer + target; the target may be the saved file.
+      for (const key of context.edges.keys()) if (key.includes('\0')) context.edges.delete(key)
+      memo = undefined
+    },
   }
+  return context
 }
 
 /** `existsSync` once per path per scan — the closure walk asks the same paths per route. */
@@ -259,6 +281,7 @@ export interface RouteFacts {
   segmentConfig?: RouteSegmentConfig
   needsRouterEntry?: true
   clientEntryReasons?: ClientEntryReason[]
+  softLinks?: true
 }
 
 const deferredFields = [
@@ -278,12 +301,14 @@ const deferredFields = [
   'segmentConfig',
   'needsRouterEntry',
   'clientEntryReasons',
+  'softLinks',
 ] as const satisfies readonly (keyof RouteFacts)[]
 
 /** Path-only entry fields; everything in RouteFacts is layered on lazily. */
 type RoutePathEntry = Omit<RouteManifestEntry, keyof RouteFacts>
 
 const resolvedRoutes = new WeakSet<RouteManifestEntry>()
+const resetters = new WeakMap<RouteManifestEntry, () => ScanContext>()
 let factsVersion = 0
 
 /** Bumped each time a route resolves its deferred facts (dev re-keys watch roots off it). */
@@ -293,6 +318,13 @@ export function routeFactsVersion() {
 
 export function routeFactsResolved(route: RouteManifestEntry) {
   return resolvedRoutes.has(route)
+}
+
+/** Forget these routes' resolved facts after a save to `files`; the next access re-walks from disk. */
+export function resetRouteFacts(routes: RouteManifestEntry[], files: string[]) {
+  let context: ScanContext | undefined
+  for (const route of routes) context = resetters.get(route)?.() ?? context
+  context?.forget(files)
 }
 
 /**
@@ -344,16 +376,26 @@ export function setRouteFactsStore(store: RouteFactsStore | undefined) {
 }
 
 function withDeferredFacts(
-  appPath: string,
+  context: ScanContext,
   base: RoutePathEntry,
   compute: () => RouteFacts,
 ): RouteManifestEntry {
+  const { appPath } = context
   const entry = base as RouteManifestEntry
   let facts: RouteFacts | undefined
   // Consumers still assign some of these (the build marks needsRouterEntry), so
   // each field keeps a setter that wins over the computed value without forcing
   // the scan.
   const overrides = new Map<string, unknown>()
+  // A save's re-walk skips the restart record: the next boot revalidates it and walks.
+  let saved = false
+  resetters.set(entry, () => {
+    facts = undefined
+    saved = true
+    overrides.clear()
+    resolvedRoutes.delete(entry)
+    return context
+  })
 
   for (const field of deferredFields) {
     Object.defineProperty(entry, field, {
@@ -366,9 +408,10 @@ function withDeferredFacts(
           // facts were derived in is part of the key - otherwise one app's
           // record answers another app's lookup in the same process.
           const key = `${appPath}\0${base.kind}:${base.id}`
-          const stored = factsStore?.load(key)
+          const store = saved ? undefined : factsStore
+          const stored = store?.load(key)
           facts = stored ?? withDirCache(compute)
-          if (!stored) factsStore?.save(key, facts)
+          if (!stored) store?.save(key, facts)
           resolvedRoutes.add(entry)
           factsVersion += 1
         }
@@ -432,7 +475,7 @@ function buildRouteTable(
       if (!metadataParts) continue
       routes.push(
         withDeferredFacts(
-          appPath,
+          context,
           {
             id: `metadata-${routeId(metadataParts.route)}`,
             kind: 'handler',
@@ -480,7 +523,7 @@ function buildRouteTable(
     const interception = parts.interception
     routes.push(
       withDeferredFacts(
-        appPath,
+        context,
         {
           id: interception ? `intercept-${sanitizeIdPart(routeDir)}` : routeId(parts.route || '/'),
           kind,
@@ -555,7 +598,7 @@ function metadataRouteFacts(
   )
   return {
     mode: inferRouteMode(parts, usesRequest, segmentConfig),
-    hasStaticParams: Boolean(parts.metadataRoute.generatedParam),
+    hasStaticParams: Boolean(parts.metadataRoute.generatedParam) || hasStaticParamsExport(source),
     usesRequest,
     client: false,
     clientReferences: [],
@@ -610,17 +653,15 @@ function pageOrHandlerFacts(
     // segment has no static params, the route renders on demand and the ancestor's dynamicParams config no
     // longer restricts it (Next treats the whole path as dynamic).
     const allDynamicParams = [...parts.params, ...(parts.catchAll ? [parts.catchAll] : [])]
-    const coveredParams = new Set<string>()
-    for (const entry of configEntries) {
-      if (!hasStaticParamsExport(entry.source)) continue
-      const covered = paramOfOwnSegment(appPath, entry.file, allDynamicParams)
-      if (covered) coveredParams.add(covered)
-    }
+    const coveredParams = new Set(
+      configEntries
+        .filter(entry => hasStaticParamsExport(entry.source))
+        .flatMap(entry => layoutParamNamesForDir(appPath, path.dirname(entry.file))),
+    )
+    // A fully generated route closes every param, like Next's route-wide fallback: false.
     if (allDynamicParams.some(param => !coveredParams.has(param))) {
       delete segmentConfig.dynamicParamsFalse
-    } else if (hasStaticParamsExport(source)) {
-      segmentConfig.strictDynamicParams = true
-    }
+    } else segmentConfig.dynamicParamsFalse = allDynamicParams
   }
   const hasStaticParams =
     hasStaticParamsExport(source) ||
@@ -724,7 +765,7 @@ function routerEntryFact(
     slotInterceptor: boolean
     table: TableFlags
   },
-): { needsRouterEntry?: true; clientEntryReasons?: ClientEntryReason[] } {
+): { needsRouterEntry?: true; clientEntryReasons?: ClientEntryReason[]; softLinks?: true } {
   if (options.kind !== 'page') return {}
   const reasons: ClientEntryReason[] = []
   // Slot interceptors never render standalone (the origin page hosts them);
@@ -738,8 +779,9 @@ function routerEntryFact(
   // pages that otherwise would not. The remaining reasons gate feature regions INSIDE the entry (the action
   // runtime), so they are scanned for every page - a page's inline `'use server'` action is usually handed to
   // an island it also renders.
+  const softLinks = routeUsesLinkComponent(context, options.sourceFiles)
   if (!options.client && options.clientReferences.length === 0) {
-    if (routeUsesLinkComponent(context, options.sourceFiles)) reasons.push('link')
+    if (softLinks) reasons.push('link')
   } else if (routeUsesNavigation(context, options.sourceFiles)) {
     // The complement of the branch above: a page that already ships an entry
     // never needed a reason before, so nothing here changes whether the entry
@@ -748,7 +790,11 @@ function routerEntryFact(
   }
   reasons.push(...routeClientEntryReasons(context, options.sourceFiles))
   if (reasons.length === 0) return {}
-  return { needsRouterEntry: true, clientEntryReasons: [...new Set(reasons)] }
+  return {
+    needsRouterEntry: true,
+    clientEntryReasons: [...new Set(reasons)],
+    ...(softLinks ? { softLinks: true as const } : {}),
+  }
 }
 
 /**
@@ -873,7 +919,7 @@ function appendSlotDerivedRoutes(
       // interceptor during slot rendering. Kept minimal on purpose.
       routes.push(
         withDeferredFacts(
-          appPath,
+          context,
           {
             id: `intercept-${sanitizeIdPart(candidate.relative.replace(pageOrRouteTrailing(), ''))}`,
             kind: 'page',
@@ -902,6 +948,9 @@ function appendSlotDerivedRoutes(
     }
 
     if (patterns.has(parts.pattern)) continue
+    // A catch-all slot page only implies a URL when every sibling slot on the
+    // way can render for it; otherwise the entry would never render a whole page.
+    if (parts.catchAll && unrenderableSlots(appPath, parts.route).length > 0) continue
     patterns.add(parts.pattern)
 
     const childrenDefault = childrenDefaultFile(candidate.ownerDir, candidate.innerNames)
@@ -933,7 +982,7 @@ function appendSlotDerivedRoutes(
 
     routes.push(
       withDeferredFacts(
-        appPath,
+        context,
         {
           id: `slot-${routeId(parts.route || '/')}`,
           kind: 'page',
@@ -948,6 +997,9 @@ function appendSlotDerivedRoutes(
           synthetic: true,
           syntheticSlotDir: candidate.slotDir,
           ...(childrenDefault ? { childrenDefault } : {}),
+          ...(anchor === candidate.file && !declaresChildren(candidate.ownerDir)
+            ? { namedSlotsOnly: true }
+            : {}),
           ...(forbiddenPaths.length > 0 ? { forbiddenFiles: forbiddenPaths } : {}),
           ...(unauthorizedPaths.length > 0 ? { unauthorizedFiles: unauthorizedPaths } : {}),
         },
@@ -1077,7 +1129,7 @@ function appendDefaultDerivedRoutes(
 
     routes.push(
       withDeferredFacts(
-        appPath,
+        context,
         {
           id: `default-${routeId(parts.route || '/')}`,
           kind: 'page',
@@ -1363,7 +1415,7 @@ function djb2Hash(value: string) {
   return hash >>> 0
 }
 
-function inferRouteMode(
+export function inferRouteMode(
   parts: RouteParts,
   usesRequest: boolean,
   config?: RouteSegmentConfig,
@@ -1385,7 +1437,9 @@ interface ParsedSegmentConfig {
   dynamicParams?: boolean
   runtime?: string
   prefetch?: RouteSegmentConfig['prefetch']
+  ensureStatic?: RouteSegmentConfig['ensureStatic']
   unstableInstant?: boolean
+  stableInstant?: boolean
   /** Literal but invalid `export const revalidate` value (build error in Next). */
   invalidRevalidate?: string
 }
@@ -1426,13 +1480,18 @@ function parseSegmentConfig(source: string): ParsedSegmentConfig {
       searchable,
     )
   if (prefetchMatch) parsed.prefetch = prefetchMatch[1] as RouteSegmentConfig['prefetch']
-  // `unstable_instant = true | false | {…samples}` — an object literal opts in
-  // like `true` (its samples refine the runtime-prefetch render, they don't
-  // gate it).
-  const instantMatch = /^\s*export\s+const\s+unstable_instant\s*=\s*(true|false|\{)/m.exec(
-    searchable,
-  )
-  if (instantMatch) parsed.unstableInstant = instantMatch[1] !== 'false'
+  const ensureStaticMatch =
+    /^\s*export\s+const\s+ensureStatic\s*=\s*['"](shell|prefetch|navigation)['"]/m.exec(searchable)
+  if (ensureStaticMatch) {
+    parsed.ensureStatic = ensureStaticMatch[1] as RouteSegmentConfig['ensureStatic']
+  }
+  // Stable `instant` and its legacy alias share one runtime representation.
+  const instantMatch =
+    /^\s*export\s+const\s+(instant|unstable_instant)\s*=\s*(true|false|\{)/m.exec(searchable)
+  if (instantMatch) {
+    parsed.unstableInstant = instantMatch[2] !== 'false'
+    if (instantMatch[1] === 'instant') parsed.stableInstant = true
+  }
   return parsed
 }
 
@@ -1443,9 +1502,9 @@ function parseSegmentConfig(source: string): ParsedSegmentConfig {
  * `force-dynamic` (any segment forces the whole route) and `revalidate`
  * (the lowest declared number wins, Next-style).
  *
- * `dynamicParams = false` is resolved per param: it governs the params that
- * appear in the declaring file's own directory prefix, taking the leaf-most
- * declaration for each param.
+ * `dynamicParams = false` is resolved per param: it closes the params that
+ * appear in the declaring file's own directory prefix, whatever any other
+ * segment declares.
  */
 function segmentConfigFromEntries(
   appPath: string,
@@ -1455,7 +1514,7 @@ function segmentConfigFromEntries(
   const config: RouteSegmentConfig = {}
   let lowestRevalidate: number | undefined
   let sawRevalidateFalse = false
-  const dynamicParamsByName = new Map<string, boolean>()
+  const closedParams = new Set<string>()
   const allParams = [...parts.params, ...(parts.catchAll ? [parts.catchAll] : [])]
 
   for (const entry of entries) {
@@ -1481,38 +1540,26 @@ function segmentConfigFromEntries(
     if (parsed.fetchCache && !config.fetchCache) config.fetchCache = parsed.fetchCache
     if (parsed.runtime && !config.runtime) config.runtime = parsed.runtime
     if (parsed.prefetch && !config.prefetch) config.prefetch = parsed.prefetch
+    if (parsed.ensureStatic && !config.ensureStatic) config.ensureStatic = parsed.ensureStatic
     // Leaf-most declaration wins (entries are page-first): a page's explicit
     // `unstable_instant = false` overrides a layout's opt-in.
     if (parsed.unstableInstant !== undefined && config.unstableInstant === undefined) {
       config.unstableInstant = parsed.unstableInstant
+      if (parsed.stableInstant) config.stableInstant = true
     }
-    if (parsed.dynamicParams !== undefined) {
-      const param = paramOfOwnSegment(appPath, entry.file, allParams)
-      if (param !== undefined && !dynamicParamsByName.has(param)) {
-        dynamicParamsByName.set(param, parsed.dynamicParams)
+    if (parsed.dynamicParams === false) {
+      for (const param of layoutParamNamesForDir(appPath, path.dirname(entry.file))) {
+        closedParams.add(param)
       }
     }
   }
 
   if (lowestRevalidate !== undefined) config.revalidate = lowestRevalidate
   else if (sawRevalidateFalse) config.revalidate = false
-  const governed = allParams.filter(param => dynamicParamsByName.get(param) === false)
+  const governed = allParams.filter(param => closedParams.has(param))
   if (governed.length > 0) config.dynamicParamsFalse = governed
 
   return Object.keys(config).length > 0 ? config : undefined
-}
-
-/**
- * The route param introduced by the file's own directory segment, if any. A `dynamicParams` declaration
- * governs that segment only - it does not cascade to child segments (a layout at `[locale]/` governs
- * `locale` but not a `[slug]` below it).
- */
-function paramOfOwnSegment(appPath: string, file: string, params: string[]) {
-  const segments = toPosixPath(path.relative(appPath, path.dirname(file))).split('/')
-  const own = segments[segments.length - 1]
-  return params.find(
-    param => own === `[${param}]` || own === `[...${param}]` || own === `[[...${param}]]`,
-  )
 }
 
 // The parse is memoized per source, so the thousands of directive checks a
@@ -1656,6 +1703,26 @@ function defaultReexportsClientModule(
   return false
 }
 
+function clientModuleExportNames(
+  context: ScanContext,
+  file: string,
+  visited = new Set<string>(),
+): Set<string> {
+  const key = path.resolve(file)
+  if (visited.has(key) || !fileExists(context, key)) return new Set()
+  visited.add(key)
+  const facts = scanFacts(key, readSource(context, key))
+  const names = new Set(facts.exportNames)
+  for (const specifier of facts.exportStars) {
+    const target = resolveModuleEdge(context, key, specifier)
+    if (!target) continue
+    for (const name of clientModuleExportNames(context, target, visited)) {
+      if (name !== 'default') names.add(name)
+    }
+  }
+  return names
+}
+
 function collectFromFile(
   context: ScanContext,
   file: string,
@@ -1679,19 +1746,13 @@ function collectFromFile(
     if (isClientModule(context, imported.file)) {
       // `export * from './client'` re-exports the target's named exports (never
       // its default), so each of them is a client reference of this module.
-      if (imported.star) {
-        const importedSource = readSource(context, imported.file)
-        for (const exportName of scanFacts(imported.file, importedSource).exportNames) {
-          if (exportName !== 'default') {
+      if (imported.star || imported.exports.includes('*')) {
+        for (const exportName of clientModuleExportNames(context, imported.file)) {
+          if (!imported.star || exportName !== 'default') {
             addClientReference(references, clientReference(imported.file, exportName))
           }
         }
         continue
-      }
-      if (imported.exports.includes('*')) {
-        throw new Error(
-          `${file} namespace-imports Client Component module ${imported.file}. Import the client component by default or named export instead.`,
-        )
       }
       // A bare side-effect import binds no exports, but the module still belongs in the client bundle:
       // webpack eagerly initializes every client reference module once any of them renders, so its top-level

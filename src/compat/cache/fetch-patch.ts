@@ -166,7 +166,7 @@ export async function collectFetchRdcRecords(): Promise<FetchRdcRecord[]> {
 export function seedFetchRdcRecords(
   records: readonly FetchRdcRecord[],
   route?: string,
-  routeTags: readonly string[] = [],
+  _routeTags: readonly string[] = [],
 ) {
   for (const record of records) {
     if (!isFetchRdcRecord(record)) continue
@@ -183,11 +183,7 @@ export function seedFetchRdcRecords(
         url: record.snapshot.url,
       }),
       storedAt: record.storedAt,
-      // A fetch made inside a `use cache` scope carries no tags of its own - the scope's cacheTag()s are
-      // the invalidation surface. Stamp the route-level tag union on the seeded snapshot so updateTag()
-      // of any of those tags invalidates it (slightly over-broad within the route, never
-      // under-invalidating).
-      tags: [...new Set([...record.tags, ...routeTags])],
+      tags: [...record.tags],
       // Foreign-process sequences are meaningless here — see rebaseRdcTagSeq.
       tagSeq: rebaseRdcTagSeq(record),
       ...(record.revalidateSeconds !== undefined
@@ -304,7 +300,8 @@ export function installCompatFetchCache() {
       return original(input, init)
     }
 
-    const segmentFetchCache = currentRenderCacheMeta()?.fetchCache
+    const meta = currentRenderCacheMeta()
+    const segmentFetchCache = meta?.fetchCache
     const segmentForcesCache =
       segmentFetchCache === 'force-cache' || segmentFetchCache === 'only-cache'
     // Explicit no-store signals opt the surrounding route out of prebuilt
@@ -314,16 +311,18 @@ export function installCompatFetchCache() {
       !segmentForcesCache &&
       (cacheOption === 'no-store' || cacheOption === 'no-cache' || revalidate === 0)
     ) {
-      recordCacheNoStore()
+      recordCacheNoStore(
+        `${revalidate === 0 ? 'revalidate: 0' : 'no-store'} fetch ${request.url} ${meta?.route ?? '/'}`,
+      )
     }
     // Route handlers never auto-cache an implicit/default fetch (Next treats
     // both forms as uncached), and it keeps the handler out of prebuilt static
     // output. Pages are unaffected: their ISR output freezes the data at
     // prerender time.
     const handlerDefaultFetch =
-      (cacheOption === undefined || cacheOption === 'default') &&
-      currentRenderCacheMeta()?.handler === true
-    if (handlerDefaultFetch && !segmentForcesCache) recordCacheNoStore()
+      (cacheOption === undefined || cacheOption === 'default') && meta?.handler === true
+    if (handlerDefaultFetch && !segmentForcesCache)
+      recordCacheNoStore(`fetch ${request.url} ${meta.route ?? '/'}`)
 
     const mode = cacheModeFor(
       cacheOption,
@@ -340,7 +339,6 @@ export function installCompatFetchCache() {
     const key = fetchCacheKey(request)
 
     if (mode === 'cache' && !draftModeBypassActive()) {
-      const meta = currentRenderCacheMeta()
       const resumeEntry = fetchRdcRecords().get(key)
       if (
         resumeEntry &&
@@ -503,8 +501,10 @@ async function normalizeFetchBody(
   body: BodyInit | null | undefined,
 ): Promise<{ key: string; replacement?: BodyInit } | undefined | null> {
   if (body == null) return undefined
-  if (typeof body === 'string') return { key: body }
-  if (body instanceof URLSearchParams) return { key: body.toString() }
+  if (typeof body === 'string') return { key: JSON.stringify(['string', body]) }
+  if (body instanceof URLSearchParams) {
+    return { key: JSON.stringify(['urlencoded', [...body.entries()]]) }
+  }
   if (body instanceof ArrayBuffer) return { key: bytesKey(new Uint8Array(body)) }
   if (ArrayBuffer.isView(body)) {
     return { key: bytesKey(new Uint8Array(body.buffer, body.byteOffset, body.byteLength)) }
@@ -515,11 +515,16 @@ async function normalizeFetchBody(
   }
   if (body instanceof FormData) {
     // Reading entries does not consume the body; fetch re-serializes it.
-    const parts: string[] = []
-    for (const [name, value] of body.entries()) {
-      parts.push(name, typeof value === 'string' ? value : await (value as Blob).text())
+    const parts: unknown[] = []
+    for (const [name, value] of body.entries() as Iterable<[string, string | File]>) {
+      parts.push([
+        name,
+        typeof value === 'string'
+          ? value
+          : [value.name, value.type, bytesKey(new Uint8Array(await value.arrayBuffer()))],
+      ])
     }
-    return { key: parts.join(' ') }
+    return { key: JSON.stringify(['form', parts]) }
   }
   return null
 }

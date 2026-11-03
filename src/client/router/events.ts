@@ -23,7 +23,11 @@ export function locationListeners() {
 export function emitLocationChange() {
   routerState.observedLocationKey = locationKey()
   if (silentLocationDepth > 0) return
-  for (const listener of [...locationListeners()]) listener()
+  const emit = () => {
+    for (const listener of [...locationListeners()]) listener()
+  }
+  if (routerState.locationBroadcast) routerState.locationBroadcast(emit)
+  else emit()
 }
 
 let silentLocationDepth = 0
@@ -53,6 +57,7 @@ export function onNavigationStart(listener: () => void) {
 }
 
 export function emitNavigationStart() {
+  routerState.navigationStarts = (routerState.navigationStarts ?? 0) + 1
   for (const listener of [...navigationStartListeners]) listener()
 }
 

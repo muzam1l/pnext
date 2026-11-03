@@ -81,6 +81,10 @@ function actionClientModulePath() {
   return path.join(import.meta.dirname, '../compat/actions/client.ts')
 }
 
+function livePageModulePath() {
+  return path.join(import.meta.dirname, '../compat/client/live-page.ts')
+}
+
 function navCompatModulePath() {
   return path.join(import.meta.dirname, '../compat/client/nav.ts')
 }
@@ -123,7 +127,7 @@ function pnextIslandVNode(h, Component, props, children, root) {
   return `${seed}
 import { LayoutSegmentContext as __PNextLayoutSegmentContext, RouteParamsContext as __PNextRouteParamsContext } from ${JSON.stringify(islandContextModulePath())};
 function pnextIslandReadJson(root, attr) {
-  const raw = root && root.getAttribute ? root.getAttribute(attr) : null;
+  const raw = root.getAttribute(attr);
   if (!raw) return null;
   try { return JSON.parse(raw); } catch (e) { return null; }
 }
@@ -136,6 +140,8 @@ function pnextIslandVNode(h, Component, props, children, root) {
   if (segments) vnode = h(__PNextLayoutSegmentContext.Provider, { value: segments }, vnode);
   const params = pnextIslandReadJson(root, 'data-pnext-params');
   if (params) vnode = h(__PNextRouteParamsContext.Provider, { value: params }, vnode);
+  // Sibling islands share wrapper types: key by id so a diff never hands one another's tree.
+  vnode.key = root.getAttribute('data-pnext-client');
   return vnode;
 }
 `
@@ -570,12 +576,7 @@ function pnextSettled(value) {
   return Promise.resolve(value).then(pnextIgnore, pnextIgnore);
 }
 function pnextIgnore() {}
-function markRouteHydrated() {
-  window.__NEXT_HYDRATED = true;
-  window.__NEXT_HYDRATED_AT ??= performance.now();
-  if (typeof window.__NEXT_HYDRATED_CB === 'function') window.__NEXT_HYDRATED_CB();
-  window.dispatchEvent(new Event('pnext:hydrated'));
-}
+import { markRouteHydrated } from ${JSON.stringify(navCompatModulePath())};
 // A settled mount promise means the DOM is attached, NOT that useEffect ran - preact defers effects
 // to after-paint, so a layout publishing its handle from an effect is still unset when
 // __NEXT_HYDRATED flips. Drive preact's flush through options.requestAnimationFrame so "effects ran"
@@ -744,14 +745,7 @@ function routerOnlyEntrySource(facts: EntryCompatFacts) {
   // runs — mark it right away (the island shapes gate on their mount promises
   // first) or the harness waits out its full __NEXT_HYDRATED fallback.
   const mark = facts.nextCompat
-    ? `
-function markRouteHydrated() {
-  window.__NEXT_HYDRATED = true;
-  window.__NEXT_HYDRATED_AT ??= performance.now();
-  if (typeof window.__NEXT_HYDRATED_CB === 'function') window.__NEXT_HYDRATED_CB();
-  window.dispatchEvent(new Event('pnext:hydrated'));
-}
-`
+    ? `import { markRouteHydrated } from ${JSON.stringify(navCompatModulePath())};`
     : ''
   return `
 ${routerImportSource(facts)}
@@ -763,14 +757,22 @@ ${facts.nextCompat ? '  markRouteHydrated();\n' : ''}}
 export function unmountRoute() {}
 
 ${installRouterCall(facts.router)}${installCallsSource(facts)}
-if (${autoMountGuard(facts.router)}) mountRoute();
-if (window.__PNEXT_REGISTER_ENTRY__) window.__PNEXT_REGISTER_ENTRY__(import.meta.url, { mountRoute, unmountRoute });
+${autoMountSource(facts)}
+window.__PNEXT_REGISTER_ENTRY__?.(import.meta.url, { mountRoute, unmountRoute });
 `
 }
 
 /** `installRouter()`, or nothing when the route can never soft-navigate. */
 function installRouterCall(router?: boolean) {
   return router ? 'installRouter();\n' : ''
+}
+
+// Compat mounts a timer tick after the instrumentation-client import settles: hydration reads strictly later.
+function autoMountSource({ router, nextCompat }: EntryCompatFacts) {
+  const mount = nextCompat
+    ? "typeof __PNEXT_INSTRUMENTATION_CLIENT__ !== 'undefined' && __PNEXT_INSTRUMENTATION_CLIENT__ ? self.__PNEXT_IC__?.then(() => setTimeout(mountRoute, 1)) ?? mountRoute() : mountRoute()"
+    : 'void mountRoute()'
+  return `if (${autoMountGuard(router)}) ${mount};`
 }
 
 /**
@@ -793,14 +795,15 @@ function installCallsSource({
   if (!nextCompat) return ''
   const overlay =
     actions && errorFile ? 'installActionErrorOverlay(__PNextRouteErrorComponent);\n' : ''
+  // Only the options this route has: an absent key reads as undefined.
+  const options = [
+    errorFile && 'errorComponent: __PNextRouteErrorComponent',
+    globalErrorFile && 'globalErrorComponent: __PNextGlobalErrorComponent',
+    notFoundFile && 'notFoundComponent: __PNextRouteNotFoundComponent',
+    actions && 'isActionError',
+  ].filter(Boolean)
   return `${actions ? 'installActionRouter();\n' : ''}installNavCompat();
-${overlay}installClientErrors({ errorComponent: ${
-    errorFile ? '__PNextRouteErrorComponent' : 'undefined'
-  }, globalErrorComponent: ${
-    globalErrorFile ? '__PNextGlobalErrorComponent' : 'undefined'
-  }, notFoundComponent: ${
-    notFoundFile ? '__PNextRouteNotFoundComponent' : 'undefined'
-  }, isActionError: ${actions ? 'isActionError' : 'undefined'} });`
+${overlay}installClientErrors({ ${options.join(', ')} });`
 }
 
 /**
@@ -871,6 +874,7 @@ ${deferredIslands ? "import { useEffect, useState } from 'preact/hooks';" : ''}
 ${suspense ? "import { Suspense } from 'preact/compat';" : ''}
 ${revival ? layoutSegmentHelperSource(nextCompat) : ''}
 ${nextCompat && (revival || page) ? syncPropsHelperSource() : ''}
+${nextCompat && page ? `import { LivePage as __PNextLivePage } from ${JSON.stringify(livePageModulePath())};` : ''}
 ${revival ? propsParserSource(nextCompat) : ''}
 ${revival ? islandHelpersSource(facts) : ''}
 ${islandCssHelperSource()}
@@ -986,8 +990,8 @@ const { mountRoute, remountRoute, unmountRoute } = bootstrapRoute({
 export { mountRoute, remountRoute, unmountRoute };
 
 ${installRouterCall(facts.router)}${installCallsSource(facts)}
-if (${autoMountGuard(facts.router)}) void mountRoute();
-if (window.__PNEXT_REGISTER_ENTRY__) window.__PNEXT_REGISTER_ENTRY__(import.meta.url, { mountRoute, unmountRoute });
+${autoMountSource(facts)}
+window.__PNEXT_REGISTER_ENTRY__?.(import.meta.url, { mountRoute, unmountRoute });
 `
 }
 
@@ -999,9 +1003,9 @@ if (window.__PNEXT_REGISTER_ENTRY__) window.__PNEXT_REGISTER_ENTRY__(import.meta
  */
 function boundaryConfigSource(facts: EntryCompatFacts) {
   if (!facts.nextCompat) return ''
-  const base = `\n  errorComponent: ${facts.errorFile ? '__PNextRouteErrorComponent' : 'undefined'},\n  notFoundComponent: ${
-    facts.notFoundFile ? '__PNextRouteNotFoundComponent' : 'undefined'
-  },`
+  const base = `${facts.errorFile ? '\n  errorComponent: __PNextRouteErrorComponent,' : ''}${
+    facts.notFoundFile ? '\n  notFoundComponent: __PNextRouteNotFoundComponent,' : ''
+  }`
   if (!hasErrorBoundary(facts)) return `${base}\n  errorBoundary: BareErrorBoundary,`
   return `${base}\n  errorBoundary: ClientErrorBoundary,\n  onBoundaryReset: softRefreshRoute,${
     facts.notFoundFile ? '' : '\n  builtInNotFound: __PNextBuiltInNotFound,'
@@ -1127,8 +1131,8 @@ export function unmountRoute(keep) {
 }
 
 ${installRouterCall(facts.router)}${installCallsSource(facts)}
-if (${autoMountGuard(facts.router)}) void mountRoute();
-if (window.__PNEXT_REGISTER_ENTRY__) window.__PNEXT_REGISTER_ENTRY__(import.meta.url, { mountRoute, unmountRoute });
+${autoMountSource(facts)}
+window.__PNEXT_REGISTER_ENTRY__?.(import.meta.url, { mountRoute, unmountRoute });
 
 function observeVisibleIsland(root, island) {
   if (typeof IntersectionObserver === 'undefined') {
@@ -1433,7 +1437,7 @@ if (!root) return;
 // Published for the router: it needs the mount container (and, for a dissolved
 // page slot, its anchors) to preserve this page across a refresh.
 window.__PNEXT_CLIENT_PAGE_ROOT__ = root;
-mount(root, ${wrapInBoundary('h(Page, pageProps())', nextCompat)});
+mount(root, ${wrapInBoundary(pageVNode(nextCompat), nextCompat)});
 }
 
 // Next renders a page's children directly into the layout with no wrapper element, so tests assert
@@ -1497,6 +1501,10 @@ function pageMarkerContainer(open, close, parent) {
 `
 }
 
+function pageVNode(nextCompat?: boolean) {
+  return nextCompat ? 'h(__PNextLivePage, { Page, props: pageProps() })' : 'h(Page, pageProps())'
+}
+
 // Under next compat every hydrated island and the page mount wraps in the in-tree
 // ClientErrorBoundary, NESTED INSIDE the implicit Suspense boundary islands must keep (a bare lazy()
 // without Suspense kills the Preact tree). The boundary renders the route error.js and reset() soft-
@@ -1515,6 +1523,7 @@ function clientBoundaryHelperSource(nextCompat?: boolean, suspense?: boolean) {
   // A suspense-free app (no lazy/use/async components anywhere in its client graph) keeps the error
   // boundary but drops the Suspense wrapper - and preact/compat with it.
   const boundary = `h(config.errorBoundary, {
+      key: vnode.key,
       errorComponent: config.errorComponent,
       notFoundComponent: config.notFoundComponent,
       builtInNotFound: config.builtInNotFound,
@@ -1522,7 +1531,7 @@ function clientBoundaryHelperSource(nextCompat?: boolean, suspense?: boolean) {
     }, vnode)`
   return `
   function pnextBoundary(vnode) {
-    return ${suspense ? `h(Suspense, { fallback: null }, ${boundary})` : boundary};
+    return ${suspense ? `h(Suspense, { fallback: null, key: vnode.key }, ${boundary})` : boundary};
   }
 `
 }
@@ -1633,19 +1642,15 @@ async function mountIslandTree(root, island) {
   const rawProps = root.getAttribute('data-pnext-props') ?? '{}';
   const incoming = root.__pnextIncoming;
   root.__pnextIncoming = undefined;
-  // A streamed chunk promoted INSIDE this root's adopted children (the hard-loaded document
-  // finishes streaming long after hydration) replaced DOM this preact tree owns without
-  // telling it. Its vdom still names the fallback, so a diff would build the incoming
-  // children BESIDE the promoted ones. Rebuild from the incoming DOM instead.
-  const streamGrafted = root.__pnextStreamGrafted;
-  root.__pnextStreamGrafted = undefined;
-  if (incoming && root.__pnextLive === render && !streamGrafted) {
+  if (incoming && root.__pnextLive === render) {
     // Preserved across a soft navigation: re-render in place with the incoming
     // document's props/children so component state survives while the routed
     // content under the island updates.
     // A kept layout's island (its own incoming) keeps its tree.
     if (incoming !== root) {
       const vnode = ${islandVNodeExpr('Component', 'await islandProps(rawProps, incoming, domChildren, h)', 'await staticChildren(incoming, island.id)', 'root')};
+      // Put back boundaries a post-hydration promotion swapped out (renderer PROMO_RUNTIME).
+      root.__pnextUnpromote?.();
       render(${wrapInBoundary('vnode', nextCompat)}, root);
     }
     pnextMountedRoots.add(root);
@@ -1739,7 +1744,7 @@ async function domNode(node) {
   }
 
   if (Page && element.id === 'pnext-page') {
-    return ${wrapInBoundary('h(Page, pageProps())', nextCompat)};
+    return ${wrapInBoundary(pageVNode(nextCompat), nextCompat)};
   }
 
   return h(element.localName, domProps(element), await domChildren(element));

@@ -371,7 +371,7 @@ export function cachedData(
     const tagStale = tagsStaleSince(entry.tags, entry.storedAt)
     if (!tagStale && !dataCacheEntryExpired(entry)) return entry.value
     // ISR regeneration renders refetch expired entries inline.
-    if (cacheMetaStorage.getStore()?.blockingStaleFetches !== true) {
+    if (meta?.blockingStaleFetches !== true && !insideDataCacheProducer()) {
       if (!entry.refreshing) {
         entry.refreshing = true
         void storeDataCacheEntry(key, produce, options, entry)
@@ -524,6 +524,10 @@ export interface RenderCacheMeta {
   handler?: boolean
   /** True when `dynamic = 'error'` must reject request API access. */
   dynamicError?: boolean
+  /** On-demand render of a build-prerendered route: dynamic usage fails it (Next's static-to-dynamic error). */
+  onDemandPrerender?: boolean
+  /** The render read a request API or a no-store signal. */
+  dynamicUsage?: boolean
   /**
    * after() work queued during a static-generation render. There is no response close to flush against,
    * so the render itself drains the queue once `produce` settles - Next's semantics: a build prerender
@@ -542,6 +546,10 @@ export function currentRenderCacheMeta() {
   return cacheMetaStorage.getStore()
 }
 
+export function runOutsideRenderCacheMeta<T>(callback: () => T): T {
+  return cacheMetaStorage.exit(callback)
+}
+
 /**
  * True while producing prebuilt static output - a build-time prerender or an ISR regeneration. In that
  * context a plain fetch with no explicit cache option defaults to caching, matching Next's
@@ -558,6 +566,7 @@ export function recordCacheTags(tags: readonly string[]) {
   // tags of every fetch made inside it, so revalidateTag invalidates the entry).
   const producerTags = producerTagsStorage.getStore()
   if (producerTags) for (const tag of tags) producerTags.add(tag)
+  if (useCacheMetadataSinks.tags?.(tags)) return
   const meta = cacheMetaStorage.getStore()
   if (!meta) return
   for (const tag of tags) meta.tags.add(tag)
@@ -569,16 +578,21 @@ export function recordCacheTags(tags: readonly string[]) {
 // that ENTRY's cacheLife too, matching Next: a `fetch(..., { next:
 // { revalidate: 1 } })` inside 'use cache' bounds the cache entry at 1s, not
 // just the surrounding route.
-const useCacheRevalidateSink = revalidateGlobal('useCacheRevalidateSink', () => ({
-  current: undefined as ((seconds: number) => void) | undefined,
+const useCacheMetadataSinks = revalidateGlobal('useCacheMetadataSinks', () => ({
+  revalidate: undefined as ((seconds: number) => boolean) | undefined,
+  tags: undefined as ((tags: readonly string[]) => boolean) | undefined,
 }))
 
-export function setUseCacheRevalidateSink(sink: (seconds: number) => void) {
-  useCacheRevalidateSink.current = sink
+export function setUseCacheRevalidateSink(sink: (seconds: number) => boolean) {
+  useCacheMetadataSinks.revalidate = sink
+}
+
+export function setUseCacheTagSink(sink: (tags: readonly string[]) => boolean) {
+  useCacheMetadataSinks.tags = sink
 }
 
 export function recordCacheRevalidate(seconds: number) {
-  useCacheRevalidateSink.current?.(seconds)
+  if (useCacheMetadataSinks.revalidate?.(seconds)) return
   const meta = cacheMetaStorage.getStore()
   if (!meta) return
   meta.revalidateSeconds =
@@ -601,18 +615,47 @@ export function recordCacheStale(seconds: number) {
     meta.staleSeconds === undefined ? seconds : Math.min(meta.staleSeconds, seconds)
 }
 
-export function recordCacheNoStore() {
+export function recordCacheNoStore(reason: string) {
   // Inside a data-cache producer (unstable_cache / 'use cache') the cache
   // boundary wins: no-store signals do not leak out to the route.
   if (insideProducerStorage.getStore()) return
   const meta = cacheMetaStorage.getStore()
+  recordDynamicUsage(meta, reason)
   if (meta) meta.noStore = true
+}
+
+export function currentRenderIsOnDemandPrerender(): boolean {
+  return cacheMetaStorage.getStore()?.onDemandPrerender === true
+}
+
+/** A failed SSR pass keeps an on-demand prerender out of the cache (the pipeline answers 500). */
+export function failOnDemandPrerender(): void {
+  const meta = cacheMetaStorage.getStore()
+  if (meta?.onDemandPrerender) meta.noStore = true
+}
+
+/** Request API or no-store use: marks a build prerender dynamic and fails an on-demand one. */
+export function recordDynamicUsage(meta: RenderCacheMeta | undefined, reason: string): void {
+  if (!meta || insideProducerStorage.getStore()) return
+  meta.dynamicUsage = true
+  if (!meta.onDemandPrerender) return
+  // Caught by user code, it still fails the render (Next's revalidate 0 before the throw).
+  meta.noStore = true
+  const error = new Error(
+    `Page changed from static to dynamic at runtime ${meta.route ?? '/'}, reason: ${reason}\n` +
+      `see more here https://nextjs.org/docs/messages/app-static-to-dynamic-error`,
+  )
+  error.name = 'DynamicServerError'
+  throw error
 }
 
 const insideProducerStorage = revalidateGlobal(
   'insideProducerStorage',
   () => new AsyncLocalStorage<boolean>(),
 )
+// Core's sync-IO shim reads it to exempt producer bodies (ppr.ts insideUseCacheScope).
+;(globalThis as Record<PropertyKey, unknown>)[Symbol.for('pnext.compat.dataCacheProducerStorage')] =
+  insideProducerStorage
 const producerKindStorage = revalidateGlobal(
   'producerKindStorage',
   () => new AsyncLocalStorage<'use-cache' | 'unstable-cache'>(),
@@ -702,6 +745,7 @@ export async function collectRenderCacheMeta<T>(
     prerender?: boolean
     handler?: boolean
     dynamicError?: boolean
+    onDemandPrerender?: boolean
   } = {},
 ): Promise<{
   value: T
@@ -710,6 +754,7 @@ export async function collectRenderCacheMeta<T>(
   expireSeconds?: number
   staleSeconds?: number
   noStore?: boolean
+  dynamicUsage?: boolean
 }> {
   const meta: RenderCacheMeta = {
     tags: new Set(),
@@ -720,6 +765,7 @@ export async function collectRenderCacheMeta<T>(
     prerender: options.prerender,
     handler: options.handler,
     dynamicError: options.dynamicError,
+    onDemandPrerender: options.onDemandPrerender,
   }
   const value = await cacheMetaStorage.run(meta, produce)
   await drainStaticAfterTasks(meta)
@@ -730,6 +776,7 @@ export async function collectRenderCacheMeta<T>(
     ...(meta.expireSeconds !== undefined ? { expireSeconds: meta.expireSeconds } : {}),
     ...(meta.staleSeconds !== undefined ? { staleSeconds: meta.staleSeconds } : {}),
     ...(meta.noStore ? { noStore: true } : {}),
+    ...(meta.dynamicUsage ? { dynamicUsage: true } : {}),
   }
 }
 

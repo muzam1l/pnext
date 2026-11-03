@@ -10,7 +10,6 @@ import { onExtensionHostReset, registerResponseFinalizers } from '../../../exten
 import { getWorkUnit } from '../../../request/context'
 import { servedRelease } from '../../../runtime/production'
 import type { MetadataLink } from '../../../types'
-import { persistFont, persistedFont } from './cache'
 import { escapeRegex } from '../../../utils/code'
 import {
   familyStack,
@@ -422,24 +421,27 @@ async function resolveFont(
  * Google stylesheet and font file to re-derive URLs whose bytes are already emitted. A build always
  * resolves for real - it owns the output directory it just emptied.
  */
+// One import site, so the server build keeps one copy of this dev-only module.
+const fontCache = () => import('./cache')
+
 async function resolveThroughCache(
   definition: FontDefinition,
   context: FontResolveContext,
   key: string,
 ): Promise<ResolvedFont> {
   if (!context.dev) return definition.resolve(context)
-  const persisted = await persistedFont(context.config, key)
-  if (persisted) return persisted
-  return resolveAndPersist(definition, context, key)
+  const { persistedFont } = await fontCache()
+  return (await persistedFont(context.config, key)) ?? resolveAndPersist(definition, context, key)
 }
 
-function resolveAndPersist(
+async function resolveAndPersist(
   definition: FontDefinition,
   context: FontResolveContext,
   key: string,
 ): Promise<ResolvedFont> {
   const resolved = definition.resolve(context)
   if (context.dev) {
+    const { persistFont } = await fontCache()
     void resolved.then(font => persistFont(context.config, key, font)).catch(() => undefined)
   }
   return resolved
@@ -467,7 +469,7 @@ async function resolveGoogleFont(
   const emitted = await Promise.all(
     fontFiles.map(async fontFile => ({
       ...fontFile,
-      emitted: await emitRemoteFontFile(context, fontFile.googleFontFileUrl, {
+      emitted: await emitRemoteFontFile(context, new URL(fontFile.googleFontFileUrl, url).href, {
         preload: fontFile.preloadFontFile,
         adjustFontFallback,
       }),
@@ -750,7 +752,7 @@ function findGoogleFontFiles(css: string, subsetsToPreload: string[] | undefined
       continue
     }
 
-    const googleFontFileUrl = /src: url\((.+?)\)/.exec(line)?.[1]
+    const googleFontFileUrl = /src: url\((['"]?)(.+?)\1\)/.exec(line)?.[2]
     if (!googleFontFileUrl || fontFiles.some(file => file.googleFontFileUrl === googleFontFileUrl))
       continue
     fontFiles.push({
@@ -777,9 +779,9 @@ async function emitRemoteFontFile(context: FontResolveContext, url: string, emit
 }
 
 async function fetchFontFile(url: string) {
-  const mocked = mockedGoogleResponse(url)
-  if (mocked instanceof Uint8Array) return mocked
-  if (typeof mocked === 'string') return new TextEncoder().encode(mocked)
+  // Next's mocked mode never fetches a font file: a path is read, any other URL is its own bytes.
+  if (process.env.NEXT_FONT_GOOGLE_MOCKED_RESPONSES)
+    return new Uint8Array(url.startsWith('/') ? readFileSync(url) : Buffer.from(url))
 
   const response = await fetch(url)
   if (!response.ok) throw new Error(`Failed to fetch font file from \`${url}\`.`)
@@ -945,9 +947,6 @@ function mockedGoogleResponse(url: string) {
   const mocked = require(mockFile) as Record<string, string>
   const value = mocked[url]
   if (value === undefined) throw new Error(`Missing mocked response for URL: ${url}`)
-  if (typeof value === 'string' && value.startsWith('/') && existsSync(value)) {
-    return new Uint8Array(readFileSync(value))
-  }
   return value
 }
 
