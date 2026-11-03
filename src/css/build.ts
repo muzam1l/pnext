@@ -177,11 +177,6 @@ export function globalCssSources(
 // (via globalCssHref) whether the app has global CSS at all. Memoize per root+appPath; dev clears
 // this on save (invalidateDevCaches), prod sources never change in-process.
 const globalCssSourceCache = new Map<string, string[]>()
-let sourcesVersion = 0
-
-export function globalCssSourcesVersion() {
-  return sourcesVersion
-}
 
 export function memoizedGlobalCssSources(
   config: Pick<ResolvedConfig, 'root' | 'appPath' | 'workspaceRoot'>,
@@ -216,7 +211,6 @@ export function globalCssSourcesForPaths(root: string, appPath: string, workspac
   const stored = globalCssStore?.load(key)
   if (stored) {
     globalCssSourceCache.set(key, stored)
-    sourcesVersion++
     return stored
   }
 
@@ -234,7 +228,6 @@ export function globalCssSourcesForPaths(root: string, appPath: string, workspac
 
   const resolved = [...sources].map(file => path.resolve(file))
   globalCssSourceCache.set(key, resolved)
-  sourcesVersion++
   // The answer depends on every file the walk READ (a new `import './x.css'`
   // anywhere in the layout graph changes its importer's bytes) and on every
   // path it found ABSENT (restoring one while the server was down would add an
@@ -246,7 +239,6 @@ export function globalCssSourcesForPaths(root: string, appPath: string, workspac
 /** Drop the memoized layout-graph walk (dev save invalidation). */
 export function clearGlobalCssSourceCache() {
   globalCssSourceCache.clear()
-  sourcesVersion++
 }
 
 function collectGlobalCssSources(

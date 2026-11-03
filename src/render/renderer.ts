@@ -923,6 +923,20 @@ export function needsClientEntry(route: RouteManifestEntry) {
   return route.client || route.clientReferences.length > 0 || Boolean(route.needsRouterEntry)
 }
 
+/** A built route's module tags as its document carries them: chunk preloads, then the entry. */
+export function routeModuleTags(config: ResolvedConfig, route: RouteManifestEntry): string {
+  const href = (asset: string) =>
+    escapeHtml(withAssetPrefix(config, clientAssetPath(config, asset)))
+  const entry = needsClientEntry(route)
+    ? `<body><script type="module" src="${href(clientScriptPath(route))}"></script>`
+    : ''
+  return (
+    (route.clientEntryImports ?? [])
+      .map(asset => `<link rel="modulepreload" href="${href(asset)}">`)
+      .join('') + entry
+  )
+}
+
 interface DocumentParts {
   shell: 'generated' | 'layout'
   htmlProps: Record<string, unknown>

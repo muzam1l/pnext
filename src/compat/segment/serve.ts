@@ -25,6 +25,7 @@ import {
   pprShellPath,
   pprSubShellPath,
   renderPageResponse,
+  routeModuleTags,
   shellStaleSeconds,
   LATE_METADATA_MARKER,
 } from '../../render/renderer'
@@ -729,6 +730,10 @@ export const segmentPrefetchInterceptor: RequestInterceptor = async (request, ct
     // Announced on the HEADERS too, so the client keeps head-before-body order without the tree body.
     ...(selection?.route.pprMetadata === true
       ? { 'x-pnext-head-outlined': headFetchedFirst(selection) ? 'first' : '1' }
+      : {}),
+    // The client warms these beside its body request, so the warm never trails the prefetch.
+    ...(selection?.route.clientEntry
+      ? { 'x-pnext-assets': routeModuleTags(config, selection.route) }
       : {}),
     'x-nextjs-deployment-id': deploymentId(),
   }

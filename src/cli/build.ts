@@ -1027,7 +1027,18 @@ async function runBuild(
   }
   await writeBuildManifest(config.outPath, manifest)
   log.log(`wrote manifest.json (${routes.length} route${routes.length === 1 ? '' : 's'})`)
-  // Overlaps the warm pass; awaited before the build cache snapshot.
+  for (const hook of getBuildExtensions().completeHooks) {
+    await hook({ config, manifest, log })
+  }
+  // Compiling the rest of the app's modules is build work, so it counts toward the build's own
+  // duration rather than hiding after it.
+  const warmed = log.step('warm module cache', () =>
+    warm.finish(log, undefined, {
+      globalCss: globalCssSources(config),
+      clientReferences: [...compiledClientReferenceFiles()],
+    }),
+  )
+  // After the warm go-ahead, so the child compiles meanwhile; awaited before the cache snapshot.
   const routeSizes: Promise<RouteSizeRow[]> =
     config.output === 'export'
       ? Promise.resolve([])
@@ -1058,17 +1069,7 @@ async function runBuild(
           return rows
         })
   routeSizes.catch(() => undefined)
-  for (const hook of getBuildExtensions().completeHooks) {
-    await hook({ config, manifest, log })
-  }
-  // Compiling the rest of the app's modules is build work, so it counts toward the build's own
-  // duration rather than hiding after it.
-  await log.step('warm module cache', () =>
-    warm.finish(log, undefined, {
-      globalCss: globalCssSources(config),
-      clientReferences: [...compiledClientReferenceFiles()],
-    }),
-  )
+  await warmed
   // The release names every module production imports; a server compile that did not finish
   // fails the build here rather than a request later.
   if (!existsSync(buildIndexFile(config.outPath))) {

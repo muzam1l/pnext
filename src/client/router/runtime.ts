@@ -458,15 +458,14 @@ function entryScriptSrc(doc: Document) {
   )
 }
 
-async function warmPageAssets(html: string) {
-  if (typeof DOMParser === 'undefined') return
+function warmPageAssets(html: string) {
   const doc = new DOMParser().parseFromString(html, 'text/html')
   for (const link of doc.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"][href]')) {
     preloadStylesheet(link.getAttribute('href') ?? '')
   }
   warmEntryChunks(doc)
   const entrySrc = entryScriptSrc(doc)
-  if (entrySrc) await importEntry(entrySrc)
+  if (entrySrc) void importEntry(entrySrc)
 }
 
 // The destination entry's static chunks, kicked off before the entry itself is imported: without
@@ -3155,7 +3154,7 @@ export function prefetchRoute(
         ) {
           recordNavigationSegment(url.pathname, url.search, fetched)
         }
-        void warmPageAssets(fetched.html)
+        warmPageAssets(fetched.html)
         if (
           (typeof __PNEXT_ROUTER_POLICY_SETTERS__ === 'undefined' ||
             __PNEXT_ROUTER_POLICY_SETTERS__) &&
@@ -3728,6 +3727,8 @@ async function fetchPage(
           init,
           `${rscVariant}:${bodySegment}`,
         )
+        // Warmed beside the body request: a warm after the body lands outlives the prefetch.
+        warmPageAssets(treeResponse.headers.get('x-pnext-assets') ?? '')
         // A rejection before the await below must not surface as unhandled.
         bodyPromise.catch(() => undefined)
         await finishTree()

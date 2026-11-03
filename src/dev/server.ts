@@ -26,7 +26,6 @@ import {
   buildRouteCss,
   clearGlobalCssSourceCache,
   memoizedGlobalCssSources,
-  globalCssSourcesVersion,
   isCssFile,
   warmCssPipeline,
 } from '../css/build'
@@ -415,15 +414,13 @@ export async function startDevServer(options: DevServerOptions) {
   // a route has resolved its deferred facts — so they are re-derived whenever
   // another route materializes (its first compile), not once at boot.
   let watchedFactsVersion = -1
-  let watchedCssVersion = -1
+  const watchedCss = new Set<string>()
   function syncWatchRoots() {
-    if (
-      watchedFactsVersion === routeFactsVersion() &&
-      watchedCssVersion === globalCssSourcesVersion()
-    )
-      return
+    // A save clears and re-walks the global CSS sources; only a stylesheet not seen yet moves a root.
+    const css = memoizedGlobalCssSources(config).filter(file => !watchedCss.has(file))
+    if (watchedFactsVersion === routeFactsVersion() && css.length === 0) return
     watchedFactsVersion = routeFactsVersion()
-    watchedCssVersion = globalCssSourcesVersion()
+    for (const file of css) watchedCss.add(file)
     watcher = refreshWatcher(config, routes, watcher, reload, bootTime, eagerInvalidate)
   }
 
@@ -1881,10 +1878,12 @@ function devWatchRoots(config: ResolvedConfig, routes: RouteManifestEntry[]) {
   }
 
   // Discover external stylesheets after the warm tier or a render has walked the layout.
-  memoizedGlobalCssSources(config).forEach(add)
+  const files = new Set(memoizedGlobalCssSources(config))
   // Reading sourceFiles off an unresolved route would scan the whole app at
   // boot — exactly what the deferred route table exists to avoid.
-  for (const route of routes.filter(routeFactsResolved)) route.sourceFiles.forEach(add)
+  for (const route of routes.filter(routeFactsResolved))
+    route.sourceFiles.forEach(file => files.add(file))
+  files.forEach(add)
 
   return [...roots].sort()
 }

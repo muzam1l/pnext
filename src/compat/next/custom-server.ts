@@ -52,12 +52,14 @@ export async function emitCustomServerShim(config: ResolvedConfig): Promise<void
   } catch {
     // Missing — create fresh below.
   }
-  await mkdir(target, { recursive: true })
+  await mkdir(path.join(target, 'dist', 'server'), { recursive: true })
   await writeFile(
     path.join(target, 'package.json'),
     `${JSON.stringify({ name: 'next', version: SHIM_VERSION, main: 'index.cjs' }, null, 2)}\n`,
   )
   await writeFile(path.join(target, 'index.cjs'), customServerShimSource())
+  // Entrypoint servers require it first; the pnext server sets up its own runtime under Bun.
+  await writeFile(path.join(target, 'dist', 'server', 'node-environment.js'), '')
 }
 
 /** Whether `node_modules/next` is a shim this build emitted earlier. */

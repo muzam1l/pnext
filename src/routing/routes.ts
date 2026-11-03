@@ -387,8 +387,11 @@ function withDeferredFacts(
   // each field keeps a setter that wins over the computed value without forcing
   // the scan.
   const overrides = new Map<string, unknown>()
+  // A save's re-walk skips the restart record: the next boot revalidates it and walks.
+  let saved = false
   resetters.set(entry, () => {
     facts = undefined
+    saved = true
     overrides.clear()
     resolvedRoutes.delete(entry)
     return context
@@ -405,9 +408,10 @@ function withDeferredFacts(
           // facts were derived in is part of the key - otherwise one app's
           // record answers another app's lookup in the same process.
           const key = `${appPath}\0${base.kind}:${base.id}`
-          const stored = factsStore?.load(key)
+          const store = saved ? undefined : factsStore
+          const stored = store?.load(key)
           facts = stored ?? withDirCache(compute)
-          if (!stored) factsStore?.save(key, facts)
+          if (!stored) store?.save(key, facts)
           resolvedRoutes.add(entry)
           factsVersion += 1
         }
