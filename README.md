@@ -28,9 +28,9 @@ Or by hand: `bun add -d @wular/pnext`, then `pnext dev`.
 
 ## Incremental by design
 
-Server-rendered pages ship **0 KB** of JavaScript. A `<Link>` adds **~1.6 KB gzip** and loads the navigation runtime (~21 KB) on idle. Interactive pages hydrate on Preact for **~8.5 KB gzip** of framework, **~15 KB** with React compatibility. Everything is instant, the first page in dev renders **10–12× faster** than Next.js on **3.5–4× less memory**, and production builds run **7–9× faster**. See [Performance](./reference/performance.md).
+Server-rendered pages ship **0 KB** of JavaScript. A `<Link>` adds **~1.3 KB gzip** and loads the navigation runtime (~21 KB) on idle. Interactive pages hydrate on Preact for **~8.5 KB gzip** of framework, **~15 KB** with React compatibility. Everything is instant, the first page in dev renders **5–16× faster** than Next.js on **3–4× less memory**, and production builds run **6–16× faster**. See [Performance](./reference/performance.md).
 
-Core pnext is pure Preact. `compat.react` runs React components and libraries on it, and `compat.next` runs a whole Next.js App Router app unchanged. Start anywhere on that ladder and move when it suits you. The App Router compatibility is validated against Next's own test suite (4,400+ assertions passing). The `pages/` folder or private internal utilities of Next.js or React are mostly not supported. See [Compatibility](./reference/compat.md).
+Core pnext is pure Preact. `compat.react` runs React components and libraries on it, and `compat.next` runs a whole Next.js App Router app unchanged. Start anywhere on that ladder and move when it suits you. The App Router compatibility is validated against Next's own test suite (all 5,914 scored assertions of Next.js 16.4.3 passing). The `pages/` folder or private internal utilities of Next.js or React are mostly not supported. See [Compatibility](./reference/compat.md).
 
 ## A quick tour
 

@@ -1,6 +1,6 @@
 # Compatibility
 
-pnext is Next.js-shaped. With `compat.next` on, App Router apps behave the way they do in Next: the `next/*` module surface, `next.config.js`, server actions, metadata, proxy and middleware, `'use cache'`, the `/_next/image` optimizer, and the `next/navigation` router. That is validated by running Next.js's own test suite against pnext, with 4,400+ assertions passing, rather than by hand-written parity claims.
+pnext is Next.js-shaped. With `compat.next` on, App Router apps behave the way they do in Next: the `next/*` module surface, `next.config.js`, server actions, metadata, proxy and middleware, `'use cache'`, the `/_next/image` optimizer, and the `next/navigation` router. That is validated by running Next.js's own test suite against pnext, with all 5,914 scored assertions of Next.js 16.4.3's suite passing, rather than by hand-written parity claims.
 
 ```ts
 export default {

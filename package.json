@@ -1,6 +1,6 @@
 {
   "name": "@wular/pnext",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A fast little framework for server-first React apps, fully compatible with Next.js",
   "type": "module",
   "bin": {
