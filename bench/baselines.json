@@ -33,12 +33,12 @@
       }
     },
     "bytes": {
-      "js-raw": 15.76,
-      "js-gzip": 6.76,
-      "js-deferred-gzip": 33.13,
+      "js-raw": 15,
+      "js-gzip": 6.54,
+      "js-deferred-gzip": 32.78,
       "js-files": 3,
-      "install": 6.2,
-      "zero-island": 15.19
+      "install": 6.5,
+      "zero-island": 15
     }
   },
   "ssr": {
@@ -77,12 +77,12 @@
       }
     },
     "bytes": {
-      "js-raw": 32.94,
-      "js-gzip": 13.41,
-      "js-deferred-gzip": 33.04,
+      "js-raw": 31.98,
+      "js-gzip": 13.18,
+      "js-deferred-gzip": 32.7,
       "js-files": 4,
-      "install": 6.2,
-      "zero-island": 15.82
+      "install": 6.5,
+      "zero-island": 15.58
     }
   },
   "dashboard": {
@@ -98,11 +98,11 @@
       "hmr": null
     },
     "bytes": {
-      "js-raw": 112.05,
-      "js-gzip": 26.09,
-      "js-deferred-gzip": 36.01,
-      "js-files": 6,
-      "install": 6.2
+      "js-raw": 111.51,
+      "js-gzip": 25.92,
+      "js-deferred-gzip": 36.07,
+      "js-files": 5,
+      "install": 6.5
     }
   },
   "visible": {
@@ -118,11 +118,11 @@
       "hmr": null
     },
     "bytes": {
-      "js-raw": 6.86,
-      "js-gzip": 2.85,
+      "js-raw": 6.98,
+      "js-gzip": 2.88,
       "js-deferred-gzip": 6.41,
       "js-files": 1,
-      "install": 6.2
+      "install": 6.5
     }
   }
 }
