@@ -53,6 +53,14 @@ function isAppConvention(name: string): boolean {
   return appConventions.has(name) || metadataConventionPattern.test(name)
 }
 
+/** `pages/`, or `src/pages/` for a Pages-only `src/` app (root has no `pages/` or `app/`, `src/` has no `app/`). */
+export function pagesDirectory(root: string): string {
+  const rootPages = path.join(root, 'pages')
+  return [rootPages, path.join(root, 'app'), path.join(root, 'src', 'app')].some(existsSync)
+    ? rootPages
+    : path.join(root, 'src', 'pages')
+}
+
 /**
  * Build a compat-owned App Router view for basic Pages files. Keeping this
  * outside the source app preserves native App routes and avoids hybrid-route
@@ -62,7 +70,7 @@ export async function materializePagesApp(
   root: string,
   base = path.join(tmpdir(), 'pnext-pages-compat'),
 ): Promise<string | undefined> {
-  const pagesPath = path.join(root, 'pages')
+  const pagesPath = pagesDirectory(root)
   if (!existsSync(pagesPath)) return undefined
 
   const nativeApp = path.join(root, 'app')

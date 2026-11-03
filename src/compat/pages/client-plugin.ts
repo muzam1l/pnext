@@ -5,6 +5,7 @@ import type { Loader, OnLoadResult, Plugin } from 'esbuild'
 import { build as esbuild } from '../../utils/esbuild'
 import type { ResolvedConfig } from '../../config'
 import { applyClientSourceTransforms, getBundlerExtensions } from '../../extensions'
+import { pagesDirectory } from './router'
 
 const pageClientFacade = 'pnext-page-client.js'
 const sideEffectImportPattern = /(?:^|\n)\s*import\s*(['"])([^'"]+)\1\s*;?/g
@@ -16,7 +17,7 @@ const styleImportPattern = /\.(?:css|scss|sass|less|styl)(?:\?|$)/
  */
 export function pagesClientModulePlugin(config: ResolvedConfig): Plugin {
   const compiled = new Map<string, Promise<OnLoadResult>>()
-  const hasPages = existsSync(path.join(config.root, 'pages'))
+  const hasPages = existsSync(pagesDirectory(config.root))
   return {
     name: 'pnext-pages-client-module',
     setup(build) {

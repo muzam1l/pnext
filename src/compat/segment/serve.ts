@@ -77,6 +77,7 @@ import { appRootParams } from '../ppr/root-params-scan'
 import { loadCompatRewrites, resolveCompatRewrite, type CompatRewrite } from '../next/rewrites'
 import { existsSync, readFileSync } from 'node:fs'
 import { readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { writeFileAtomic } from '../../utils/fs'
 
 /** experimental.staleTimes.{static,dynamic} from next.config (seconds). */
 function configuredStaleTimes(): { static?: number; dynamic?: number } {
@@ -1117,7 +1118,7 @@ async function freshPrefetchShell(
       })
       .then(async ({ value }) => {
         if (!value) return undefined
-        await writeFile(file, value.shell).catch(() => undefined)
+        await writeFileAtomic(file, value.shell).catch(() => undefined)
         return value.shell
       })
       .finally(() => pendingPrefetchShells.delete(file))

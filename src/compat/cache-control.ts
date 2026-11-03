@@ -7,6 +7,7 @@ import type { ResponseFinalizer, ResponseFinalizerContext } from '../extensions'
 import { getNextConfig } from './next/config-loader'
 import { escapeRegex } from '../utils/code'
 import { canonicalUrlHref } from './next/canonical-url'
+import { pagesDirectory } from './pages/router'
 import {
   appPathname,
   loadCompatHeaders,
@@ -153,7 +154,7 @@ function loadPagesRevalidateRules(config: ResolvedConfig): RevalidateRule[] {
 
 /** Pages with a `getStaticProps` revalidate window: `[pages-relative file, seconds]`. */
 export function pagesRevalidateFacts(root: string): [string, number][] {
-  const pagesDir = path.join(root, 'pages')
+  const pagesDir = pagesDirectory(root)
   if (!existsSync(pagesDir)) return []
   const facts: [string, number][] = []
   for (const file of walkFiles(pagesDir)) {

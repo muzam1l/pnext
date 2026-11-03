@@ -458,6 +458,16 @@ function entryScriptSrc(doc: Document) {
   )
 }
 
+// A fetched page carries its own request's nonce; only this document's, read before any navigation, satisfies its CSP.
+const bootNonce =
+  typeof document === 'undefined'
+    ? undefined
+    : document.querySelector<HTMLScriptElement>('script[nonce]')?.nonce
+
+function adoptNonce(script: HTMLScriptElement) {
+  if (bootNonce) script.nonce = bootNonce
+}
+
 function warmPageAssets(html: string) {
   const doc = new DOMParser().parseFromString(html, 'text/html')
   for (const link of doc.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"][href]')) {
@@ -1193,6 +1203,7 @@ function swapBody(
       // fragment lands in the live document.
       const script = document.createElement('script')
       for (const attribute of node.attributes) script.setAttribute(attribute.name, attribute.value)
+      adoptNonce(script)
       script.text = node.text
       fragment.append(script)
       continue
@@ -3432,6 +3443,7 @@ function applyLateMetadata(html: string) {
     if (node instanceof HTMLScriptElement) {
       const script = document.createElement('script')
       for (const attribute of node.attributes) script.setAttribute(attribute.name, attribute.value)
+      adoptNonce(script)
       script.text = node.text
       document.body.append(script)
       continue
@@ -3728,7 +3740,8 @@ async function fetchPage(
           `${rscVariant}:${bodySegment}`,
         )
         // Warmed beside the body request: a warm after the body lands outlives the prefetch.
-        warmPageAssets(treeResponse.headers.get('x-pnext-assets') ?? '')
+        const assets = treeResponse.headers.get('x-pnext-assets')
+        if (assets) warmPageAssets(assets)
         // A rejection before the await below must not surface as unhandled.
         bodyPromise.catch(() => undefined)
         await finishTree()
